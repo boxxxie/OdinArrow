@@ -1,10 +1,10 @@
-package bench_odinarrow
+package main
 
 import "core:fmt"
 import "core:mem"
 import "core:slice"
 import "core:time"
-import oa "../../src"
+import oa "../../skadi"
 
 N_LARGE  :: 10_000_000
 N_STRING :: 1_000_000
@@ -166,7 +166,7 @@ bench_string_build :: proc() -> u64 {
 
 bench_string_scan :: proc() -> u64 {
 	b := oa.string_builder_make(N_STRING)
-	for i in 0..<N_STRING { oa.string_builder_append(&b, "hello_world") }
+	for _ in 0..<N_STRING { oa.string_builder_append(&b, "hello_world") }
 	arr, _ := oa.string_builder_finish(&b)
 	oa.string_builder_destroy(&b)
 

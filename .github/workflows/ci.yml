@@ -38,22 +38,13 @@ jobs:
           python3 -m pip install "pyarrow>=24.0.0" || python3 -m pip install pyarrow
 
       - name: Run strict static analysis across all packages
-        run: |
-          if grep -q '^check:' Makefile; then
-            make check
-          else
-            odin check src -no-entry-point -vet -strict-style
-            odin check examples/quickstart -vet -strict-style
-          fi
+        run: make check
 
       - name: Run unit, regression & 4-layer ATDD specification suites
         run: make test
 
       - name: Verify package documentation generation
-        run: |
-          odin doc src > /dev/null
-          if [ -d src/pipeline ]; then odin doc src/pipeline > /dev/null; fi
-          if [ -d deps/sleipnir/actor ]; then odin doc deps/sleipnir/actor > /dev/null; fi
+        run: odin doc skadi > /dev/null
 
       - name: Run quickstart example & verify PyArrow IPC interop
         run: |

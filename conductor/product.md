@@ -1,7 +1,7 @@
-# Product Guide: OdinArrow
+# Product Guide: Skadi
 
 ## Vision
-OdinArrow is a native [Apache Arrow](https://arrow.apache.org/) implementation in the [Odin](https://odin-lang.org/) programming language, providing columnar in-memory data structures, high-performance compute kernels, and Arrow IPC (Feather v2) serialization with zero-overhead abstractions and explicit memory management.
+Skadi is a native [Apache Arrow](https://arrow.apache.org/) implementation in the [Odin](https://odin-lang.org/) programming language, providing columnar in-memory data structures, high-performance compute kernels, and Arrow IPC (Feather v2) serialization with zero-overhead abstractions and explicit memory management.
 
 ## Target Users
 - **Odin systems & data engineers** building high-performance analytical tools, ETL pipelines, or CLI utilities in Odin.

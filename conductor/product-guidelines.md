@@ -1,4 +1,4 @@
-# Product Guidelines: OdinArrow
+# Product Guidelines: Skadi
 
 ## Engineering & API Principles
 - **Explicit Memory Ownership:** Every allocation, buffer, builder, array, schema, and record batch must have clear ownership semantics, explicit `allocator := context.allocator` parameters where appropriate, and deterministic `*_destroy` / `*_free` procedures.

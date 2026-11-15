@@ -5,7 +5,7 @@
 //     odin run examples/quickstart -out:/tmp/quickstart
 package main
 
-import oa "../../src"
+import oa "../../skadi"
 import "core:fmt"
 import "core:os"
 

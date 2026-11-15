@@ -3,3 +3,6 @@ bin/
 tmp_roundtrip/
 Learn/
 .claude/
+__pycache__/
+*.pyc
+.tmp/

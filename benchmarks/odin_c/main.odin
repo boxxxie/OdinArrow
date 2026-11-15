@@ -11,7 +11,7 @@ import "core:fmt"
 import "core:slice"
 import "core:time"
 import "core:math/rand"
-import oa "../../src"
+import oa "../../skadi"
 
 N      :: 10_000_000
 NS     :: 1_000_000

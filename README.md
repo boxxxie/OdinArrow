@@ -25,7 +25,7 @@ Arrow project has accomplished.
   UInt8…64, Float32/64, Utf8/Binary (i32 offsets), LargeUtf8/LargeBinary
   (i64 offsets), Null.
 - **Builders** — raw-buffer, zero-copy `finish()`, lazy validity bitmaps, plus a
-  reusable [`Buffer_Pool`](src/buffer_pool.odin) that recycles freed blocks.
+  reusable [`Buffer_Pool`](skadi/buffer_pool.odin) that recycles freed blocks.
 - **Compute kernels** — `sum`, `min`/`max`, `mean`, `count`, `filter`, `take`,
   `cast`, element-wise arithmetic, and `sort_indices` (stable, nulls-last).
   SIMD paths for the numeric hot loops; multi-threaded `*_parallel` variants.
@@ -38,7 +38,7 @@ Arrow project has accomplished.
 ```odin
 package main
 
-import oa "odinarrow"
+import oa "skadi"
 import "core:fmt"
 
 main :: proc() {
@@ -126,13 +126,15 @@ Reproduce: `bash benchmarks/bench_odin_c.sh` (single-threaded, vs Arrow C++) or
 Requires the [Odin compiler](https://odin-lang.org/docs/install/).
 
 ```sh
-make test                              # build + run the test suite (-vet -strict-style)
+make check                             # run strict static checks across all packages
+make test                              # build + run the test suite (-vet -strict-style -disallow-do)
 odin run examples/quickstart -out:/tmp/quickstart   # run the runnable demo
-odin build src -out:libodinarrow       # build the package
+odin build skadi -build-mode:static -out:libskadi.a # build the package as a static library
 ```
 
-To use it in your own project, import the `src` directory as the `odinarrow`
-package. A complete, runnable tour of the API lives in
+To use it in your own project, import the `skadi` directory as the `skadi`
+package (either via a relative path or `-collection:skadi=...`). A complete,
+runnable tour of the API lives in
 [`examples/quickstart`](examples/quickstart/main.odin); running it prints:
 
 ```
@@ -174,12 +176,14 @@ package. A complete, runnable tour of the API lives in
 ## Project layout
 
 ```
-src/                 the odinarrow package (buffers, types, arrays, builders,
-                     compute, ipc, buffer_pool, ...)
-tests/               the test suite (run with `make test`)
-examples/quickstart/ a runnable tour of the API
-benchmarks/          odin / python / cpp runners + compare.sh + RESULTS.md
-programs/            CSV<->Parquet example programs (Skadi and Arrow-FFI)
+skadi/                 the skadi package (buffers, types, arrays, builders,
+                       compute, ipc, buffer_pool, ...)
+tests/                 the unit test suite (*_test.odin, run with `make test`)
+tests_cpp/             Arrow C++ FFI layout compatibility tests (`make test-cpp`)
+examples/quickstart/   a runnable tour of the API
+examples/csv_to_parquet/  native CSV -> Parquet CLI example
+examples/parquet_to_csv/  native Parquet -> CSV CLI example
+benchmarks/            odin / python / cpp / FFI runners + compare.sh + RESULTS.md
 ```
 
 ## License

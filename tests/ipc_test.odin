@@ -1,0 +1,455 @@
+package skadi_tests
+
+import "core:testing"
+import "core:os"
+import oa "../skadi"
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+make_i32_array :: proc(vals: []i32) -> oa.Array {
+    b := oa.builder_make(i32, len(vals))
+    defer oa.builder_destroy(&b)
+    for v in vals { oa.builder_append(&b, v) }
+    arr, _ := oa.builder_finish(&b)
+    return arr
+}
+
+make_f64_array :: proc(vals: []f64) -> oa.Array {
+    b := oa.builder_make(f64, len(vals))
+    defer oa.builder_destroy(&b)
+    for v in vals { oa.builder_append(&b, v) }
+    arr, _ := oa.builder_finish(&b)
+    return arr
+}
+
+make_string_array :: proc(vals: []string) -> oa.Array {
+    b := oa.string_builder_make(len(vals))
+    defer oa.string_builder_destroy(&b)
+    for v in vals { oa.string_builder_append(&b, v) }
+    arr, _ := oa.string_builder_finish(&b)
+    return arr
+}
+
+// ── Large* round-trip ─────────────────────────────────────────────────────────
+
+@(test)
+test_ipc_large_string :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_large_str.arrow"
+    defer os.remove(path)
+
+    fields := []oa.Field{oa.field_make("ls", oa.Large_String_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+
+    // a null and an empty exercise validity + repeated i64 offsets
+    b := oa.large_string_builder_make(4)
+    oa.large_string_builder_append(&b, "alpha")
+    oa.large_string_builder_append_null(&b)
+    oa.large_string_builder_append(&b, "")
+    oa.large_string_builder_append(&b, "gamma")
+    col, _ := oa.large_string_builder_finish(&b)
+    oa.large_string_builder_destroy(&b)
+
+    batch, _ := oa.record_batch_make(&schema, []oa.Array{col})
+    defer oa.record_batch_free(&batch)
+
+    testing.expect(t, oa.ipc_write_file(path, &schema, []oa.Record_Batch{batch}))
+
+    schema2, batches, ok := oa.ipc_read_file(path)
+    testing.expect(t, ok)
+    defer {
+        oa.schema_free(schema2); free(schema2)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    testing.expect_value(t, len(batches), 1)
+    _, is_large := schema2.fields[0].type.(oa.Large_String_Type)
+    testing.expect(t, is_large, "type should round-trip as Large_String_Type")
+    c := oa.record_batch_column_at(&batches[0], 0)
+    testing.expect_value(t, oa.array_get_large_string(c, 0), "alpha")
+    testing.expect(t, oa.array_is_null(c, 1))
+    testing.expect_value(t, oa.array_get_large_string(c, 2), "")
+    testing.expect_value(t, oa.array_get_large_string(c, 3), "gamma")
+}
+
+@(test)
+test_ipc_binary :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_binary.arrow"
+    defer os.remove(path)
+
+    fields := []oa.Field{oa.field_make("bin", oa.Binary_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+
+    b := oa.binary_builder_make(3)
+    oa.binary_builder_append(&b, []u8{0x00, 0xFF})
+    oa.binary_builder_append(&b, []u8{0x42})
+    col, _ := oa.binary_builder_finish(&b)
+    oa.binary_builder_destroy(&b)
+
+    batch, _ := oa.record_batch_make(&schema, []oa.Array{col})
+    defer oa.record_batch_free(&batch)
+
+    testing.expect(t, oa.ipc_write_file(path, &schema, []oa.Record_Batch{batch}))
+
+    schema2, batches, ok := oa.ipc_read_file(path)
+    testing.expect(t, ok)
+    defer {
+        oa.schema_free(schema2); free(schema2)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    _, is_bin := schema2.fields[0].type.(oa.Binary_Type)
+    testing.expect(t, is_bin, "type should round-trip as Binary_Type")
+    c := oa.record_batch_column_at(&batches[0], 0)
+    v0 := oa.array_get_binary(c, 0)
+    testing.expect_value(t, len(v0), 2)
+    testing.expect_value(t, v0[0], u8(0x00))
+    testing.expect_value(t, v0[1], u8(0xFF))
+    v1 := oa.array_get_binary(c, 1)
+    testing.expect_value(t, len(v1), 1)
+    testing.expect_value(t, v1[0], u8(0x42))
+}
+
+// ── IPC round-trip ────────────────────────────────────────────────────────────
+
+@(test)
+test_ipc_write_read_i32 :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_i32.arrow"
+    defer os.remove(path)
+
+    // Build schema + batch
+    fields := []oa.Field{oa.field_make("x", oa.Int32_Type{}), oa.field_make("y", oa.Int32_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+
+    col_x := make_i32_array([]i32{1, 2, 3, 4, 5})
+    col_y := make_i32_array([]i32{10, 20, 30, 40, 50})
+    // batch takes ownership of the column buffers; do not free col_x/col_y separately
+    cols := []oa.Array{col_x, col_y}
+    batch, ok := oa.record_batch_make(&schema, cols)
+    testing.expect(t, ok, "record_batch_make failed")
+    defer oa.record_batch_free(&batch)
+
+    // Write
+    write_ok := oa.ipc_write_file(path, &schema, []oa.Record_Batch{batch})
+    testing.expect(t, write_ok, "ipc_write_file failed")
+
+    // Read back
+    schema2, batches, read_ok := oa.ipc_read_file(path)
+    testing.expect(t, read_ok, "ipc_read_file failed")
+    defer {
+        oa.schema_free(schema2)
+        free(schema2)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    testing.expect_value(t, len(batches), 1)
+    testing.expect_value(t, batches[0].length, 5)
+    testing.expect_value(t, len(schema2.fields), 2)
+    testing.expect_value(t, schema2.fields[0].name, "x")
+    testing.expect_value(t, schema2.fields[1].name, "y")
+
+    x := oa.record_batch_column(&batches[0], "x")
+    testing.expect(t, x != nil)
+    testing.expect_value(t, oa.array_get(x, 0, i32), i32(1))
+    testing.expect_value(t, oa.array_get(x, 4, i32), i32(5))
+
+    y := oa.record_batch_column(&batches[0], "y")
+    testing.expect(t, y != nil)
+    testing.expect_value(t, oa.array_get(y, 2, i32), i32(30))
+}
+
+@(test)
+test_ipc_write_read_f64 :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_f64.arrow"
+    defer os.remove(path)
+
+    fields := []oa.Field{oa.field_make("v", oa.Float64_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+
+    col := make_f64_array([]f64{1.5, 2.5, 3.5})
+    cols := []oa.Array{col}
+    batch, _ := oa.record_batch_make(&schema, cols)
+    defer oa.record_batch_free(&batch)
+
+    write_ok := oa.ipc_write_file(path, &schema, []oa.Record_Batch{batch})
+    testing.expect(t, write_ok)
+
+    schema2, batches, ok := oa.ipc_read_file(path)
+    testing.expect(t, ok)
+    defer {
+        oa.schema_free(schema2)
+        free(schema2)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    testing.expect_value(t, len(batches), 1)
+    v := oa.record_batch_column(&batches[0], "v")
+    testing.expect(t, v != nil)
+    testing.expect(t, approx_eq(oa.array_get(v, 0, f64), 1.5, 1e-10))
+    testing.expect(t, approx_eq(oa.array_get(v, 2, f64), 3.5, 1e-10))
+}
+
+@(test)
+test_ipc_write_read_string :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_str.arrow"
+    defer os.remove(path)
+
+    fields := []oa.Field{oa.field_make("name", oa.String_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+
+    col := make_string_array([]string{"alice", "bob", "charlie"})
+    cols := []oa.Array{col}
+    batch, _ := oa.record_batch_make(&schema, cols)
+    defer oa.record_batch_free(&batch)
+
+    write_ok := oa.ipc_write_file(path, &schema, []oa.Record_Batch{batch})
+    testing.expect(t, write_ok)
+
+    schema2, batches, ok := oa.ipc_read_file(path)
+    testing.expect(t, ok)
+    defer {
+        oa.schema_free(schema2)
+        free(schema2)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    testing.expect_value(t, len(batches), 1)
+    nm := oa.record_batch_column(&batches[0], "name")
+    testing.expect(t, nm != nil)
+    testing.expect_value(t, oa.array_get_string(nm, 0), "alice")
+    testing.expect_value(t, oa.array_get_string(nm, 2), "charlie")
+}
+
+// ── IPC stream format ─────────────────────────────────────────────────────────
+
+@(test)
+test_ipc_stream_roundtrip :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_stream.arrows"
+    defer os.remove(path)
+
+    fields := []oa.Field{oa.field_make("n", oa.Int32_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+
+    a1 := make_i32_array([]i32{1, 2, 3})
+    a2 := make_i32_array([]i32{4, 5})
+    b1, _ := oa.record_batch_make(&schema, []oa.Array{a1})
+    b2, _ := oa.record_batch_make(&schema, []oa.Array{a2})
+    defer oa.record_batch_free(&b1); defer oa.record_batch_free(&b2)
+
+    write_ok := oa.ipc_write_stream(path, &schema, []oa.Record_Batch{b1, b2})
+    testing.expect(t, write_ok, "ipc_write_stream failed")
+
+    schema2, batches, read_ok := oa.ipc_read_stream(path)
+    testing.expect(t, read_ok, "ipc_read_stream failed")
+    defer {
+        oa.schema_free(schema2)
+        free(schema2)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    testing.expect_value(t, len(batches), 2)
+    testing.expect_value(t, len(schema2.fields), 1)
+    testing.expect_value(t, schema2.fields[0].name, "n")
+    testing.expect_value(t, batches[0].length, 3)
+    testing.expect_value(t, batches[1].length, 2)
+
+    c0 := oa.record_batch_column_at(&batches[0], 0)
+    c1 := oa.record_batch_column_at(&batches[1], 0)
+    testing.expect_value(t, oa.array_get(c0, 0, i32), i32(1))
+    testing.expect_value(t, oa.array_get(c0, 2, i32), i32(3))
+    testing.expect_value(t, oa.array_get(c1, 1, i32), i32(5))
+}
+
+@(test)
+test_ipc_stream_string :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_stream_str.arrows"
+    defer os.remove(path)
+
+    fields := []oa.Field{oa.field_make("s", oa.String_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+
+    col := make_string_array([]string{"one", "two", "three"})
+    batch, _ := oa.record_batch_make(&schema, []oa.Array{col})
+    defer oa.record_batch_free(&batch)
+
+    testing.expect(t, oa.ipc_write_stream(path, &schema, []oa.Record_Batch{batch}))
+
+    schema2, batches, ok := oa.ipc_read_stream(path)
+    testing.expect(t, ok)
+    defer {
+        oa.schema_free(schema2)
+        free(schema2)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    testing.expect_value(t, len(batches), 1)
+    s := oa.record_batch_column_at(&batches[0], 0)
+    testing.expect_value(t, oa.array_get_string(s, 0), "one")
+    testing.expect_value(t, oa.array_get_string(s, 2), "three")
+}
+
+@(test)
+test_ipc_multiple_batches :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_multi.arrow"
+    defer os.remove(path)
+
+    fields := []oa.Field{oa.field_make("n", oa.Int32_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+
+    a1 := make_i32_array([]i32{1, 2, 3})
+    a2 := make_i32_array([]i32{4, 5})
+    c1 := []oa.Array{a1}; c2 := []oa.Array{a2}
+    b1, _ := oa.record_batch_make(&schema, c1)
+    b2, _ := oa.record_batch_make(&schema, c2)
+    defer oa.record_batch_free(&b1); defer oa.record_batch_free(&b2)
+
+    batches_in := []oa.Record_Batch{b1, b2}
+    oa.ipc_write_file(path, &schema, batches_in)
+
+    schema2, batches, ok := oa.ipc_read_file(path)
+    testing.expect(t, ok)
+    defer {
+        oa.schema_free(schema2)
+        free(schema2)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    testing.expect_value(t, len(batches), 2)
+    testing.expect_value(t, batches[0].length, 3)
+    testing.expect_value(t, batches[1].length, 2)
+
+    col0 := oa.record_batch_column_at(&batches[0], 0)
+    col1 := oa.record_batch_column_at(&batches[1], 0)
+    testing.expect_value(t, oa.array_get(col0, 2, i32), i32(3))
+    testing.expect_value(t, oa.array_get(col1, 1, i32), i32(5))
+}
+
+// Security (A4): a file with a corrupt out-of-bounds string offset must be
+// rejected when validation is on, and the unsafe batch must not be returned.
+@(test)
+test_ipc_rejects_bad_offsets :: proc(t: ^testing.T) {
+    good := "/tmp/test_ipc_goodoff.arrow"
+    bad  := "/tmp/test_ipc_badoff.arrow"
+    defer os.remove(good); defer os.remove(bad)
+
+    fields := []oa.Field{oa.field_make("s", oa.String_Type{})}
+    schema, _ := oa.schema_make(fields)
+    defer oa.schema_free(&schema)
+    col := make_string_array([]string{"alpha", "beta", "gamma"})  // offsets [0,5,9,14]
+    batch, _ := oa.record_batch_make(&schema, []oa.Array{col})
+    defer oa.record_batch_free(&batch)
+    oa.ipc_write_file(good, &schema, []oa.Record_Batch{batch})
+
+    data, _ := os.read_entire_file(good, context.allocator)
+    defer delete(data)
+    // locate the i32 offsets buffer [0,5,9,14] and push the last offset OOB
+    pat := []u8{0,0,0,0, 5,0,0,0, 9,0,0,0, 14,0,0,0}
+    pos := -1
+    search: for i in 0..<len(data)-len(pat)+1 {
+        for j in 0..<len(pat) { if data[i+j] != pat[j] { continue search } }
+        pos = i; break
+    }
+    testing.expect(t, pos >= 0, "offsets pattern not found in file")
+    data[pos+12]=0xFF; data[pos+13]=0xFF; data[pos+14]=0xFF; data[pos+15]=0x7F  // 14 -> 0x7FFFFFFF
+    _ = os.write_entire_file(bad, data)
+
+    // validate (default) → corrupt batch rejected, not returned
+    sc, batches, ok := oa.ipc_read_file(bad)
+    testing.expect(t, ok)
+    testing.expect_value(t, len(batches), 0)
+    oa.schema_free(sc); free(sc); delete(batches)
+
+    // validate=false → the (unsafe) batch is returned, proving the check matters
+    sc2, batches2, ok2 := oa.ipc_read_file(bad, validate=false)
+    testing.expect(t, ok2)
+    testing.expect_value(t, len(batches2), 1)
+    oa.schema_free(sc2); free(sc2)
+    for bx in batches2 { bc := bx; oa.record_batch_free(&bc) }
+    delete(batches2)
+}
+
+// A1/A3: structural-fuzz — mutating or truncating a valid file must never crash
+// the reader (it returns gracefully). Reaching the end = no OOB/panic.
+@(test)
+test_ipc_fuzz_no_crash :: proc(t: ^testing.T) {
+    fields := []oa.Field{oa.field_make("i", oa.Int32_Type{}), oa.field_make("s", oa.String_Type{})}
+    schema, _ := oa.schema_make(fields); defer oa.schema_free(&schema)
+    ic := make_i32_array([]i32{1,2,3,4,5})
+    scol := make_string_array([]string{"a","bb","ccc","dddd","eeeee"})
+    batch, _ := oa.record_batch_make(&schema, []oa.Array{ic, scol}); defer oa.record_batch_free(&batch)
+    src := "/tmp/test_ipc_fuzz.arrow"; defer os.remove(src)
+    oa.ipc_write_file(src, &schema, []oa.Record_Batch{batch})
+    orig, _ := os.read_entire_file(src, context.allocator); defer delete(orig)
+
+    fp := "/tmp/test_ipc_fuzz2.arrow"; defer os.remove(fp)
+    free_result :: proc(sc: ^oa.Schema, batches: []oa.Record_Batch, ok: bool) {
+        if !ok { return }
+        if sc != nil { oa.schema_free(sc); free(sc) }
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+
+    rng: u64 = 0x1234_5678_9abc_def1
+    next :: proc(s: ^u64) -> u64 { s^ = s^*6364136223846793005 + 1442695040888963407; return (s^ >> 17) }
+
+    // single- and double-byte mutations
+    for _ in 0..<1500 {
+        data := make([]u8, len(orig)); copy(data, orig)
+        data[int(next(&rng) % u64(len(orig)))] = u8(next(&rng))
+        data[int(next(&rng) % u64(len(orig)))] = u8(next(&rng))
+        _ = os.write_entire_file(fp, data)
+        delete(data)
+        sc, bs, ok := oa.ipc_read_file(fp)
+        free_result(sc, bs, ok)
+    }
+    // every truncation length
+    for cut in 0..=len(orig) {
+        _ = os.write_entire_file(fp, orig[:cut])
+        sc, bs, ok := oa.ipc_read_file(fp)
+        free_result(sc, bs, ok)
+    }
+    testing.expect(t, true)  // survived: no OOB / panic
+}
+
+// A5: copy read mode (use_mmap=false) reads into a private buffer — no mapping
+// that could SIGBUS on concurrent truncation. Must read the same data.
+@(test)
+test_ipc_copy_mode :: proc(t: ^testing.T) {
+    path := "/tmp/test_ipc_copy.arrow"; defer os.remove(path)
+    fields := []oa.Field{oa.field_make("x", oa.Int32_Type{}), oa.field_make("s", oa.String_Type{})}
+    schema, _ := oa.schema_make(fields); defer oa.schema_free(&schema)
+    ic := make_i32_array([]i32{7, 8, 9})
+    scol := make_string_array([]string{"foo", "bar", "baz"})
+    batch, _ := oa.record_batch_make(&schema, []oa.Array{ic, scol}); defer oa.record_batch_free(&batch)
+    oa.ipc_write_file(path, &schema, []oa.Record_Batch{batch})
+
+    sc, batches, ok := oa.ipc_read_file(path, use_mmap = false)
+    testing.expect(t, ok)
+    defer {
+        oa.schema_free(sc); free(sc)
+        for bx in batches { bc := bx; oa.record_batch_free(&bc) }
+        delete(batches)
+    }
+    testing.expect_value(t, len(batches), 1)
+    cx := oa.record_batch_column_at(&batches[0], 0)
+    cs := oa.record_batch_column_at(&batches[0], 1)
+    testing.expect_value(t, oa.array_get(cx, 0, i32), i32(7))
+    testing.expect_value(t, oa.array_get(cx, 2, i32), i32(9))
+    testing.expect_value(t, oa.array_get_string(cs, 0), "foo")
+    testing.expect_value(t, oa.array_get_string(cs, 2), "baz")
+}
