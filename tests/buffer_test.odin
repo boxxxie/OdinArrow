@@ -42,7 +42,8 @@ test_buffer_is_64_byte_aligned :: proc(t: ^testing.T) {
 test_buffer_capacity_is_multiple_of_alignment :: proc(t: ^testing.T) {
 	sizes2 := []int{0, 1, 63, 64, 65, 200}
 	for size in sizes2 {
-		buf, _ := oa.buffer_make(size)
+		buf, err := oa.buffer_make(size)
+		testing.expect(t, err == nil)
 		defer oa.buffer_free(&buf)
 		testing.expect(
 			t,
@@ -57,7 +58,8 @@ test_buffer_capacity_is_multiple_of_alignment :: proc(t: ^testing.T) {
 
 @(test)
 test_buffer_is_zero_initialised :: proc(t: ^testing.T) {
-	buf, _ := oa.buffer_make(128)
+	buf, err := oa.buffer_make(128)
+	testing.expect(t, err == nil)
 	defer oa.buffer_free(&buf)
 	for i in 0..<buf.size {
 		testing.expect(t, buf.data[i] == 0, "every byte must start at zero")
@@ -80,7 +82,8 @@ test_buffer_size_zero :: proc(t: ^testing.T) {
 
 @(test)
 test_buffer_resize_grow_preserves_data :: proc(t: ^testing.T) {
-	buf, _ := oa.buffer_make(64)
+	buf, mk_err := oa.buffer_make(64)
+	testing.expect(t, mk_err == nil)
 	defer oa.buffer_free(&buf)
 
 	buf.data[0]  = 0xAB
@@ -95,10 +98,11 @@ test_buffer_resize_grow_preserves_data :: proc(t: ^testing.T) {
 
 @(test)
 test_buffer_resize_grow_zeroes_new_region :: proc(t: ^testing.T) {
-	buf, _ := oa.buffer_make(64)
+	buf, err := oa.buffer_make(64)
+	testing.expect(t, err == nil)
 	defer oa.buffer_free(&buf)
 
-	oa.buffer_resize(&buf, 192)
+	testing.expect(t, oa.buffer_resize(&buf, 192) == nil)
 	for i in 64..<192 {
 		testing.expect(t, buf.data[i] == 0, "newly grown region must be zero")
 	}
@@ -106,13 +110,14 @@ test_buffer_resize_grow_zeroes_new_region :: proc(t: ^testing.T) {
 
 @(test)
 test_buffer_resize_shrink_no_realloc :: proc(t: ^testing.T) {
-	buf, _ := oa.buffer_make(128)
+	buf, err := oa.buffer_make(128)
+	testing.expect(t, err == nil)
 	defer oa.buffer_free(&buf)
 
 	orig_cap := buf.capacity
 	buf.data[0] = 0x55
 
-	oa.buffer_resize(&buf, 32)
+	testing.expect(t, oa.buffer_resize(&buf, 32) == nil)
 	testing.expect_value(t, buf.size, 32)
 	testing.expect_value(t, buf.capacity, orig_cap) // capacity unchanged
 	testing.expect_value(t, buf.data[0], u8(0x55))
@@ -122,7 +127,8 @@ test_buffer_resize_shrink_no_realloc :: proc(t: ^testing.T) {
 
 @(test)
 test_buffer_slice_shares_memory :: proc(t: ^testing.T) {
-	buf, _ := oa.buffer_make(128)
+	buf, err := oa.buffer_make(128)
+	testing.expect(t, err == nil)
 	defer oa.buffer_free(&buf)
 
 	buf.data[10] = 0xFF
@@ -146,7 +152,8 @@ test_buffer_slice_shares_memory :: proc(t: ^testing.T) {
 
 @(test)
 test_buffer_slice_zero_length :: proc(t: ^testing.T) {
-	buf, _ := oa.buffer_make(64)
+	buf, err := oa.buffer_make(64)
+	testing.expect(t, err == nil)
 	defer oa.buffer_free(&buf)
 
 	view := oa.buffer_slice(&buf, 32, 32)
@@ -157,7 +164,8 @@ test_buffer_slice_zero_length :: proc(t: ^testing.T) {
 
 @(test)
 test_buffer_copy_is_independent :: proc(t: ^testing.T) {
-	src, _ := oa.buffer_make(64)
+	src, mk_err := oa.buffer_make(64)
+	testing.expect(t, mk_err == nil)
 	defer oa.buffer_free(&src)
 	src.data[7] = 0xBE
 
@@ -176,11 +184,16 @@ test_buffer_copy_is_independent :: proc(t: ^testing.T) {
 @(test)
 test_buffer_no_leak :: proc(t: ^testing.T) {
 	track := setup_tracking(t)
-	defer check_no_leaks(t, &track)
+	saved_alloc := context.allocator
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
 	context.allocator = mem.tracking_allocator(&track)
 
-	buf, _ := oa.buffer_make(256)
-	oa.buffer_resize(&buf, 512)
+	buf, mk_err := oa.buffer_make(256)
+	testing.expect(t, mk_err == nil)
+	testing.expect(t, oa.buffer_resize(&buf, 512) == nil)
 	oa.buffer_free(&buf)
 }
 

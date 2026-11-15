@@ -13,7 +13,8 @@ build_bool_mask :: proc(pass: []bool) -> oa.Array {
 	for v in pass {
 		oa.builder_append(&b, v)
 	}
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	assert(err == nil)
 	return arr
 }
 
@@ -40,7 +41,8 @@ test_compute_sum_with_nulls :: proc(t: ^testing.T) {
 	oa.builder_append(&b, i32(10))
 	oa.builder_append_null(&b)
 	oa.builder_append(&b, i32(20))
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	sum, n := oa.compute_sum(&arr)
@@ -52,7 +54,8 @@ test_compute_sum_with_nulls :: proc(t: ^testing.T) {
 test_compute_sum_f64 :: proc(t: ^testing.T) {
 	arr := build_array([]f64{1.5, 2.5, 3.0})
 	defer oa.array_free(&arr)
-	sum, _ := oa.compute_sum(&arr)
+	sum, n := oa.compute_sum(&arr)
+	testing.expect_value(t, n, 3)
 	testing.expect(t, approx_eq(sum, 7.0, 1e-12))
 }
 
@@ -60,7 +63,8 @@ test_compute_sum_f64 :: proc(t: ^testing.T) {
 test_compute_sum_empty :: proc(t: ^testing.T) {
 	b := oa.builder_make(i32)
 	defer oa.builder_destroy(&b)
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 	sum, n := oa.compute_sum(&arr)
 	testing.expect_value(t, sum, f64(0))
@@ -88,7 +92,8 @@ test_compute_min_with_nulls :: proc(t: ^testing.T) {
 	oa.builder_append_null(&b)
 	oa.builder_append(&b, i32(7))
 	oa.builder_append_null(&b)
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	mn, n := oa.compute_min(&arr)
@@ -102,7 +107,8 @@ test_compute_min_all_null :: proc(t: ^testing.T) {
 	defer oa.builder_destroy(&b)
 	oa.builder_append_null(&b)
 	oa.builder_append_null(&b)
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	_, n := oa.compute_min(&arr)
@@ -127,7 +133,8 @@ test_compute_mean_with_nulls :: proc(t: ^testing.T) {
 	oa.builder_append(&b, f64(10.0))
 	oa.builder_append_null(&b)
 	oa.builder_append(&b, f64(20.0))
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	mean, n := oa.compute_mean(&arr)
@@ -144,7 +151,8 @@ test_compute_count :: proc(t: ^testing.T) {
 	oa.builder_append(&b, i32(1))
 	oa.builder_append_null(&b)
 	oa.builder_append(&b, i32(3))
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	total, valid := oa.compute_count(&arr)
@@ -177,13 +185,15 @@ test_filter_null_in_source :: proc(t: ^testing.T) {
 	oa.builder_append(&b, i32(1))
 	oa.builder_append_null(&b)
 	oa.builder_append(&b, i32(3))
-	src, _ := oa.builder_finish(&b)
+	src, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&src)
 
 	mask := build_bool_mask([]bool{true, true, true})
 	defer oa.array_free(&mask)
 
-	result, _ := oa.compute_filter(&src, &mask)
+	result, ferr := oa.compute_filter(&src, &mask)
+	testing.expect_value(t, ferr, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, 3)
 	testing.expect(t, oa.array_is_valid(&result, 0))
@@ -202,10 +212,12 @@ test_filter_null_in_mask :: proc(t: ^testing.T) {
 	oa.builder_append(&bm, true)
 	oa.builder_append_null(&bm) // null mask → exclude
 	oa.builder_append(&bm, true)
-	mask, _ := oa.builder_finish(&bm)
+	mask, merr := oa.builder_finish(&bm)
+	testing.expect_value(t, merr, nil)
 	defer oa.array_free(&mask)
 
-	result, _ := oa.compute_filter(&src, &mask)
+	result, ferr := oa.compute_filter(&src, &mask)
+	testing.expect_value(t, ferr, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, 2)
 	testing.expect_value(t, oa.array_get(&result, 0, i32), i32(1))
@@ -219,7 +231,8 @@ test_filter_all_false :: proc(t: ^testing.T) {
 	defer oa.array_free(&arr)
 	defer oa.array_free(&mask)
 
-	result, _ := oa.compute_filter(&arr, &mask)
+	result, err := oa.compute_filter(&arr, &mask)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, 0)
 }
@@ -232,7 +245,8 @@ test_filter_all_true :: proc(t: ^testing.T) {
 	defer oa.array_free(&arr)
 	defer oa.array_free(&mask)
 
-	result, _ := oa.compute_filter(&arr, &mask)
+	result, err := oa.compute_filter(&arr, &mask)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, 3)
 	check_values(t, &result, vals)
@@ -245,7 +259,8 @@ test_filter_float64 :: proc(t: ^testing.T) {
 	defer oa.array_free(&arr)
 	defer oa.array_free(&mask)
 
-	result, _ := oa.compute_filter(&arr, &mask)
+	result, err := oa.compute_filter(&arr, &mask)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, 2)
 	testing.expect(t, approx_eq(oa.array_get(&result, 0, f64), 2.2, 1e-12))
@@ -259,13 +274,15 @@ test_filter_string :: proc(t: ^testing.T) {
 	oa.string_builder_append(&b, "keep")
 	oa.string_builder_append(&b, "drop")
 	oa.string_builder_append(&b, "keep2")
-	src, _ := oa.string_builder_finish(&b)
+	src, err := oa.string_builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&src)
 
 	mask := build_bool_mask([]bool{true, false, true})
 	defer oa.array_free(&mask)
 
-	result, _ := oa.compute_filter(&src, &mask)
+	result, ferr := oa.compute_filter(&src, &mask)
+	testing.expect_value(t, ferr, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, 2)
 	testing.expect_value(t, oa.array_get_string(&result, 0), "keep")
@@ -282,7 +299,8 @@ test_compute_sum_large :: proc(t: ^testing.T) {
 	for i in 0..<n {
 		oa.builder_append(&b, i32(i))
 	}
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	sum, valid := oa.compute_sum(&arr)
@@ -299,11 +317,14 @@ test_compute_min_max_large :: proc(t: ^testing.T) {
 	for i in 0..<n {
 		oa.builder_append(&b, i32(n - i)) // n, n-1, ..., 1
 	}
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
-	mn, _ := oa.compute_min(&arr)
-	mx, _ := oa.compute_max(&arr)
+	mn, n1 := oa.compute_min(&arr)
+	mx, n2 := oa.compute_max(&arr)
+	testing.expect_value(t, n1, n)
+	testing.expect_value(t, n2, n)
 	testing.expect_value(t, mn, f64(1))
 	testing.expect_value(t, mx, f64(n))
 }
@@ -314,20 +335,30 @@ test_compute_filter_large :: proc(t: ^testing.T) {
 	b := oa.builder_make(i32, n)
 	defer oa.builder_destroy(&b)
 	for i in 0..<n { oa.builder_append(&b, i32(i)) }
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	mb := oa.builder_make(bool, n)
 	defer oa.builder_destroy(&mb)
 	for i in 0..<n { oa.builder_append(&mb, i % 2 == 0) } // even elements pass
-	mask, _ := oa.builder_finish(&mb)
+	mask, merr := oa.builder_finish(&mb)
+	testing.expect_value(t, merr, nil)
 	defer oa.array_free(&mask)
 
-	result, _ := oa.compute_filter(&arr, &mask)
+	result, ferr := oa.compute_filter(&arr, &mask)
+	testing.expect_value(t, ferr, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, n / 2)
-	testing.expect_value(t, oa.array_get(&result, 0, i32), i32(0))
-	testing.expect_value(t, oa.array_get(&result, 1, i32), i32(2))
+	testing.expect_value(t, oa.array_null_count(&result), 0)
+	if result.length == n / 2 {
+		for i in 0..<result.length {
+			if !oa.array_is_valid(&result, i) || oa.array_get(&result, i, i32) != i32(i * 2) {
+				testing.expectf(t, false, "filter mismatch at %d: valid=%v got=%d want=%d", i, oa.array_is_valid(&result, i), oa.array_get(&result, i, i32), i32(i * 2))
+				break
+			}
+		}
+	}
 }
 
 // ── min_max (single pass) ─────────────────────────────────────────────────────
@@ -350,7 +381,8 @@ test_compute_min_max_with_nulls :: proc(t: ^testing.T) {
 	oa.builder_append_null(&b)
 	oa.builder_append(&b, i32(3))
 	oa.builder_append(&b, i32(8))
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	lo, hi, n := oa.compute_min_max(&arr)
@@ -371,10 +403,12 @@ test_compute_take :: proc(t: ^testing.T) {
 	oa.builder_append(&ib, i64(4))
 	oa.builder_append(&ib, i64(1))
 	oa.builder_append(&ib, i64(3))
-	idx, _ := oa.builder_finish(&ib)
+	idx, idx_err := oa.builder_finish(&ib)
+	testing.expect_value(t, idx_err, nil)
 	defer oa.array_free(&idx)
 
-	result, _ := oa.compute_take(&src, &idx)
+	result, err := oa.compute_take(&src, &idx)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, 3)
 	testing.expect_value(t, oa.array_get(&result, 0, i32), i32(50))
@@ -389,7 +423,8 @@ test_compute_cast_i32_to_f64 :: proc(t: ^testing.T) {
 	src := build_array([]i32{1, 2, 3})
 	defer oa.array_free(&src)
 
-	result, _ := oa.compute_cast(&src, oa.Float64_Type{})
+	result, err := oa.compute_cast(&src, oa.Float64_Type{})
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, 3)
 	testing.expect(t, approx_eq(oa.array_get(&result, 0, f64), 1.0, 1e-10))
@@ -404,11 +439,13 @@ test_compute_cast_large_nt :: proc(t: ^testing.T) {
 	n := 1_048_583 // > 1Mi f64 = 8 MiB out; %8 == 7 → 7-element tail
 	b := oa.builder_make(i32, n)
 	for i in 0..<n { oa.builder_append(&b, i32(i)) }
-	src, _ := oa.builder_finish(&b)
+	src, s_err := oa.builder_finish(&b)
+	testing.expect_value(t, s_err, nil)
 	oa.builder_destroy(&b)
 	defer oa.array_free(&src)
 
-	result, _ := oa.compute_cast(&src, oa.Float64_Type{})
+	result, r_err := oa.compute_cast(&src, oa.Float64_Type{})
+	testing.expect_value(t, r_err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, n)
 	testing.expect(t, approx_eq(oa.array_get(&result, 0, f64),       0.0,         1e-6))
@@ -425,7 +462,8 @@ test_compute_add :: proc(t: ^testing.T) {
 	b := build_array([]i32{10, 20, 30})
 	defer oa.array_free(&a); defer oa.array_free(&b)
 
-	result, _ := oa.compute_add(&a, &b)
+	result, err := oa.compute_add(&a, &b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, oa.array_get(&result, 0, i32), i32(11))
 	testing.expect_value(t, oa.array_get(&result, 1, i32), i32(22))
@@ -440,11 +478,14 @@ test_compute_add_large_nt :: proc(t: ^testing.T) {
 	ab := oa.builder_make(i32, n)
 	bb := oa.builder_make(i32, n)
 	for i in 0..<n { oa.builder_append(&ab, i32(i)); oa.builder_append(&bb, i32(2 * i)) }
-	a, _ := oa.builder_finish(&ab); oa.builder_destroy(&ab)
-	b, _ := oa.builder_finish(&bb); oa.builder_destroy(&bb)
+	a, a_err := oa.builder_finish(&ab); oa.builder_destroy(&ab)
+	b, b_err := oa.builder_finish(&bb); oa.builder_destroy(&bb)
+	testing.expect_value(t, a_err, nil)
+	testing.expect_value(t, b_err, nil)
 	defer oa.array_free(&a); defer oa.array_free(&b)
 
-	result, _ := oa.compute_add(&a, &b)
+	result, r_err := oa.compute_add(&a, &b)
+	testing.expect_value(t, r_err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, result.length, n)
 	testing.expect_value(t, oa.array_get(&result, 0, i32),         i32(0))
@@ -460,13 +501,15 @@ test_compute_arithmetic_null_propagation :: proc(t: ^testing.T) {
 	oa.builder_append(&ab, i32(5))
 	oa.builder_append_null(&ab)
 	oa.builder_append(&ab, i32(7))
-	a, _ := oa.builder_finish(&ab)
+	a, a_err := oa.builder_finish(&ab)
+	testing.expect_value(t, a_err, nil)
 	defer oa.array_free(&a)
 
 	b := build_array([]i32{1, 2, 3})
 	defer oa.array_free(&b)
 
-	result, _ := oa.compute_add(&a, &b)
+	result, r_err := oa.compute_add(&a, &b)
+	testing.expect_value(t, r_err, nil)
 	defer oa.array_free(&result)
 	testing.expect_value(t, oa.array_get(&result, 0, i32), i32(6))
 	testing.expect(t, oa.array_is_null(&result, 1))
@@ -480,7 +523,8 @@ test_sort_indices_i32 :: proc(t: ^testing.T) {
 	a := build_array([]i32{30, 10, 20, 10, 40})
 	defer oa.array_free(&a)
 
-	idx, _ := oa.compute_sort_indices(&a)
+	idx, i_err := oa.compute_sort_indices(&a)
+	testing.expect_value(t, i_err, nil)
 	defer oa.array_free(&idx)
 
 	// Ascending order; ties (two 10s at positions 1 and 3) stay in input order.
@@ -492,7 +536,8 @@ test_sort_indices_i32 :: proc(t: ^testing.T) {
 	testing.expect_value(t, oa.array_get(&idx, 4, i64), i64(4))
 
 	// Feeding the indices into take yields a sorted array.
-	sorted, _ := oa.compute_take(&a, &idx)
+	sorted, s_err := oa.compute_take(&a, &idx)
+	testing.expect_value(t, s_err, nil)
 	defer oa.array_free(&sorted)
 	testing.expect_value(t, oa.array_get(&sorted, 0, i32), i32(10))
 	testing.expect_value(t, oa.array_get(&sorted, 1, i32), i32(10))
@@ -508,10 +553,12 @@ test_sort_indices_i32_negatives :: proc(t: ^testing.T) {
 	a := build_array([]i32{5, -3, 0, -100, 7, -3, 2147483647, -2147483648})
 	defer oa.array_free(&a)
 
-	idx, _ := oa.compute_sort_indices(&a)
+	idx, i_err := oa.compute_sort_indices(&a)
+	testing.expect_value(t, i_err, nil)
 	defer oa.array_free(&idx)
 
-	sorted, _ := oa.compute_take(&a, &idx)
+	sorted, s_err := oa.compute_take(&a, &idx)
+	testing.expect_value(t, s_err, nil)
 	defer oa.array_free(&sorted)
 
 	expected := []i32{-2147483648, -100, -3, -3, 0, 5, 7, 2147483647}
@@ -533,10 +580,12 @@ test_sort_indices_nulls_last :: proc(t: ^testing.T) {
 	oa.builder_append(&b, i32(1))
 	oa.builder_append_null(&b)
 	oa.builder_append(&b, i32(3))
-	a, _ := oa.builder_finish(&b)
+	a, a_err := oa.builder_finish(&b)
+	testing.expect_value(t, a_err, nil)
 	defer oa.array_free(&a)
 
-	idx, _ := oa.compute_sort_indices(&a)
+	idx, i_err := oa.compute_sort_indices(&a)
+	testing.expect_value(t, i_err, nil)
 	defer oa.array_free(&idx)
 
 	// Non-null ascending first: 1(@2), 3(@4), 5(@0); then nulls in order: @1, @3.
@@ -555,10 +604,12 @@ test_sort_indices_string :: proc(t: ^testing.T) {
 	oa.string_builder_append(&sb, "apple")
 	oa.string_builder_append(&sb, "cherry")
 	oa.string_builder_append(&sb, "apple")
-	a, _ := oa.string_builder_finish(&sb)
+	a, a_err := oa.string_builder_finish(&sb)
+	testing.expect_value(t, a_err, nil)
 	defer oa.array_free(&a)
 
-	idx, _ := oa.compute_sort_indices(&a)
+	idx, i_err := oa.compute_sort_indices(&a)
+	testing.expect_value(t, i_err, nil)
 	defer oa.array_free(&idx)
 
 	// apple(@1), apple(@3) stable, cherry(@2), pear(@0)
@@ -595,7 +646,8 @@ test_agg_with_nulls_matches_scalar :: proc(t: ^testing.T) {
 			ref_valid += 1
 		}
 	}
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	sum, vc := oa.compute_sum(&arr)
@@ -607,8 +659,10 @@ test_agg_with_nulls_matches_scalar :: proc(t: ^testing.T) {
 	testing.expect(t, approx_eq(lo, ref_min, 1e-9))
 	testing.expect(t, approx_eq(hi, ref_max, 1e-9))
 
-	mn, _ := oa.compute_min(&arr)
-	mx, _ := oa.compute_max(&arr)
+	mn, vc3 := oa.compute_min(&arr)
+	mx, vc4 := oa.compute_max(&arr)
+	testing.expect_value(t, vc3, ref_valid)
+	testing.expect_value(t, vc4, ref_valid)
 	testing.expect(t, approx_eq(mn, ref_min, 1e-9))
 	testing.expect(t, approx_eq(mx, ref_max, 1e-9))
 }
@@ -632,13 +686,15 @@ test_agg_with_nulls_i32_and_empty :: proc(t: ^testing.T) {
 			ref_valid += 1
 		}
 	}
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	sum, vc := oa.compute_sum(&arr)
 	testing.expect_value(t, vc, ref_valid)
 	testing.expect(t, approx_eq(sum, ref_sum, 1e-9))
-	lo, hi, _ := oa.compute_min_max(&arr)
+	lo, hi, vc_mm := oa.compute_min_max(&arr)
+	testing.expect_value(t, vc_mm, ref_valid)
 	testing.expect(t, approx_eq(lo, f64(ref_lo), 1e-9))
 	testing.expect(t, approx_eq(hi, f64(ref_hi), 1e-9))
 
@@ -646,7 +702,8 @@ test_agg_with_nulls_i32_and_empty :: proc(t: ^testing.T) {
 	nb := oa.builder_make(i32, 20)
 	defer oa.builder_destroy(&nb)
 	for _ in 0..<20 { oa.builder_append_null(&nb) }
-	na, _ := oa.builder_finish(&nb)
+	na, na_err := oa.builder_finish(&nb)
+	testing.expect_value(t, na_err, nil)
 	defer oa.array_free(&na)
 	s2, v2 := oa.compute_sum(&na)
 	testing.expect_value(t, v2, 0)
@@ -664,7 +721,8 @@ test_agg_with_nulls_sliced :: proc(t: ^testing.T) {
 		if i % 11 == 0 { oa.builder_append_null(&b) }
 		else           { oa.builder_append(&b, f64(i)) }
 	}
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&arr)
 
 	check :: proc(tc: ^testing.T, a: ^oa.Array) {

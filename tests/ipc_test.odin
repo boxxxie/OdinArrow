@@ -22,7 +22,8 @@ make_i32_array :: proc(vals: []i32) -> oa.Array {
 	b := oa.builder_make(i32, len(vals))
 	defer oa.builder_destroy(&b)
 	for v in vals { oa.builder_append(&b, v) }
-	arr, _ := oa.builder_finish(&b)
+	arr, err := oa.builder_finish(&b)
+	assert(err == nil)
 	return arr
 }
 
@@ -30,7 +31,8 @@ make_string_array :: proc(vals: []string) -> oa.Array {
 	b := oa.string_builder_make(len(vals))
 	defer oa.string_builder_destroy(&b)
 	for v in vals { oa.string_builder_append(&b, v) }
-	arr, _ := oa.string_builder_finish(&b)
+	arr, err := oa.string_builder_finish(&b)
+	assert(err == nil)
 	return arr
 }
 
@@ -46,12 +48,14 @@ test_ipc_rejects_bad_offsets :: proc(t: ^testing.T) {
 	}
 
 	fields := []oa.Field{oa.field_make("s", oa.String_Type{})}
-	schema, _ := oa.schema_make(fields)
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
 	defer oa.schema_free(&schema)
 	col := make_string_array([]string{"alpha", "beta", "gamma"})  // offsets [0,5,9,14]
-	batch, _ := oa.record_batch_make(&schema, []oa.Array{col})
+	batch, rb_ok := oa.record_batch_make(&schema, []oa.Array{col})
+	testing.expect(t, rb_ok)
 	defer oa.record_batch_free(&batch)
-	oa.ipc_write_file(good, &schema, []oa.Record_Batch{batch})
+	testing.expect(t, oa.ipc_write_file(good, &schema, []oa.Record_Batch{batch}))
 
 	data, _ := os.read_entire_file(good, context.allocator)
 	defer delete(data)
@@ -82,51 +86,94 @@ test_ipc_rejects_bad_offsets :: proc(t: ^testing.T) {
 }
 
 // A1/A3: structural-fuzz — mutating or truncating a valid file must never crash
-// the reader (it returns gracefully). Reaching the end = no OOB/panic.
+// the reader, valid input must round-trip cleanly, magic corruptions and strict
+// truncations must fail cleanly.
 @(test)
 test_ipc_fuzz_no_crash :: proc(t: ^testing.T) {
 	fields := []oa.Field{oa.field_make("i", oa.Int32_Type{}), oa.field_make("s", oa.String_Type{})}
-	schema, _ := oa.schema_make(fields); defer oa.schema_free(&schema)
-	ic := make_i32_array([]i32{1,2,3,4,5})
-	scol := make_string_array([]string{"a","bb","ccc","dddd","eeeee"})
-	batch, _ := oa.record_batch_make(&schema, []oa.Array{ic, scol}); defer oa.record_batch_free(&batch)
-	src := ipc_test_temp_path("fuzz", "arrow"); defer { os.remove(src); delete(src) }
-	oa.ipc_write_file(src, &schema, []oa.Record_Batch{batch})
-	orig, orig_err := os.read_entire_file(src, context.allocator)
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
+	defer oa.schema_free(&schema)
+	ic := make_i32_array([]i32{1, 2, 3, 4, 5})
+	scol := make_string_array([]string{"a", "bb", "ccc", "dddd", "eeeee"})
+	batch, rb_ok := oa.record_batch_make(&schema, []oa.Array{ic, scol})
+	testing.expect(t, rb_ok)
+	defer oa.record_batch_free(&batch)
+
+	fp := ipc_test_temp_path("fuzz", "arrow")
+	defer { os.remove(fp); delete(fp) }
+	testing.expect(t, oa.ipc_write_file(fp, &schema, []oa.Record_Batch{batch}), "ipc_write_file must succeed")
+	orig, orig_err := os.read_entire_file(fp, context.allocator)
 	testing.expect_value(t, orig_err, nil)
 	defer delete(orig)
 	if orig_err != nil || len(orig) == 0 {
 		return
 	}
 
-	fp := ipc_test_temp_path("fuzz2", "arrow"); defer { os.remove(fp); delete(fp) }
-	free_result :: proc(sc: ^oa.Schema, batches: []oa.Record_Batch, ok: bool) {
-		if !ok { return }
+	free_result :: proc(sc: ^oa.Schema, batches: []oa.Record_Batch) {
 		if sc != nil { oa.schema_free(sc); free(sc) }
 		for bx in batches { bc := bx; oa.record_batch_free(&bc) }
 		delete(batches)
 	}
 
+	// 1. Baseline: unmutated file must parse cleanly and match all rows.
+	{
+		sc0, bs0, ok0 := oa.ipc_read_file(fp)
+		testing.expect(t, ok0, "unmutated IPC file must read cleanly")
+		if ok0 {
+			testing.expect_value(t, len(bs0), 1)
+			if len(bs0) == 1 && sc0 != nil {
+				testing.expect_value(t, len(sc0.fields), 2)
+				testing.expect_value(t, bs0[0].length, 5)
+				want_s := []string{"a", "bb", "ccc", "dddd", "eeeee"}
+				for row in 0 ..< 5 {
+					testing.expect_value(t, oa.array_get(&bs0[0].columns[0], row, i32), i32(row + 1))
+					testing.expect_value(t, oa.array_get_string(&bs0[0].columns[1], row), want_s[row])
+				}
+			}
+		}
+		free_result(sc0, bs0)
+	}
+
+	// 2. Leading and trailing ARROW1 magic corruptions must be rejected.
+	if len(orig) >= 12 {
+		bad_buf := make([]u8, len(orig))
+		defer delete(bad_buf)
+		for pos in ([]int{0, len(orig) - 1}) {
+			copy(bad_buf, orig)
+			bad_buf[pos] ~= 0xFF
+			testing.expect_value(t, os.write_entire_file(fp, bad_buf), nil)
+			sc, bs, ok := oa.ipc_read_file(fp)
+			testing.expectf(t, !ok, "corrupted magic at byte %d must fail", pos)
+			free_result(sc, bs)
+		}
+	}
+
+	// 3. Deterministic 1- and 2-byte random mutations: never crash, never leak.
 	rng: u64 = 0x1234_5678_9abc_def1
 	next :: proc(s: ^u64) -> u64 { s^ = s^*6364136223846793005 + 1442695040888963407; return (s^ >> 17) }
-
-	// single- and double-byte mutations
+	mut_buf := make([]u8, len(orig))
+	defer delete(mut_buf)
 	for _ in 0..<1500 {
-		data := make([]u8, len(orig)); copy(data, orig)
-		data[int(next(&rng) % u64(len(orig)))] = u8(next(&rng))
-		data[int(next(&rng) % u64(len(orig)))] = u8(next(&rng))
-		_ = os.write_entire_file(fp, data)
-		delete(data)
-		sc, bs, ok := oa.ipc_read_file(fp)
-		free_result(sc, bs, ok)
+		copy(mut_buf, orig)
+		mut_buf[int(next(&rng) % u64(len(orig)))] = u8(next(&rng))
+		mut_buf[int(next(&rng) % u64(len(orig)))] = u8(next(&rng))
+		if os.write_entire_file(fp, mut_buf) != nil { continue }
+		sc, bs, _ := oa.ipc_read_file(fp)
+		free_result(sc, bs)
 	}
-	// every truncation length
-	for cut in 0..=len(orig) {
-		_ = os.write_entire_file(fp, orig[:cut])
+
+	// 4. Every strict prefix truncation must fail; full length must succeed.
+	for cut in 0..<len(orig) {
+		if os.write_entire_file(fp, orig[:cut]) != nil { continue }
 		sc, bs, ok := oa.ipc_read_file(fp)
-		free_result(sc, bs, ok)
+		testing.expectf(t, !ok, "strict truncation cut=%d/%d unexpectedly succeeded", cut, len(orig))
+		free_result(sc, bs)
 	}
-	testing.expect(t, true)  // survived: no OOB / panic
+	testing.expect_value(t, os.write_entire_file(fp, orig), nil)
+	sc_full, bs_full, ok_full := oa.ipc_read_file(fp)
+	testing.expect(t, ok_full, "restored full IPC file must read cleanly")
+	free_result(sc_full, bs_full)
 }
 
 // ── Pattern E: Magic & Bounds Unit Coverage ──────────────────────────────────
@@ -143,12 +190,14 @@ test_ipc_rejects_corrupt_tail_magic :: proc(t: ^testing.T) {
 	}
 
 	fields := []oa.Field{oa.field_make("n", oa.Int32_Type{})}
-	schema, _ := oa.schema_make(fields)
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
 	defer oa.schema_free(&schema)
 	col := make_i32_array([]i32{1, 2, 3})
-	batch, _ := oa.record_batch_make(&schema, []oa.Array{col})
+	batch, rb_ok := oa.record_batch_make(&schema, []oa.Array{col})
+	testing.expect(t, rb_ok)
 	defer oa.record_batch_free(&batch)
-	oa.ipc_write_file(good, &schema, []oa.Record_Batch{batch})
+	testing.expect(t, oa.ipc_write_file(good, &schema, []oa.Record_Batch{batch}))
 
 	data, err := os.read_entire_file(good, context.allocator)
 	testing.expect_value(t, err, nil)
@@ -194,11 +243,13 @@ test_ipc_stream_duplicate_schema_no_leak :: proc(t: ^testing.T) {
 	}
 
 	fields := []oa.Field{oa.field_make("val", oa.Int32_Type{})}
-	schema, _ := oa.schema_make(fields)
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
 	defer oa.schema_free(&schema)
 
 	col1 := make_i32_array([]i32{10, 20})
-	b1, _ := oa.record_batch_make(&schema, []oa.Array{col1})
+	b1, rb_ok := oa.record_batch_make(&schema, []oa.Array{col1})
+	testing.expect(t, rb_ok)
 	defer oa.record_batch_free(&b1)
 
 	testing.expect(t, oa.ipc_write_stream(s1, &schema, nil))
@@ -334,11 +385,13 @@ test_ipc_stream_record_batch_before_schema_no_leak :: proc(t: ^testing.T) {
 	}
 
 	fields := []oa.Field{oa.field_make("val", oa.Int32_Type{})}
-	schema, _ := oa.schema_make(fields)
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
 	defer oa.schema_free(&schema)
 
 	col := make_i32_array([]i32{1, 2})
-	rb, _ := oa.record_batch_make(&schema, []oa.Array{col})
+	rb, rb_ok := oa.record_batch_make(&schema, []oa.Array{col})
+	testing.expect(t, rb_ok)
 	defer oa.record_batch_free(&rb)
 
 	testing.expect(t, oa.ipc_write_stream(s1, &schema, nil))
@@ -442,12 +495,14 @@ test_ipc_rejects_unknown_type_discriminant_no_leak :: proc(t: ^testing.T) {
 		oa.field_make("unk_col_0", oa.Int32_Type{}),
 		oa.field_make("tail_str",  oa.String_Type{}),
 	}
-	schema, _ := oa.schema_make(fields)
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
 	defer oa.schema_free(&schema)
 
 	c0 := make_i32_array([]i32{10, 20})
 	c1 := make_string_array([]string{"x", "yy"})
-	rb, _ := oa.record_batch_make(&schema, []oa.Array{c0, c1})
+	rb, rb_ok := oa.record_batch_make(&schema, []oa.Array{c0, c1})
+	testing.expect(t, rb_ok)
 	defer oa.record_batch_free(&rb)
 
 	testing.expect(t, oa.ipc_write_file(good_file, &schema, []oa.Record_Batch{rb}))

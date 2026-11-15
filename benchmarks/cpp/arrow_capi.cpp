@@ -122,18 +122,16 @@ ArrowScalar arrow_capi_max_i32(const uint8_t* validity, const int32_t* data, int
 
 // ── filter ────────────────────────────────────────────────────────────────────
 
-int64_t arrow_capi_filter_i32(
+static std::shared_ptr<arrow::Int32Array> run_filter_i32(
     const uint8_t* src_validity,
     const int32_t* src_data,
     const uint8_t* mask_validity,
     const uint8_t* mask_bits,
-    int64_t n)
+    int64_t        n)
 {
-    // Source Int32 array
     auto src_ad  = make_i32_data(src_validity, src_data, n);
     auto src_arr = arrow::MakeArray(src_ad);
 
-    // Boolean mask array (bit-packed values in buf[1])
     int64_t mask_null = count_nulls(mask_validity, n);
     int64_t bm_bytes  = (n + 7) / 8;
     std::vector<std::shared_ptr<arrow::Buffer>> mask_bufs;
@@ -143,7 +141,38 @@ int64_t arrow_capi_filter_i32(
     auto mask_arr = arrow::MakeArray(mask_ad);
 
     auto result = arrow::compute::Filter(src_arr, mask_arr).ValueOrDie();
-    return result.make_array()->length();
+    return std::static_pointer_cast<arrow::Int32Array>(result.make_array());
+}
+
+int64_t arrow_capi_filter_i32(
+    const uint8_t* src_validity,
+    const int32_t* src_data,
+    const uint8_t* mask_validity,
+    const uint8_t* mask_bits,
+    int64_t n)
+{
+    return run_filter_i32(src_validity, src_data, mask_validity, mask_bits, n)->length();
+}
+
+int64_t arrow_capi_filter_i32_materialize(
+    const uint8_t* src_validity,
+    const int32_t* src_data,
+    const uint8_t* mask_validity,
+    const uint8_t* mask_bits,
+    int64_t        n,
+    int32_t*       out_values,
+    uint8_t*       out_valid,
+    int64_t        out_cap)
+{
+    auto out_arr = run_filter_i32(src_validity, src_data, mask_validity, mask_bits, n);
+    int64_t out_len = out_arr->length();
+    int64_t copy_n  = out_len < out_cap ? out_len : out_cap;
+    for (int64_t i = 0; i < copy_n; ++i) {
+        bool valid = out_arr->IsValid(i);
+        out_valid[i]  = valid ? 1 : 0;
+        out_values[i] = valid ? out_arr->Value(i) : 0;
+    }
+    return out_len;
 }
 
 // ── string scan ───────────────────────────────────────────────────────────────

@@ -39,6 +39,19 @@ int64_t arrow_capi_filter_i32(
     const uint8_t* mask_bits,     /* packed-bit bool values */
     int64_t n);
 
+/* Filter an Int32 array and materialize surviving values + validity bytes
+ * (1 = valid, 0 = null) into caller buffers up to out_cap. Returns total output length.
+ */
+int64_t arrow_capi_filter_i32_materialize(
+    const uint8_t* src_validity,  /* nullable */
+    const int32_t* src_data,
+    const uint8_t* mask_validity, /* nullable */
+    const uint8_t* mask_bits,     /* packed-bit bool values */
+    int64_t        n,
+    int32_t*       out_values,
+    uint8_t*       out_valid,
+    int64_t        out_cap);
+
 /* Sum of UTF-8 string lengths via Arrow utf8_length + sum.
  * offsets: (n+1) int32 offset values (Arrow StringArray format).
  * utf8_data: raw character bytes.

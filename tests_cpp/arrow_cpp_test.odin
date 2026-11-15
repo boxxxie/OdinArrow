@@ -34,6 +34,14 @@ foreign libarrow_capi {
         mask_validity: [^]u8, mask_bits: [^]u8,
         n: i64,
     ) -> i64 ---
+    arrow_capi_filter_i32_materialize :: proc(
+        src_validity: [^]u8, src_data: [^]i32,
+        mask_validity: [^]u8, mask_bits: [^]u8,
+        n: i64,
+        out_values: [^]i32,
+        out_valid: [^]u8,
+        out_cap: i64,
+    ) -> i64 ---
     arrow_capi_string_scan :: proc(
         validity: [^]u8,
         offsets:  [^]i32,
@@ -157,8 +165,55 @@ test_arrow_cpp_min_max_with_nulls :: proc(t: ^testing.T) {
 
 // ── filter ────────────────────────────────────────────────────────────────────
 
+verify_filter_i32_parity :: proc(t: ^testing.T, src, mask: ^oa.Array, loc := #caller_location) {
+    our_result, ferr := oa.compute_filter(src, mask)
+    testing.expect_value(t, ferr, nil, loc = loc)
+    defer oa.array_free(&our_result)
+
+    cap := src.length
+    cpp_vals  := make([]i32, max(cap, 1))
+    cpp_valid := make([]u8,  max(cap, 1))
+    defer delete(cpp_vals)
+    defer delete(cpp_valid)
+
+    cpp_count := arrow_capi_filter_i32_materialize(
+        src.buffers[0].data,
+        cast([^]i32)src.buffers[1].data,
+        mask.buffers[0].data,
+        mask.buffers[1].data,
+        i64(src.length),
+        raw_data(cpp_vals),
+        raw_data(cpp_valid),
+        i64(len(cpp_vals)))
+
+    testing.expect_value(t, i64(our_result.length), cpp_count, loc = loc)
+    if i64(our_result.length) != cpp_count {
+        return
+    }
+    cpp_nulls := 0
+    for i in 0 ..< our_result.length {
+        want_valid := cpp_valid[i] != 0
+        got_valid  := oa.array_is_valid(&our_result, i)
+        if got_valid != want_valid {
+            testing.expectf(t, false, "filter validity mismatch at %d: got=%v want=%v", i, got_valid, want_valid, loc = loc)
+            return
+        }
+        if !want_valid {
+            cpp_nulls += 1
+        } else {
+            got_v := oa.array_get(&our_result, i, i32)
+            if got_v != cpp_vals[i] {
+                testing.expectf(t, false, "filter value mismatch at %d: got=%d want=%d", i, got_v, cpp_vals[i], loc = loc)
+                return
+            }
+        }
+    }
+    testing.expect_value(t, oa.array_null_count(&our_result), cpp_nulls, loc = loc)
+}
+
 @(test)
 test_arrow_cpp_filter_count_matches :: proc(t: ^testing.T) {
+    // Non-null source and mask
     src := build_i32([]i32{10, 20, 30, 40, 50})
     defer oa.array_free(&src)
 
@@ -168,20 +223,31 @@ test_arrow_cpp_filter_count_matches :: proc(t: ^testing.T) {
     for v in mask_vals {
         oa.builder_append(&bm, v)
     }
-    mask, _ := oa.builder_finish(&bm)
+    mask, merr := oa.builder_finish(&bm)
+    testing.expect_value(t, merr, nil)
     defer oa.array_free(&mask)
 
-    our_result, _ := oa.compute_filter(&src, &mask)
-    defer oa.array_free(&our_result)
+    verify_filter_i32_parity(t, &src, &mask)
 
-    cpp_count := arrow_capi_filter_i32(
-        src.buffers[0].data,
-        cast([^]i32)src.buffers[1].data,
-        mask.buffers[0].data,
-        mask.buffers[1].data,
-        i64(src.length))
+    // Nullable source + nullable mask (null mask entries excluded, source nulls preserved)
+    src_null := build_i32_with_nulls(
+        []i32{10, 0, 30, 40, 0},
+        []bool{false, true, false, false, true},
+    )
+    defer oa.array_free(&src_null)
 
-    testing.expect_value(t, i64(our_result.length), cpp_count)
+    bm2 := oa.builder_make(bool, 5)
+    defer oa.builder_destroy(&bm2)
+    oa.builder_append(&bm2, true)
+    oa.builder_append(&bm2, true)
+    oa.builder_append_null(&bm2)
+    oa.builder_append(&bm2, false)
+    oa.builder_append(&bm2, true)
+    mask_null, merr2 := oa.builder_finish(&bm2)
+    testing.expect_value(t, merr2, nil)
+    defer oa.array_free(&mask_null)
+
+    verify_filter_i32_parity(t, &src_null, &mask_null)
 }
 
 @(test)
@@ -190,26 +256,18 @@ test_arrow_cpp_filter_large :: proc(t: ^testing.T) {
     b := oa.builder_make(i32, n)
     defer oa.builder_destroy(&b)
     for i in 0..<n { oa.builder_append(&b, i32(i)) }
-    arr, _ := oa.builder_finish(&b)
+    arr, err := oa.builder_finish(&b)
+    testing.expect_value(t, err, nil)
     defer oa.array_free(&arr)
 
     mb := oa.builder_make(bool, n)
     defer oa.builder_destroy(&mb)
     for i in 0..<n { oa.builder_append(&mb, i % 2 == 0) }
-    mask, _ := oa.builder_finish(&mb)
+    mask, merr := oa.builder_finish(&mb)
+    testing.expect_value(t, merr, nil)
     defer oa.array_free(&mask)
 
-    our_result, _ := oa.compute_filter(&arr, &mask)
-    defer oa.array_free(&our_result)
-
-    cpp_count := arrow_capi_filter_i32(
-        arr.buffers[0].data,
-        cast([^]i32)arr.buffers[1].data,
-        mask.buffers[0].data,
-        mask.buffers[1].data,
-        i64(arr.length))
-
-    testing.expect_value(t, i64(our_result.length), cpp_count)
+    verify_filter_i32_parity(t, &arr, &mask)
 }
 
 // ── string scan ───────────────────────────────────────────────────────────────

@@ -60,7 +60,8 @@ test_rle_encode_matches_plain :: proc(t: ^testing.T) {
 		oa.builder_append(&pb, v)
 		ref_sum += f64(v)
 	}
-	plain, _ := oa.builder_finish(&pb)
+	plain, err := oa.builder_finish(&pb)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&plain)
 
 	a := oa.rle_encode(&plain, i32)

@@ -8,7 +8,8 @@ mk_str_arr :: proc(vals: []string) -> oa.Array {
 	b := oa.string_builder_make(len(vals))
 	defer oa.string_builder_destroy(&b)
 	for v in vals { oa.string_builder_append(&b, v) }
-	arr, _ := oa.string_builder_finish(&b)
+	arr, err := oa.string_builder_finish(&b)
+	assert(err == nil)
 	return arr
 }
 
@@ -28,7 +29,8 @@ test_dict_encode_decode :: proc(t: ^testing.T) {
 		testing.expect_value(t, oa.str_dict_get(&d, i), v)
 	}
 
-	dec, _ := oa.str_dict_decode(&d)
+	dec, dec_err := oa.str_dict_decode(&d)
+	testing.expect_value(t, dec_err, nil)
 	defer oa.array_free(&dec)
 	testing.expect_value(t, dec.length, len(vals))
 	for v, i in vals {
@@ -43,7 +45,8 @@ test_dict_numeric :: proc(t: ^testing.T) {
 	defer oa.builder_destroy(&vb)
 	vals := []f64{5, 2, 5, 9, 2, 5, 9}
 	for v in vals { oa.builder_append(&vb, v) }
-	src, _ := oa.builder_finish(&vb)
+	src, err := oa.builder_finish(&vb)
+	testing.expect_value(t, err, nil)
 	defer oa.array_free(&src)
 
 	d := oa.dict_encode(&src, f64)
