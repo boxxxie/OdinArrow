@@ -63,6 +63,49 @@ int64_t arrow_capi_string_scan(
     const uint8_t* utf8_data,
     int64_t n);
 
+/* Sliced (offset >= 0) fixed-width kernels for i64, u64, f32. */
+ArrowScalar arrow_capi_sum_i64_slice (const uint8_t* validity, const int64_t*  data, int64_t offset, int64_t n);
+ArrowScalar arrow_capi_min_i64_slice (const uint8_t* validity, const int64_t*  data, int64_t offset, int64_t n);
+ArrowScalar arrow_capi_max_i64_slice (const uint8_t* validity, const int64_t*  data, int64_t offset, int64_t n);
+
+ArrowScalar arrow_capi_sum_u64_slice (const uint8_t* validity, const uint64_t* data, int64_t offset, int64_t n);
+ArrowScalar arrow_capi_min_u64_slice (const uint8_t* validity, const uint64_t* data, int64_t offset, int64_t n);
+ArrowScalar arrow_capi_max_u64_slice (const uint8_t* validity, const uint64_t* data, int64_t offset, int64_t n);
+
+ArrowScalar arrow_capi_sum_f32_slice (const uint8_t* validity, const float*    data, int64_t offset, int64_t n);
+ArrowScalar arrow_capi_mean_f32_slice(const uint8_t* validity, const float*    data, int64_t offset, int64_t n);
+
+/* Sliced Bool and Binary array validation + statistics (returns 1 if ValidateFull passes). */
+int arrow_capi_bool_stats_slice(
+    const uint8_t* validity,
+    const uint8_t* bits,
+    int64_t offset,
+    int64_t n,
+    int64_t* out_true_count,
+    int64_t* out_null_count);
+
+int arrow_capi_binary_stats_slice(
+    const uint8_t* validity,
+    const int32_t* offsets,
+    const uint8_t* data,
+    int64_t total_elems,
+    int64_t data_bytes,
+    int64_t offset,
+    int64_t n,
+    int64_t* out_valid_bytes,
+    int64_t* out_null_count);
+
+/* Arrow IPC file/stream interop helpers (returns 1 on success, 0 on error). */
+int arrow_capi_ipc_write_sample(const char* path, int is_stream);
+
+int arrow_capi_ipc_verify_roundtrip(
+    const char* path,
+    int is_stream,
+    int64_t expected_rows,
+    int32_t expected_cols,
+    int64_t* out_i64_sum,
+    int64_t* out_bin_bytes);
+
 #ifdef __cplusplus
 }
 #endif
