@@ -4,6 +4,7 @@ import "core:mem"
 import "core:slice"
 import "core:testing"
 import oa "../skadi"
+import pipeline "../skadi/pipeline"
 
 @(test)
 test_umbra_inline_and_long :: proc(t: ^testing.T) {
@@ -166,5 +167,81 @@ test_umbra_long_tie_break_offsets_and_mixed_lengths :: proc(t: ^testing.T) {
 		ui := oa.array_get(&uidx, k, i64)
 		si := oa.array_get(&sidx, k, i64)
 		testing.expect_value(t, ui, si)
+	}
+}
+
+@(test)
+test_umbra_actor_parallel_sort_parity :: proc(t: ^testing.T) {
+	mp: pipeline.Morsel_Pipeline
+	testing.expect(t, pipeline.pipeline_init(&mp, 4), "pipeline_init failed")
+	defer pipeline.pipeline_destroy(&mp)
+
+	n :: 20_000
+	ub := oa.umbra_builder_make(n)
+	sb := oa.string_builder_make(n)
+	buf: [48]u8
+	for i in 0..<n {
+		val: string
+		switch i % 7 {
+		case 0:
+			val = ""
+		case 1:
+			buf[0] = u8('a' + i % 11)
+			buf[1] = 0
+			buf[2] = 'z'
+			val = string(buf[:3])
+		case 2:
+			copy(buf[:4], "abcd")
+			val = string(buf[:4])
+		case 3:
+			copy(buf[:12], "abcd12345678")
+			val = string(buf[:12])
+		case 4:
+			copy(buf[:12], "abcd12345678")
+			buf[12] = u8('0' + i % 10)
+			buf[13] = u8('a' + (i / 10) % 26)
+			val = string(buf[:14])
+		case 5:
+			copy(buf[:16], "long_overflow_k_")
+			buf[16] = u8('0' + (i / 1000) % 10)
+			buf[17] = u8('0' + (i / 100) % 10)
+			buf[18] = u8('0' + (i / 10) % 10)
+			buf[19] = u8('0' + i % 10)
+			val = string(buf[:20])
+		case 6:
+			buf[0] = u8('z' - (i * 5) % 26)
+			buf[1] = u8('0' + i % 10)
+			val = string(buf[:2])
+		}
+		oa.umbra_append(&ub, val)
+		oa.string_builder_append(&sb, val)
+	}
+	u_arr := oa.umbra_builder_finish(&ub)
+	oa.umbra_builder_destroy(&ub)
+	defer oa.umbra_free(&u_arr)
+
+	s_arr, serr := oa.string_builder_finish(&sb)
+	testing.expect_value(t, serr, nil)
+	oa.string_builder_destroy(&sb)
+	defer oa.array_free(&s_arr)
+
+	ref_u := oa.umbra_sort_indices(&u_arr)
+	defer oa.array_free(&ref_u)
+	ref_s, rserr := oa.compute_sort_indices(&s_arr)
+	testing.expect_value(t, rserr, nil)
+	defer oa.array_free(&ref_s)
+
+	act_u := pipeline.pipeline_umbra_sort_indices(&mp, &u_arr)
+	defer oa.array_free(&act_u)
+
+	testing.expect_value(t, act_u.length, n)
+	testing.expect_value(t, ref_u.length, n)
+	testing.expect_value(t, ref_s.length, n)
+	for k in 0..<n {
+		ai := oa.array_get(&act_u, k, i64)
+		ui := oa.array_get(&ref_u, k, i64)
+		si := oa.array_get(&ref_s, k, i64)
+		testing.expect_value(t, ai, ui)
+		testing.expect_value(t, ai, si)
 	}
 }
