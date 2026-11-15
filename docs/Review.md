@@ -504,7 +504,7 @@ Unless requirements change, these remain **out of scope** for Skadi as documente
 - [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html)  
 - [Arrow Flight](https://arrow.apache.org/docs/format/Flight.html)  
 - [PyArrow Dataset](https://arrow.apache.org/docs/python/dataset.html)  
-- Skadi: [`README.md`](README.md), [`PLAN.md`](PLAN.md), [`Cursor.md`](Cursor.md), [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md)
+- Skadi: [`README.md`](../README.md), [`Cursor.md`](Cursor.md), [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)
 
 ---
 

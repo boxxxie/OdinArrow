@@ -171,8 +171,6 @@ package. A complete, runnable tour of the API lives in
 | Reusable buffer-pool allocator                       | ✅           |
 | Parquet, Flight RPC, GPU kernels                     | out of scope |
 
-See [`PLAN.md`](PLAN.md) for the full design and phase breakdown.
-
 ## Project layout
 
 ```
