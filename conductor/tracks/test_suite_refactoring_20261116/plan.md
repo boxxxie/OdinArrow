@@ -60,12 +60,12 @@ Adds unit and property/spec coverage for all remaining `skadi/` gaps identified 
 ## Phase 4: Complete Arrow C++ FFI Parity & Parquet/CSV Error-Path Tests
 Expands cross-language interop and negative Parquet reader coverage.
 
-- [ ] Task: Expand `tests_cpp/arrow_cpp_test.odin` Type & Slice Coverage
-    - [ ] Add Arrow C++ parity tests for `i64`, `u64`, `f32`, `bool`, `Binary_Type`, sliced (`offset > 0`) arrays, and Arrow IPC round-trip parity in `tests_cpp/arrow_cpp_test.odin`
-    - [ ] Run `make test-cpp` and verify all interop tests pass
-- [ ] Task: Add Parquet/CSV CLI Argument, Footer & Compression Codec Rejection Tests
-    - [ ] Add tests covering `-m` memory-limit flag parsing and invalid path/argument CLI error handling for `examples/parquet_to_csv` and `examples/csv_to_parquet`
-    - [ ] Add unit tests in `tests/parquet_internals_test.odin` for `p2c.parse_footer` rejecting invalid `PAR1` magic bytes and truncated footers
-    - [ ] Add unit tests in `tests/parquet_internals_test.odin` for `p2c.col_stream_init` / `p2c.col_stream_load_page` rejecting unsupported non-uncompressed codecs (`codec != 0`)
-    - [ ] Run `make check && make test && make test-cpp` and confirm 100% pass with 0 warnings
+- [x] Task: Expand `tests_cpp/arrow_cpp_test.odin` Type & Slice Coverage `c08a485` (`cpp_temp_path` fix in `304fc06`)
+    - [x] Add Arrow C++ parity tests for `i64`, `u64`, `f32`, `bool`, `Binary_Type`, sliced (`offset > 0`) arrays, and Arrow IPC round-trip parity in `tests_cpp/arrow_cpp_test.odin`
+    - [x] Run `make test-cpp` and verify all interop tests pass
+- [x] Task: Add Parquet/CSV CLI Argument, Footer & Compression Codec Rejection Tests `304fc06`
+    - [x] Add tests covering `-m` memory-limit flag parsing and invalid path/argument CLI error handling for `examples/parquet_to_csv` and `examples/csv_to_parquet`
+    - [x] Add unit tests in `tests/parquet_internals_test.odin` for `p2c.parse_footer` rejecting invalid `PAR1` magic bytes and truncated footers
+    - [x] Add unit tests in `tests/parquet_internals_test.odin` for `p2c.col_stream_init` / `p2c.col_stream_load_page` rejecting unsupported non-uncompressed codecs (`codec != 0`)
+    - [x] Run `make check && make test && make test-cpp` and confirm 100% pass with 0 warnings
 - [ ] Task: Conductor - User Manual Verification 'Phase 4: Complete Arrow C++ FFI Parity & Parquet/CSV Error-Path Tests' (Protocol in workflow.md)
