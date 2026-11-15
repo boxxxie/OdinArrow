@@ -29,8 +29,9 @@ PARQUET_LINK_FLAGS := -L$(ARROW_LDIR) \
 endif
 
 TEST_DATA ?= test_data.parquet
+ODIN_CHECK_FLAGS := -vet -strict-style -disallow-do -warnings-as-errors
 
-.PHONY: all test test-cpp bench-odin bench-python bench bench-compare \
+.PHONY: all check test test-cpp bench-odin bench-python bench bench-compare \
         build-arrow-capi bench-arrow-cpp \
         build-parquet-capi parquet-odin parquet-ffi bench-parquet \
         csv-to-parquet-odin csv-to-parquet-ffi clean
@@ -43,10 +44,19 @@ $(BIN):
 lib:
 	mkdir -p lib
 
-# ── Odin tests (no C++ dependency) ───────────────────────────────────────────
+# ── Odin static checks & tests (no C++ dependency) ────────────────────────────
+
+check:
+	odin check $(SRC) -no-entry-point $(ODIN_CHECK_FLAGS)
+	odin check examples/quickstart $(ODIN_CHECK_FLAGS)
+	odin check benchmarks/odin_c $(ODIN_CHECK_FLAGS)
+	odin check programs/parquet_to_csv_odin $(ODIN_CHECK_FLAGS)
+	odin check programs/parquet_to_csv_ffi $(ODIN_CHECK_FLAGS)
+	odin check programs/csv_to_parquet_odin $(ODIN_CHECK_FLAGS)
+	odin check programs/csv_to_parquet_ffi $(ODIN_CHECK_FLAGS)
 
 test: $(BIN)
-	odin test $(TESTS) -out:$(BIN)/test_runner -vet -strict-style
+	odin test $(TESTS) -out:$(BIN)/test_runner $(ODIN_CHECK_FLAGS)
 
 # ── Arrow C++ shared library (for Odin FFI) ───────────────────────────────────
 
@@ -62,7 +72,7 @@ build-arrow-capi: lib/libarrow_capi.so
 # ── Odin tests that link Arrow C++ ───────────────────────────────────────────
 
 test-cpp: lib/libarrow_capi.so $(BIN)
-	odin test tests_cpp/ -out:$(BIN)/test_runner_cpp -vet \
+	odin test tests_cpp/ -out:$(BIN)/test_runner_cpp $(ODIN_CHECK_FLAGS) \
 	    -extra-linker-flags="-Wl,-rpath,$(realpath lib) -Wl,-rpath,$(ARROW_LDIR)"
 
 # ── Standalone Arrow C++ benchmark binary ─────────────────────────────────────
