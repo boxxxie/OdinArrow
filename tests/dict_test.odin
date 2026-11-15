@@ -81,7 +81,8 @@ test_dict_try_get_with_nulls :: proc(t: ^testing.T) {
 	oa.string_builder_append_null(&sb)
 	oa.string_builder_append(&sb, "beta")
 	oa.string_builder_append_null(&sb)
-	s_arr, _ := oa.string_builder_finish(&sb)
+	s_arr, s_err := oa.string_builder_finish(&sb)
+	testing.expect_value(t, s_err, nil)
 	defer oa.array_free(&s_arr)
 
 	sd := oa.str_dict_encode(&s_arr)
@@ -107,7 +108,8 @@ test_dict_try_get_with_nulls :: proc(t: ^testing.T) {
 	oa.builder_append_null(&nb)
 	oa.builder_append(&nb, 20)
 	oa.builder_append_null(&nb)
-	n_arr, _ := oa.builder_finish(&nb)
+	n_arr, n_err := oa.builder_finish(&nb)
+	testing.expect_value(t, n_err, nil)
 	defer oa.array_free(&n_arr)
 
 	nd := oa.dict_encode(&n_arr, i32)
