@@ -125,14 +125,16 @@ out_i64 :: proc(o: ^Out, v: i64) {
 }
 
 out_f32 :: proc(o: ^Out, v: f32) {
-	tmp: [32]u8
-	s := fmt.bprintf(tmp[:], "%g", v)
+	tmp: [64]u8
+	s := strconv.write_float(tmp[:], f64(v), 'g', -1, 32)
+	if len(s) > 0 && s[0] == '+' { s = s[1:] }
 	out_str(o, s)
 }
 
 out_f64 :: proc(o: ^Out, v: f64) {
-	tmp: [32]u8
-	s := fmt.bprintf(tmp[:], "%g", v)
+	tmp: [64]u8
+	s := strconv.write_float(tmp[:], v, 'g', -1, 64)
+	if len(s) > 0 && s[0] == '+' { s = s[1:] }
 	out_str(o, s)
 }
 
@@ -300,10 +302,26 @@ parquet_to_csv_stream :: proc(
 	}
 
 	n_cols := len(metas)
+	Col_Out_Kind :: enum u8 {
+		Str,
+		I32,
+		I64,
+		F32,
+		F64,
+		Bool,
+	}
+	col_kinds := make([]Col_Out_Kind, n_cols)
+	defer delete(col_kinds)
 	for i in 0 ..< n_cols {
 		pt := metas[i].ptype
-		if pt != PTYPE_BOOLEAN && pt != PTYPE_INT32 && pt != PTYPE_INT64 &&
-		   pt != PTYPE_FLOAT && pt != PTYPE_DOUBLE && pt != PTYPE_BYTE_ARRAY {
+		switch pt {
+		case PTYPE_BOOLEAN:    col_kinds[i] = .Bool
+		case PTYPE_INT32:      col_kinds[i] = .I32
+		case PTYPE_INT64:      col_kinds[i] = .I64
+		case PTYPE_FLOAT:      col_kinds[i] = .F32
+		case PTYPE_DOUBLE:     col_kinds[i] = .F64
+		case PTYPE_BYTE_ARRAY: col_kinds[i] = .Str
+		case:
 			u_err: Parquet_To_CSV_Unsupported_Column_Error
 			n_copy := min(len(metas[i].name), len(u_err.name_buf))
 			copy(u_err.name_buf[:n_copy], metas[i].name[:n_copy])
@@ -392,10 +410,10 @@ parquet_to_csv_stream :: proc(
 	}
 	write_ok := false
 	defer if using_file && opened_file != nil {
-		if !write_ok {
-			_ = os.truncate(opened_file, 0)
-		}
 		os.close(opened_file)
+		if !write_ok {
+			_ = os.remove(out_path)
+		}
 	}
 
 	out_file := opened_file if using_file else os.stdout
@@ -417,13 +435,13 @@ parquet_to_csv_stream :: proc(
 		n := min(chunk_rows, total - rows_done)
 
 		for j in 0..<n_cols {
-			switch metas[j].ptype {
-			case PTYPE_INT32:   chunk_arrays[j] = col_stream_to_i32_array(&streams[j], n)
-			case PTYPE_INT64:   chunk_arrays[j] = col_stream_to_i64_array(&streams[j], n)
-			case PTYPE_FLOAT:   chunk_arrays[j] = col_stream_to_f32_array(&streams[j], n)
-			case PTYPE_DOUBLE:  chunk_arrays[j] = col_stream_to_f64_array(&streams[j], n)
-			case PTYPE_BOOLEAN: chunk_arrays[j] = col_stream_to_bool_array(&streams[j], n)
-			case:               chunk_arrays[j] = col_stream_to_string_array(&streams[j], n)
+			switch col_kinds[j] {
+			case .I32:  chunk_arrays[j] = col_stream_to_i32_array(&streams[j], n)
+			case .I64:  chunk_arrays[j] = col_stream_to_i64_array(&streams[j], n)
+			case .F32:  chunk_arrays[j] = col_stream_to_f32_array(&streams[j], n)
+			case .F64:  chunk_arrays[j] = col_stream_to_f64_array(&streams[j], n)
+			case .Bool: chunk_arrays[j] = col_stream_to_bool_array(&streams[j], n)
+			case .Str:  chunk_arrays[j] = col_stream_to_string_array(&streams[j], n)
 			}
 			if chunk_arrays[j].length != n {
 				for k in 0..=j {
@@ -443,19 +461,13 @@ parquet_to_csv_stream :: proc(
 				if oa.array_is_null(&chunk_arrays[j], r) {
 					// write empty field for null values
 				} else {
-					#partial switch _ in chunk_arrays[j].type {
-					case oa.Int32_Type:
-						out_i32(&o, oa.array_get(&chunk_arrays[j], r, i32))
-					case oa.Int64_Type:
-						out_i64(&o, oa.array_get(&chunk_arrays[j], r, i64))
-					case oa.Float32_Type:
-						out_f32(&o, oa.array_get(&chunk_arrays[j], r, f32))
-					case oa.Float64_Type:
-						out_f64(&o, oa.array_get(&chunk_arrays[j], r, f64))
-					case oa.Bool_Type:
-						out_bool(&o, oa.array_get(&chunk_arrays[j], r, bool))
-					case oa.String_Type:
-						out_csv_field(&o, oa.array_get_string(&chunk_arrays[j], r))
+					switch col_kinds[j] {
+					case .I32:  out_i32(&o, oa.array_get(&chunk_arrays[j], r, i32))
+					case .I64:  out_i64(&o, oa.array_get(&chunk_arrays[j], r, i64))
+					case .F32:  out_f32(&o, oa.array_get(&chunk_arrays[j], r, f32))
+					case .F64:  out_f64(&o, oa.array_get(&chunk_arrays[j], r, f64))
+					case .Bool: out_bool(&o, oa.array_get(&chunk_arrays[j], r, bool))
+					case .Str:  out_csv_field(&o, oa.array_get_string(&chunk_arrays[j], r))
 					}
 				}
 			}
