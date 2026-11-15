@@ -128,10 +128,7 @@ driver_put_parquet_blob :: proc(w: ^Spec_World, name: string, data: []u8) {
 	w.parquet_blobs[name] = slice.clone(data)
 }
 
-driver_put_array :: proc(w: ^Spec_World, name: string, arr: oa.Array, loc := #caller_location) {
-	if old, exists := w.arrays[name]; exists {
-		append(&w.retired_arrays, old)
-	}
+driver_verify_array_invariants :: proc(w: ^Spec_World, arr: oa.Array, loc := #caller_location) {
 	check := arr
 	if _, is_null := check.type.(oa.Null_Type); is_null {
 		probe := check
@@ -142,7 +139,8 @@ driver_put_array :: proc(w: ^Spec_World, name: string, arr: oa.Array, loc := #ca
 		}
 	} else if check.null_count >= 0 {
 		cached := check.null_count
-		testing.expect_value(w.t, oa.array_recount_nulls(&check), cached, loc = loc)
+		probe := check
+		testing.expect_value(w.t, oa.array_recount_nulls(&probe), cached, loc = loc)
 	}
 	if check.offset == 0 {
 		for buf, bi in check.buffers {
@@ -157,7 +155,14 @@ driver_put_array :: proc(w: ^Spec_World, name: string, arr: oa.Array, loc := #ca
 			}
 		}
 	}
-	w.arrays[name] = check
+}
+
+driver_put_array :: proc(w: ^Spec_World, name: string, arr: oa.Array, loc := #caller_location) {
+	if old, exists := w.arrays[name]; exists {
+		append(&w.retired_arrays, old)
+	}
+	driver_verify_array_invariants(w, arr, loc)
+	w.arrays[name] = arr
 }
 
 driver_put_selection :: proc(w: ^Spec_World, name: string, sel: oa.Selection) {
@@ -176,10 +181,13 @@ driver_put_str_dict :: proc(w: ^Spec_World, name: string, d: oa.Str_Dict_Array) 
 	w.str_dicts[name] = d
 }
 
-driver_put_batch :: proc(w: ^Spec_World, name: string, rb: oa.Record_Batch) {
+driver_put_batch :: proc(w: ^Spec_World, name: string, rb: oa.Record_Batch, loc := #caller_location) {
 	if old, exists := w.batches[name]; exists {
 		prev := old
 		oa.record_batch_free(&prev)
+	}
+	for col in rb.columns {
+		driver_verify_array_invariants(w, col, loc)
 	}
 	w.batches[name] = rb
 }
@@ -191,11 +199,27 @@ driver_free_batch_slice :: proc(set: []oa.Record_Batch) {
 	delete(set)
 }
 
-driver_put_batch_set :: proc(w: ^Spec_World, name: string, set: []oa.Record_Batch) {
+driver_put_batch_set :: proc(w: ^Spec_World, name: string, set: []oa.Record_Batch, loc := #caller_location) {
 	if old, exists := w.batch_sets[name]; exists {
 		driver_free_batch_slice(old)
 	}
+	for rb in set {
+		for col in rb.columns {
+			driver_verify_array_invariants(w, col, loc)
+		}
+	}
 	w.batch_sets[name] = set
+}
+
+driver_release_batch_in_set :: proc(w: ^Spec_World, set_name: string, idx: int, loc := #caller_location) {
+	set, ok := w.batch_sets[set_name]
+	valid := ok && idx >= 0 && idx < len(set)
+	testing.expect(w.t, valid, "invalid batch index", loc = loc)
+	if !valid {
+		return
+	}
+	oa.record_batch_free(&set[idx])
+	set[idx] = {}
 }
 
 driver_get_batch_in_set :: proc(
@@ -257,6 +281,20 @@ driver_build_primitive :: proc(w: ^Spec_World, name: string, vals: []$T, loc := 
 	driver_put_array(w, name, arr, loc)
 }
 
+driver_build_strings :: proc(w: ^Spec_World, name: string, vals: []string, loc := #caller_location) {
+	b := oa.string_builder_make(len(vals))
+	defer oa.string_builder_destroy(&b)
+	for s in vals {
+		oa.string_builder_append(&b, s)
+	}
+	arr, err := oa.string_builder_finish(&b)
+	testing.expect_value(w.t, err, nil, loc = loc)
+	if err != nil {
+		return
+	}
+	driver_put_array(w, name, arr, loc)
+}
+
 driver_build_nullable_strings :: proc(w: ^Spec_World, name: string, vals: []Maybe(string), loc := #caller_location) {
 	b := oa.string_builder_make(len(vals))
 	defer oa.string_builder_destroy(&b)
@@ -306,6 +344,7 @@ driver_build_masked_i32 :: proc(w: ^Spec_World, name: string, raw: []i32, valid:
 			null_cnt += 1
 		}
 	}
+	oa.buffer_free(&arr.buffers[0])
 	arr.buffers[0] = bm
 	arr.null_count = null_cnt
 	driver_put_array(w, name, arr, loc)
@@ -378,14 +417,14 @@ driver_ipc_file_roundtrip :: proc(
 			oa.schema_free(sc)
 			free(sc)
 		}
-		delete(out_batches)
+		driver_free_batch_slice(out_batches)
 		return
 	}
 	if sc != nil {
 		append(&w.schemas, sc)
 		w.set_schemas[set_name] = sc
 	}
-	driver_put_batch_set(w, set_name, out_batches)
+	driver_put_batch_set(w, set_name, out_batches, loc)
 }
 
 driver_ipc_schema_only_roundtrip :: proc(
@@ -414,14 +453,14 @@ driver_ipc_schema_only_roundtrip :: proc(
 			oa.schema_free(sc)
 			free(sc)
 		}
-		delete(out_batches)
+		driver_free_batch_slice(out_batches)
 		return
 	}
 	if sc != nil {
 		append(&w.schemas, sc)
 		w.set_schemas[set_name] = sc
 	}
-	driver_put_batch_set(w, set_name, out_batches)
+	driver_put_batch_set(w, set_name, out_batches, loc)
 }
 
 driver_build_null_column :: proc(w: ^Spec_World, name: string, length: int, loc := #caller_location) {
@@ -517,14 +556,14 @@ driver_ipc_stream_roundtrip :: proc(
 			oa.schema_free(sc)
 			free(sc)
 		}
-		delete(out_batches)
+		driver_free_batch_slice(out_batches)
 		return
 	}
 	if sc != nil {
 		append(&w.schemas, sc)
 		w.set_schemas[set_name] = sc
 	}
-	driver_put_batch_set(w, set_name, out_batches)
+	driver_put_batch_set(w, set_name, out_batches, loc)
 }
 
 driver_make_batch :: proc(w: ^Spec_World, batch_name: string, col_names: []string, loc := #caller_location) {
@@ -549,6 +588,9 @@ driver_make_batch :: proc(w: ^Spec_World, batch_name: string, col_names: []strin
 			return
 		}
 		fields[i] = oa.field_make(field_name, src.type)
+		// Zero-allocator views intentionally skip array_copy to preserve non-zero offset for
+		// sliced-batch specs; lifetime safety relies on world_destroy freeing w.batches
+		// before w.arrays and w.retired_arrays.
 		is_view := src.buffers[0].allocator.procedure == nil &&
 			src.buffers[1].allocator.procedure == nil &&
 			src.buffers[2].allocator.procedure == nil
@@ -587,7 +629,7 @@ driver_make_batch :: proc(w: ^Spec_World, batch_name: string, col_names: []strin
 		}
 		return
 	}
-	driver_put_batch(w, batch_name, rb)
+	driver_put_batch(w, batch_name, rb, loc)
 }
 
 driver_csv_parquet_roundtrip :: proc(
@@ -772,14 +814,26 @@ driver_build_parquet_two_col_fixture :: proc(
 	n_rgs := len(id_rgs)
 	id_nullable := false
 	str_nullable := false
-	for rg in id_rgs {
+	for rg, r_idx in id_rgs {
 		if rg.nullable {
 			id_nullable = true
 		}
+		for mv, row_idx in rg.values {
+			if mv == nil {
+				testing.expectf(w.t, rg.nullable, "RG %d INT32 row %d is nil while nullable=false", r_idx, row_idx, loc = loc)
+				id_nullable = true
+			}
+		}
 	}
-	for rg in str_rgs {
+	for rg, r_idx in str_rgs {
 		if rg.nullable {
 			str_nullable = true
+		}
+		for mv, row_idx in rg.values {
+			if mv == nil {
+				testing.expectf(w.t, rg.nullable, "RG %d string row %d is nil while nullable=false", r_idx, row_idx, loc = loc)
+				str_nullable = true
+			}
 		}
 	}
 

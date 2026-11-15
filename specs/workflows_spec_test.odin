@@ -91,16 +91,16 @@ spec_ipc_multi_batch_independent_lifetimes :: proc(t: ^testing.T) {
 	given_batch(&w, "b1", []string{"id:id_b", "name:nm_b"})
 
 	upon_ipc_file_roundtrip(&w, "loaded", []string{"b0", "b1"}, use_mmap = true)
+	then_batch_set_count(&w, "loaded", expected_batches = 2)
 	upon_releasing_batch_in_set(&w, "loaded", 0)
 
-	then_batch_set_count(&w, "loaded", expected_batches = 2)
 	then_batch_column_equals(&w, "loaded", 1, "id",   []Maybe(i32){4, 5})
 	then_batch_column_equals(&w, "loaded", 1, "name", []Maybe(string){"alan", "barbara"})
 
 	upon_ipc_stream_roundtrip(&w, "loaded_stream", []string{"b0", "b1"})
+	then_batch_set_count(&w, "loaded_stream", expected_batches = 2)
 	upon_releasing_batch_in_set(&w, "loaded_stream", 0)
 
-	then_batch_set_count(&w, "loaded_stream", expected_batches = 2)
 	then_batch_column_equals(&w, "loaded_stream", 1, "id",   []Maybe(i32){4, 5})
 	then_batch_column_equals(&w, "loaded_stream", 1, "name", []Maybe(string){"alan", "barbara"})
 }
@@ -322,6 +322,7 @@ spec_mask_selection_column_and_record_batch_take :: proc(t: ^testing.T) {
 	then_selection_equals(&w, "sel", []int{0, 2, 3})
 	then_selection_aggregates_equal(&w, "score", "sel", selected_rows = 3, valid_count = 2, sum = 50.0, min_val = 10.0, max_val = 40.0)
 	then_where_aggregates_equal(&w, "score", "mask", mask_true_count = 3, valid_count = 2, sum = 50.0, mean = 25.0, min_val = 10.0, max_val = 40.0)
+	then_where_aggregates_equal(&w, "bonus", "mask", mask_true_count = 3, valid_count = 3, sum = 9.5, mean = 9.5 / 3.0, min_val = 1.5, max_val = 4.5)
 
 	upon_taking_selection(&w, "taken_score", "score", "sel")
 	then_column_f64_equals(&w, "taken_score", []Maybe(f64){10.0, nil, 40.0})
@@ -329,13 +330,14 @@ spec_mask_selection_column_and_record_batch_take :: proc(t: ^testing.T) {
 	then_column_f64_equals(&w, "taken_bonus", []Maybe(f64){1.5, 3.5, 4.5})
 
 	upon_taking_batch_selection(&w, "taken_batch", "src_batch", "sel")
+	then_batch_column_at_equals(&w, "taken_batch", 0, []Maybe(i32){1, 3, 4})
 	then_batch_column_equals(&w, "taken_batch", "id",    []Maybe(i32){1, 3, 4})
 	then_batch_column_equals(&w, "taken_batch", "score", []Maybe(f64){10.0, nil, 40.0})
 	then_batch_column_equals(&w, "taken_batch", "bonus", []Maybe(f64){1.5, 3.5, 4.5})
 	then_batch_column_equals(&w, "taken_batch", "tag",   []Maybe(string){"a", "c", nil})
 }
 
-// String dictionary value counts and grouped sum with nulls and sliced offsets
+// String dictionary value counts and grouped sum with nulls/slices and dense inputs
 @(test)
 spec_string_dictionary_value_counts_and_group_sum :: proc(t: ^testing.T) {
 	w: Spec_World
@@ -351,4 +353,12 @@ spec_string_dictionary_value_counts_and_group_sum :: proc(t: ^testing.T) {
 	upon_encoding_string_dict(&w, "color_dict", "keys")
 	then_string_dict_value_counts_equal(&w, "color_dict", []string{"red", "green", "blue"}, []i64{3, 2, 1})
 	then_string_dict_group_sums_equal(&w, "color_dict", "weights", []string{"red", "green", "blue"}, []f64{10.0, 6.0, 0.0})
+
+	// Dense (null_count == 0, offset == 0) string dictionary & weight fast path
+	given_column(&w, "dense_keys",    []string{"red", "green", "red", "blue", "green", "red"})
+	given_column(&w, "dense_weights", []f64{1.5, 2.0, 3.5, 7.0, 4.0, 5.0})
+
+	upon_encoding_string_dict(&w, "dense_dict", "dense_keys")
+	then_string_dict_value_counts_equal(&w, "dense_dict", []string{"red", "green", "blue"}, []i64{3, 2, 1})
+	then_string_dict_group_sums_equal(&w, "dense_dict", "dense_weights", []string{"red", "green", "blue"}, []f64{10.0, 6.0, 7.0})
 }

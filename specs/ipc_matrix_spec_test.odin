@@ -44,9 +44,9 @@ spec_ipc_all_16_types_roundtrip_matrix :: proc(t: ^testing.T) {
 		then_batch_set_count(&w, mode, expected_batches = 1)
 		then_batch_in_set_row_count(&w, mode, 0, expected_rows = 3)
 		then_schema_field_names(&w, mode, []string{
-			"c_null", "c_bool", "c_i8", "c_i16", "c_i32", "c_i64",
-			"c_u8", "c_u16", "c_u32", "c_u64", "c_f32", "c_f64",
-			"c_str", "c_lstr", "c_bin", "c_lbin",
+			"c_null:null", "c_bool:bool", "c_i8:int8", "c_i16:int16", "c_i32:int32", "c_i64:int64",
+			"c_u8:uint8", "c_u16:uint16", "c_u32:uint32", "c_u64:uint64", "c_f32:float32", "c_f64:float64",
+			"c_str:string", "c_lstr:large_string", "c_bin:binary", "c_lbin:large_binary",
 		})
 		then_batch_null_column_equals(&w, mode, 0, "c_null", expected_len = 3)
 		then_batch_column_equals(&w, mode, 0, "c_bool", []Maybe(bool){true, nil, false})

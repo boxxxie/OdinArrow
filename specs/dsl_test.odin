@@ -2,6 +2,7 @@ package skadi_specs
 
 import "base:runtime"
 import "core:bytes"
+import "core:fmt"
 import "core:math"
 import "core:strings"
 import "core:testing"
@@ -24,10 +25,10 @@ given_column :: proc{
 	given_col_maybe_f64,
 	given_col_bool,
 	given_col_maybe_bool,
+	given_col_str,
 	given_col_maybe_str,
 	given_col_binary,
 	given_col_maybe_binary,
-	given_col_large_strings,
 }
 
 given_col_i32 :: proc(w: ^Spec_World, name: string, vals: []i32, loc := #caller_location) {
@@ -77,6 +78,9 @@ given_col_bool :: proc(w: ^Spec_World, name: string, vals: []bool, loc := #calle
 }
 given_col_maybe_bool :: proc(w: ^Spec_World, name: string, vals: []Maybe(bool), loc := #caller_location) {
 	driver_build_nullable_primitive(w, name, vals, loc)
+}
+given_col_str :: proc(w: ^Spec_World, name: string, vals: []string, loc := #caller_location) {
+	driver_build_strings(w, name, vals, loc)
 }
 given_col_maybe_str :: proc(w: ^Spec_World, name: string, vals: []Maybe(string), loc := #caller_location) {
 	driver_build_nullable_strings(w, name, vals, loc)
@@ -221,7 +225,7 @@ upon_taking_batch_selection :: proc(w: ^Spec_World, dst_batch, src_batch, sel_na
 	if !ok {
 		return
 	}
-	driver_put_batch(w, dst_batch, out)
+	driver_put_batch(w, dst_batch, out, loc)
 }
 
 upon_encoding_string_dict :: proc(w: ^Spec_World, dict_name, col_name: string, loc := #caller_location) {
@@ -342,14 +346,7 @@ upon_ipc_schema_only_roundtrip :: proc(w: ^Spec_World, set_name, schema_from_bat
 }
 
 upon_releasing_batch_in_set :: proc(w: ^Spec_World, set_name: string, idx: int, loc := #caller_location) {
-	set, ok := w.batch_sets[set_name]
-	valid := ok && idx >= 0 && idx < len(set)
-	testing.expect(w.t, valid, "invalid batch index", loc = loc)
-	if !valid {
-		return
-	}
-	oa.record_batch_free(&set[idx])
-	set[idx] = {}
+	driver_release_batch_in_set(w, set_name, idx, loc)
 }
 
 upon_csv_parquet_csv_roundtrip :: proc(
@@ -535,6 +532,12 @@ then_batch_column_equals :: proc{
 	then_batch_in_set_binary_equals,
 }
 
+then_batch_column_at_equals :: proc{
+	then_single_batch_col_at_i32_equals,
+	then_single_batch_col_at_f64_equals,
+	then_single_batch_col_at_str_equals,
+}
+
 @(private="file")
 _driver_get_batch_column :: proc(
 	w:         ^Spec_World,
@@ -567,6 +570,26 @@ _driver_get_single_batch_column :: proc(
 	col := oa.record_batch_column(rb, col_name)
 	testing.expectf(w.t, col != nil, "missing column %q in batch %q", col_name, batch_name, loc = loc)
 	return col, col != nil
+}
+
+@(private="file")
+_driver_get_single_batch_column_at :: proc(
+	w:          ^Spec_World,
+	batch_name: string,
+	col_idx:    int,
+	loc         := #caller_location,
+) -> (^oa.Array, string, bool) {
+	rb, ok := &w.batches[batch_name]
+	testing.expectf(w.t, ok, "missing batch %q", batch_name, loc = loc)
+	if !ok {
+		return nil, "", false
+	}
+	col := oa.record_batch_column_at(rb, col_idx)
+	testing.expectf(w.t, col != nil, "missing column[%d] in batch %q", col_idx, batch_name, loc = loc)
+	if col == nil {
+		return nil, "", false
+	}
+	return col, fmt.tprintf("%s[%d]", batch_name, col_idx), true
 }
 
 @(private="file")
@@ -616,7 +639,8 @@ _then_array_nullable_primitive_equals :: proc(
 				got := oa.array_get(col, i, f64)
 				testing.expectf(w.t, math.abs(got - v) <= 1e-9, "%q row %d mismatch: got %v, want %v", col_name, i, got, v, loc = loc)
 			} else {
-				testing.expect_value(w.t, oa.array_get(col, i, T), v, loc = loc)
+				got := oa.array_get(col, i, T)
+				testing.expectf(w.t, got == v, "%q row %d mismatch: got %v, want %v", col_name, i, got, v, loc = loc)
 			}
 		} else {
 			testing.expectf(w.t, oa.array_is_null(col, i), "expected null in %q at row %d", col_name, i, loc = loc)
@@ -637,27 +661,49 @@ _then_batch_nullable_primitive_equals :: proc(
 	if !ok {
 		return
 	}
-	_then_array_nullable_primitive_equals(w, col, col_name, expected, loc)
+	qualified := fmt.tprintf("%s[%d].%s", set_name, batch_idx, col_name)
+	_then_array_nullable_primitive_equals(w, col, qualified, expected, loc)
 }
 
 then_single_batch_i32_equals :: proc(w: ^Spec_World, batch_name, col_name: string, expected: []Maybe(i32), loc := #caller_location) {
 	col, ok := _driver_get_single_batch_column(w, batch_name, col_name, loc)
 	if ok {
-		_then_array_nullable_primitive_equals(w, col, col_name, expected, loc)
+		_then_array_nullable_primitive_equals(w, col, fmt.tprintf("%s.%s", batch_name, col_name), expected, loc)
 	}
 }
 
 then_single_batch_f64_equals :: proc(w: ^Spec_World, batch_name, col_name: string, expected: []Maybe(f64), loc := #caller_location) {
 	col, ok := _driver_get_single_batch_column(w, batch_name, col_name, loc)
 	if ok {
-		_then_array_nullable_primitive_equals(w, col, col_name, expected, loc)
+		_then_array_nullable_primitive_equals(w, col, fmt.tprintf("%s.%s", batch_name, col_name), expected, loc)
 	}
 }
 
 then_single_batch_str_equals :: proc(w: ^Spec_World, batch_name, col_name: string, expected: []Maybe(string), loc := #caller_location) {
 	col, ok := _driver_get_single_batch_column(w, batch_name, col_name, loc)
 	if ok {
-		_then_array_str_equals(w, col, col_name, expected, false, loc)
+		_then_array_str_equals(w, col, fmt.tprintf("%s.%s", batch_name, col_name), expected, false, loc)
+	}
+}
+
+then_single_batch_col_at_i32_equals :: proc(w: ^Spec_World, batch_name: string, col_idx: int, expected: []Maybe(i32), loc := #caller_location) {
+	col, label, ok := _driver_get_single_batch_column_at(w, batch_name, col_idx, loc)
+	if ok {
+		_then_array_nullable_primitive_equals(w, col, label, expected, loc)
+	}
+}
+
+then_single_batch_col_at_f64_equals :: proc(w: ^Spec_World, batch_name: string, col_idx: int, expected: []Maybe(f64), loc := #caller_location) {
+	col, label, ok := _driver_get_single_batch_column_at(w, batch_name, col_idx, loc)
+	if ok {
+		_then_array_nullable_primitive_equals(w, col, label, expected, loc)
+	}
+}
+
+then_single_batch_col_at_str_equals :: proc(w: ^Spec_World, batch_name: string, col_idx: int, expected: []Maybe(string), loc := #caller_location) {
+	col, label, ok := _driver_get_single_batch_column_at(w, batch_name, col_idx, loc)
+	if ok {
+		_then_array_str_equals(w, col, label, expected, false, loc)
 	}
 }
 
@@ -685,15 +731,17 @@ then_batch_in_set_bool_equals :: proc(
 	if !ok {
 		return
 	}
+	qualified := fmt.tprintf("%s[%d].%s", set_name, batch_idx, col_name)
 	_, type_ok := col.type.(oa.Bool_Type)
-	testing.expectf(w.t, type_ok, "expected Bool_Type for %q, got %v", col_name, col.type, loc = loc)
+	testing.expectf(w.t, type_ok, "expected Bool_Type for %q, got %v", qualified, col.type, loc = loc)
 	testing.expect_value(w.t, col.length, len(expected), loc = loc)
 	if col.length != len(expected) {
 		return
 	}
 	for want, i in expected {
-		testing.expectf(w.t, oa.array_is_valid(col, i), "expected valid bool at row %d", i, loc = loc)
-		testing.expect_value(w.t, oa.array_get(col, i, bool), want, loc = loc)
+		testing.expectf(w.t, oa.array_is_valid(col, i), "expected valid bool in %q at row %d", qualified, i, loc = loc)
+		got := oa.array_get(col, i, bool)
+		testing.expectf(w.t, got == want, "%q row %d mismatch: got %v, want %v", qualified, i, got, want, loc = loc)
 	}
 }
 
@@ -721,7 +769,7 @@ _then_array_str_equals :: proc(
 		if s, is_val := want.?; is_val {
 			testing.expectf(w.t, oa.array_is_valid(col, i), "expected valid string in %q at row %d", col_name, i, loc = loc)
 			got := large ? oa.array_get_large_string(col, i) : oa.array_get_string(col, i)
-			testing.expect_value(w.t, got, s, loc = loc)
+			testing.expectf(w.t, got == s, "%q row %d mismatch: got %q, want %q", col_name, i, got, s, loc = loc)
 		} else {
 			testing.expectf(w.t, oa.array_is_null(col, i), "expected null string in %q at row %d", col_name, i, loc = loc)
 		}
@@ -740,7 +788,8 @@ _then_batch_str_equals :: proc(
 ) {
 	col, ok := _driver_get_batch_column(w, set_name, batch_idx, col_name, loc)
 	if ok {
-		_then_array_str_equals(w, col, col_name, expected, large, loc)
+		qualified := fmt.tprintf("%s[%d].%s", set_name, batch_idx, col_name)
+		_then_array_str_equals(w, col, qualified, expected, large, loc)
 	}
 }
 
@@ -758,12 +807,13 @@ _then_batch_bin_equals :: proc(
 	if !ok {
 		return
 	}
+	qualified := fmt.tprintf("%s[%d].%s", set_name, batch_idx, col_name)
 	if large {
 		_, is_lb := col.type.(oa.Large_Binary_Type)
-		testing.expectf(w.t, is_lb, "expected Large_Binary_Type for %q, got %v", col_name, col.type, loc = loc)
+		testing.expectf(w.t, is_lb, "expected Large_Binary_Type for %q, got %v", qualified, col.type, loc = loc)
 	} else {
 		_, is_b := col.type.(oa.Binary_Type)
-		testing.expectf(w.t, is_b, "expected Binary_Type for %q, got %v", col_name, col.type, loc = loc)
+		testing.expectf(w.t, is_b, "expected Binary_Type for %q, got %v", qualified, col.type, loc = loc)
 	}
 	testing.expect_value(w.t, col.length, len(expected), loc = loc)
 	if col.length != len(expected) {
@@ -771,11 +821,11 @@ _then_batch_bin_equals :: proc(
 	}
 	for want, i in expected {
 		if b, is_val := want.?; is_val {
-			testing.expectf(w.t, oa.array_is_valid(col, i), "expected valid binary in %q at row %d", col_name, i, loc = loc)
+			testing.expectf(w.t, oa.array_is_valid(col, i), "expected valid binary in %q at row %d", qualified, i, loc = loc)
 			got := large ? oa.array_get_large_binary(col, i) : oa.array_get_binary(col, i)
-			testing.expectf(w.t, bytes.equal(got, b), "%q row %d binary mismatch: got %v, want %v", col_name, i, got, b, loc = loc)
+			testing.expectf(w.t, bytes.equal(got, b), "%q row %d binary mismatch: got %v, want %v", qualified, i, got, b, loc = loc)
 		} else {
-			testing.expectf(w.t, oa.array_is_null(col, i), "expected null binary in %q at row %d", col_name, i, loc = loc)
+			testing.expectf(w.t, oa.array_is_null(col, i), "expected null binary in %q at row %d", qualified, i, loc = loc)
 		}
 	}
 }

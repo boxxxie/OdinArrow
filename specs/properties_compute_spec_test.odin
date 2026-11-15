@@ -15,6 +15,7 @@ prop_filter_and_take_match_oracle :: proc(t: ^testing.T) {
 
 		n := int(rng_next(&rng) % 300) + 8
 		pass_pct := int(rng_next(&rng) % 2) == 0 ? 12 : 65
+		allow_nulls := (iter % 4) != 0
 
 		src_oracle := make([]Maybe(i32), n, context.temp_allocator)
 		mask_oracle := make([]Maybe(bool), n, context.temp_allocator)
@@ -28,7 +29,7 @@ prop_filter_and_take_match_oracle :: proc(t: ^testing.T) {
 		defer oa.binary_builder_destroy(&bb)
 
 		for i in 0 ..< n {
-			if rng_next(&rng) % 7 == 0 {
+			if allow_nulls && rng_next(&rng) % 7 == 0 {
 				src_oracle[i] = nil
 				oa.builder_append_null(&ib)
 			} else {
@@ -37,7 +38,7 @@ prop_filter_and_take_match_oracle :: proc(t: ^testing.T) {
 				oa.builder_append(&ib, v)
 			}
 
-			if rng_next(&rng) % 11 == 0 {
+			if allow_nulls && rng_next(&rng) % 11 == 0 {
 				mask_oracle[i] = nil
 				oa.builder_append_null(&mb)
 			} else {
@@ -46,7 +47,7 @@ prop_filter_and_take_match_oracle :: proc(t: ^testing.T) {
 				oa.builder_append(&mb, p)
 			}
 
-			if rng_next(&rng) % 9 == 0 {
+			if allow_nulls && rng_next(&rng) % 9 == 0 {
 				bin_oracle[i] = nil
 				oa.binary_builder_append_null(&bb)
 			} else {
@@ -77,8 +78,8 @@ prop_filter_and_take_match_oracle :: proc(t: ^testing.T) {
 		}
 		defer oa.array_free(&barr)
 
-		from := int(rng_next(&rng) % u64(n / 2))
-		to := from + int(rng_next(&rng) % u64(n - from)) + 1
+		from := (iter % 5 == 0) ? 0 : int(rng_next(&rng) % u64(n / 2))
+		to := (iter % 7 == 0) ? from : from + int(rng_next(&rng) % u64(n - from)) + 1
 
 		arr_sl := oa.array_slice(arr, from, to)
 		mask_sl := oa.array_slice(mask, from, to)
@@ -141,12 +142,12 @@ prop_filter_and_take_match_oracle :: proc(t: ^testing.T) {
 			}
 		}
 
-		take_k := 12
+		take_k := arr_sl.length == 0 ? 0 : 12
 		idx_b := oa.builder_make(i64, take_k + 4)
 		defer oa.builder_destroy(&idx_b)
 		idx_oracle := make([]Maybe(int), take_k + 4, context.temp_allocator)
 		for k in 0 ..< take_k + 4 {
-			if k % 5 == 0 {
+			if arr_sl.length == 0 || (allow_nulls && k % 5 == 0) {
 				oa.builder_append_null(&idx_b)
 				idx_oracle[k] = nil
 			} else {
@@ -350,6 +351,7 @@ prop_arithmetic_and_cast_preserve_values_and_nulls :: proc(t: ^testing.T) {
 		defer free_all(context.temp_allocator)
 
 		n := 120
+		allow_nulls := (iter % 4) != 0
 		lb := oa.builder_make(i32, n)
 		defer oa.builder_destroy(&lb)
 		rb := oa.builder_make(i32, n)
@@ -359,7 +361,7 @@ prop_arithmetic_and_cast_preserve_values_and_nulls :: proc(t: ^testing.T) {
 		r_or := make([]Maybe(i32), n, context.temp_allocator)
 
 		for i in 0 ..< n {
-			if rng_next(&rng) % 8 == 0 {
+			if allow_nulls && rng_next(&rng) % 8 == 0 {
 				l_or[i] = nil
 				oa.builder_append_null(&lb)
 			} else {
@@ -368,11 +370,11 @@ prop_arithmetic_and_cast_preserve_values_and_nulls :: proc(t: ^testing.T) {
 				oa.builder_append(&lb, lv)
 			}
 
-			if rng_next(&rng) % 9 == 0 {
+			if allow_nulls && rng_next(&rng) % 9 == 0 {
 				r_or[i] = nil
 				oa.builder_append_null(&rb)
 			} else {
-				// Bounded non-zero operand so Add/Sub/Mul stay free of i32 overflow
+				// Bounded non-zero operand so Add/Sub/Mul/Div stay free of i32 overflow or div-by-zero
 				rv := i32(int(rng_next(&rng) % 20) + 1)
 				r_or[i] = rv
 				oa.builder_append(&rb, rv)
@@ -391,8 +393,16 @@ prop_arithmetic_and_cast_preserve_values_and_nulls :: proc(t: ^testing.T) {
 		}
 		defer oa.array_free(&ra)
 
-		l_sl := oa.array_slice(la, 3, n - 5)
-		r_sl := oa.array_slice(ra, 3, n - 5)
+		from := (iter % 5 == 0) ? 0 : 3
+		to := (iter % 5 == 0) ? n : ((iter % 7 == 0) ? from : n - 5)
+		l_sl := oa.array_slice(la, from, to)
+		r_sl := oa.array_slice(ra, from, to)
+
+		sum_arr, add_err := oa.compute_add(&l_sl, &r_sl)
+		if !testing.expectf(t, add_err == nil, "seed=0x%X iter=%d compute_add err=%v", seed, iter, add_err) {
+			return
+		}
+		defer oa.array_free(&sum_arr)
 
 		diff, sub_err := oa.compute_sub(&l_sl, &r_sl)
 		if !testing.expectf(t, sub_err == nil, "seed=0x%X iter=%d compute_sub err=%v", seed, iter, sub_err) {
@@ -406,15 +416,31 @@ prop_arithmetic_and_cast_preserve_values_and_nulls :: proc(t: ^testing.T) {
 		}
 		defer oa.array_free(&prod)
 
+		quot, div_err := oa.compute_div(&l_sl, &r_sl)
+		if !testing.expectf(t, div_err == nil, "seed=0x%X iter=%d compute_div err=%v", seed, iter, div_err) {
+			return
+		}
+		defer oa.array_free(&quot)
+
 		casted, cast_err := oa.compute_cast(&l_sl, oa.Float64_Type{})
 		if !testing.expectf(t, cast_err == nil, "seed=0x%X iter=%d compute_cast err=%v", seed, iter, cast_err) {
 			return
 		}
 		defer oa.array_free(&casted)
 
+		if !testing.expectf(
+			t,
+			sum_arr.length == l_sl.length && diff.length == l_sl.length && prod.length == l_sl.length && quot.length == l_sl.length && casted.length == l_sl.length,
+			"seed=0x%X iter=%d arithmetic/cast output length mismatch",
+			seed,
+			iter,
+		) {
+			return
+		}
+
 		for k in 0 ..< l_sl.length {
-			lv, lok := l_or[3 + k].?
-			rv, rok := r_or[3 + k].?
+			lv, lok := l_or[from + k].?
+			rv, rok := r_or[from + k].?
 			if lok {
 				if !testing.expectf(t, oa.array_is_valid(&casted, k), "seed=0x%X iter=%d idx=%d: cast lost validity", seed, iter, k) {
 					return
@@ -429,17 +455,29 @@ prop_arithmetic_and_cast_preserve_values_and_nulls :: proc(t: ^testing.T) {
 			}
 
 			if lok && rok {
+				if !testing.expectf(t, oa.array_get(&sum_arr, k, i32) == lv + rv, "seed=0x%X iter=%d idx=%d: add mismatch", seed, iter, k) {
+					return
+				}
 				if !testing.expectf(t, oa.array_get(&diff, k, i32) == lv - rv, "seed=0x%X iter=%d idx=%d: sub mismatch", seed, iter, k) {
 					return
 				}
 				if !testing.expectf(t, oa.array_get(&prod, k, i32) == lv * rv, "seed=0x%X iter=%d idx=%d: mul mismatch", seed, iter, k) {
 					return
 				}
+				if !testing.expectf(t, oa.array_get(&quot, k, i32) == lv / rv, "seed=0x%X iter=%d idx=%d: div mismatch", seed, iter, k) {
+					return
+				}
 			} else {
+				if !testing.expectf(t, oa.array_is_null(&sum_arr, k), "seed=0x%X iter=%d idx=%d: add null propagation", seed, iter, k) {
+					return
+				}
 				if !testing.expectf(t, oa.array_is_null(&diff, k), "seed=0x%X iter=%d idx=%d: sub null propagation", seed, iter, k) {
 					return
 				}
 				if !testing.expectf(t, oa.array_is_null(&prod, k), "seed=0x%X iter=%d idx=%d: mul null propagation", seed, iter, k) {
+					return
+				}
+				if !testing.expectf(t, oa.array_is_null(&quot, k), "seed=0x%X iter=%d idx=%d: div null propagation", seed, iter, k) {
 					return
 				}
 			}
@@ -524,34 +562,45 @@ prop_encoded_arrays_match_plain_oracle :: proc(t: ^testing.T) {
 	testing.expect_value(t, dlo, plain_lo)
 	testing.expect_value(t, dhi, plain_hi)
 
-	samples := []string{
+	base_samples := [9]string{
 		"",
 		"ab",
-		"ab\x00c",
 		"ab\x00d",
+		"ab\x00c",
 		"exactly_12_b",
-		"thirteen_byte",
 		"thirteen_bytf",
-		"long_prefix_tie_alpha_1",
+		"thirteen_byte",
 		"long_prefix_tie_alpha_2",
+		"long_prefix_tie_alpha_1",
 	}
-	ub := oa.umbra_builder_make(len(samples))
-	defer oa.umbra_builder_destroy(&ub)
-	for s in samples {
-		oa.umbra_append(&ub, s)
-	}
-	ua := oa.umbra_builder_finish(&ub)
-	defer oa.umbra_free(&ua)
+	for umbra_iter in 0 ..< 16 {
+		defer free_all(context.temp_allocator)
+		samples := base_samples
+		if umbra_iter > 0 {
+			for i := len(samples) - 1; i > 0; i -= 1 {
+				j := int(rng_next(&rng) % u64(i + 1))
+				samples[i], samples[j] = samples[j], samples[i]
+			}
+		}
 
-	ref := make([]string, len(samples), context.temp_allocator)
-	copy(ref, samples)
-	slice.sort(ref)
+		ub := oa.umbra_builder_make(len(samples))
+		defer oa.umbra_builder_destroy(&ub)
+		for s in samples {
+			oa.umbra_append(&ub, s)
+		}
+		ua := oa.umbra_builder_finish(&ub)
+		defer oa.umbra_free(&ua)
 
-	uidx := oa.umbra_sort_indices(&ua)
-	defer oa.array_free(&uidx)
-	for k in 0 ..< len(samples) {
-		got := oa.umbra_get(&ua, int(oa.array_get(&uidx, k, i64)))
-		testing.expect_value(t, got, ref[k])
+		ref := make([]string, len(samples), context.temp_allocator)
+		copy(ref, samples[:])
+		slice.sort(ref)
+
+		uidx := oa.umbra_sort_indices(&ua)
+		defer oa.array_free(&uidx)
+		for k in 0 ..< len(samples) {
+			got := oa.umbra_get(&ua, int(oa.array_get(&uidx, k, i64)))
+			testing.expectf(t, got == ref[k], "umbra_iter=%d k=%d: got %q, want %q", umbra_iter, k, got, ref[k])
+		}
 	}
 }
 
@@ -582,9 +631,10 @@ prop_cross_type_comparisons_match_exact_oracle :: proc(t: ^testing.T) {
 		for iter in 0 ..< 25 {
 			defer free_all(context.temp_allocator)
 
-			n := int(rng_next(&rng) % 72) + 8
-			from := int(rng_next(&rng) % u64(n / 2))
-			to := from + int(rng_next(&rng) % u64(n - from)) + 1
+			n := int(rng_next(&rng) % 293) + 8
+			allow_nulls := (iter % 4) != 0
+			from := (iter % 5 == 0) ? 0 : int(rng_next(&rng) % u64(n / 2))
+			to := (iter % 7 == 0) ? from : from + int(rng_next(&rng) % u64(n - from)) + 1
 
 			// 1. Exact i64 column + auxiliary predicate + i64 values
 			bi64 := oa.builder_make(i64, n)
@@ -603,7 +653,7 @@ prop_cross_type_comparisons_match_exact_oracle :: proc(t: ^testing.T) {
 
 			i64_choices := [7]i64{min(i64), BASE_I64, BASE_I64 + 1, BASE_I64 + 2, -1, 0, max(i64)}
 			for i in 0 ..< n {
-				if rng_next(&rng) % 6 == 0 {
+				if allow_nulls && rng_next(&rng) % 6 == 0 {
 					oa.builder_append_null(&bi64)
 				} else {
 					v := (rng_next(&rng) % 3 == 0) ? i64(i64(rng_next(&rng) % 20) - 10) : i64_choices[int(rng_next(&rng) % 7)]
@@ -611,7 +661,7 @@ prop_cross_type_comparisons_match_exact_oracle :: proc(t: ^testing.T) {
 					i64_valid[i] = true
 					i64_vals[i] = v
 				}
-				if rng_next(&rng) % 7 == 0 {
+				if allow_nulls && rng_next(&rng) % 7 == 0 {
 					oa.builder_append_null(&baux)
 				} else {
 					av := i64(int(rng_next(&rng) % 41) - 20)
@@ -619,7 +669,7 @@ prop_cross_type_comparisons_match_exact_oracle :: proc(t: ^testing.T) {
 					aux_valid[i] = true
 					aux_vals[i] = av
 				}
-				if rng_next(&rng) % 8 == 0 {
+				if allow_nulls && rng_next(&rng) % 8 == 0 {
 					oa.builder_append_null(&bval)
 				} else {
 					iv := i64(int(rng_next(&rng) % 31) - 15)
@@ -758,7 +808,7 @@ prop_cross_type_comparisons_match_exact_oracle :: proc(t: ^testing.T) {
 			u64_choices := [7]u64{0, 1, BASE_U64, BASE_U64 + 1, BASE_U64 + 2, max(u64) - 1, max(u64)}
 
 			for i in 0 ..< n {
-				if rng_next(&rng) % 6 == 0 {
+				if allow_nulls && rng_next(&rng) % 6 == 0 {
 					oa.builder_append_null(&bu64)
 				} else {
 					v := (rng_next(&rng) % 3 == 0) ? rng_next(&rng) : u64_choices[int(rng_next(&rng) % 7)]
@@ -799,7 +849,7 @@ prop_cross_type_comparisons_match_exact_oracle :: proc(t: ^testing.T) {
 			u8_valid := make([]bool, n, context.temp_allocator)
 			u8_vals  := make([]u8, n, context.temp_allocator)
 			for i in 0 ..< n {
-				if rng_next(&rng) % 5 == 0 {
+				if allow_nulls && rng_next(&rng) % 5 == 0 {
 					oa.builder_append_null(&bu8)
 				} else {
 					v := u8(rng_next(&rng) & 0xFF)
@@ -836,4 +886,120 @@ prop_cross_type_comparisons_match_exact_oracle :: proc(t: ^testing.T) {
 			}
 		}
 	}
+}
+
+// Property: Dense (buffers[0].data == nil, offset == 0) multi-column f64 chained selection,
+// materialised filter/take, and fused aggregation fast paths match a scalar oracle at N >= 1024.
+@(test)
+prop_dense_f64_multicolumn_selection_and_fusion :: proc(t: ^testing.T) {
+	N :: 1024
+	rng := Spec_Rng{state = 0x7654_3210_FEDC_BA98}
+	defer free_all(context.temp_allocator)
+
+	ba := oa.builder_make(f64, N)
+	defer oa.builder_destroy(&ba)
+	bb := oa.builder_make(f64, N)
+	defer oa.builder_destroy(&bb)
+	bc := oa.builder_make(f64, N)
+	defer oa.builder_destroy(&bc)
+
+	va := make([]f64, N, context.temp_allocator)
+	vb := make([]f64, N, context.temp_allocator)
+	vc := make([]f64, N, context.temp_allocator)
+
+	for i in 0 ..< N {
+		a := f64(int(rng_next(&rng) % 200) - 50) * 0.5
+		b := f64(int(rng_next(&rng) % 150))
+		c := f64(int(rng_next(&rng) % 21) - 10) * 1.25
+		va[i] = a
+		vb[i] = b
+		vc[i] = c
+		oa.builder_append(&ba, a)
+		oa.builder_append(&bb, b)
+		oa.builder_append(&bc, c)
+	}
+
+	a_arr, a_err := oa.builder_finish(&ba)
+	testing.expect_value(t, a_err, nil)
+	if a_err != nil { return }
+	defer oa.array_free(&a_arr)
+
+	b_arr, b_err := oa.builder_finish(&bb)
+	testing.expect_value(t, b_err, nil)
+	if b_err != nil { return }
+	defer oa.array_free(&b_arr)
+
+	c_arr, c_err := oa.builder_finish(&bc)
+	testing.expect_value(t, c_err, nil)
+	if c_err != nil { return }
+	defer oa.array_free(&c_arr)
+
+	testing.expect(t, a_arr.buffers[0].data == nil && b_arr.buffers[0].data == nil && c_arr.buffers[0].data == nil)
+
+	sel1 := oa.compute_select_compare(&a_arr, .Gt, 10.0)
+	defer oa.selection_free(&sel1)
+	sel2 := oa.selection_refine_compare(&sel1, &b_arr, .Le, 75.0)
+	defer oa.selection_free(&sel2)
+	sel3 := oa.selection_refine_compare(&sel2, &c_arr, .Ne, 0.0)
+	defer oa.selection_free(&sel3)
+
+	taken, t_err := oa.selection_take(&c_arr, &sel3)
+	testing.expect_value(t, t_err, nil)
+	if t_err != nil { return }
+	defer oa.array_free(&taken)
+
+	mask_a, ma_err := oa.compute_compare(&a_arr, .Gt, 10.0)
+	testing.expect_value(t, ma_err, nil)
+	if ma_err != nil { return }
+	defer oa.array_free(&mask_a)
+
+	filt_c, fc_err := oa.compute_filter(&c_arr, &mask_a)
+	testing.expect_value(t, fc_err, nil)
+	if fc_err != nil { return }
+	defer oa.array_free(&filt_c)
+
+	fused := oa.compute_agg_where_compare(&c_arr, &a_arr, .Gt, 10.0)
+	mat_sum, mat_vc := oa.compute_sum(&filt_c)
+
+	ref_chain := make([dynamic]int, 0, N, context.temp_allocator)
+	chain_sum := 0.0
+	fused_cnt := 0
+	fused_sum := 0.0
+	fused_min := 0.0
+	fused_max := 0.0
+	for i in 0 ..< N {
+		if va[i] > 10.0 {
+			if fused_cnt == 0 {
+				fused_min = vc[i]
+				fused_max = vc[i]
+			} else {
+				if vc[i] < fused_min { fused_min = vc[i] }
+				if vc[i] > fused_max { fused_max = vc[i] }
+			}
+			fused_sum += vc[i]
+			fused_cnt += 1
+			if vb[i] <= 75.0 && vc[i] != 0.0 {
+				append(&ref_chain, i)
+				chain_sum += vc[i]
+			}
+		}
+	}
+
+	testing.expect_value(t, sel3.length, len(ref_chain))
+	testing.expect_value(t, taken.length, len(ref_chain))
+	for want_idx, k in ref_chain {
+		testing.expect_value(t, int(sel3.indices[k]), want_idx)
+		testing.expectf(t, math.abs(oa.array_get(&taken, k, f64) - vc[want_idx]) <= 1e-9, "taken[%d] mismatch", k)
+	}
+	sel_sum, sel_vc := oa.compute_sum_selection(&c_arr, &sel3)
+	testing.expect_value(t, sel_vc, len(ref_chain))
+	testing.expectf(t, math.abs(sel_sum - chain_sum) <= 1e-9, "sel_sum mismatch: got %v, want %v", sel_sum, chain_sum)
+
+	testing.expect_value(t, mat_vc, fused_cnt)
+	testing.expect_value(t, fused.count, fused_cnt)
+	testing.expect(t, fused.valid)
+	testing.expectf(t, math.abs(fused.sum - mat_sum) <= 1e-9, "fused vs materialised sum mismatch")
+	testing.expectf(t, math.abs(fused.sum - fused_sum) <= 1e-9, "fused vs oracle sum mismatch")
+	testing.expectf(t, math.abs(fused.min_val - fused_min) <= 1e-9, "fused min mismatch")
+	testing.expectf(t, math.abs(fused.max_val - fused_max) <= 1e-9, "fused max mismatch")
 }
