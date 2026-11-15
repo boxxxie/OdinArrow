@@ -76,6 +76,9 @@ buffer_copy :: proc(src: ^Buffer, allocator := context.allocator) -> (buf: Buffe
 // Grow or shrink the buffer.
 // Growing zeroes new bytes; shrinking never reallocates.
 buffer_resize :: proc(buf: ^Buffer, new_size: int) -> mem.Allocator_Error {
+	if buf.allocator.procedure == nil {
+		return .Mode_Not_Implemented
+	}
 	new_cap := align_up(new_size, ARROW_ALIGNMENT)
 	if new_cap <= buf.capacity {
 		if new_size > buf.size {

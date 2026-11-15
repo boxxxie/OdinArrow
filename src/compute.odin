@@ -1,6 +1,7 @@
 package odinarrow
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:mem"
 
 // ── sum ───────────────────────────────────────────────────────────────────────
@@ -102,8 +103,8 @@ _sum_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (sum: f64, valid_co
 			full_bytes := n >> 3
 			run_lo     := -1
 			for byi in 0..<full_bytes {
-				byte := vbits[bstart + byi]
-				if byte == 0xFF {
+				b_val := vbits[bstart + byi]
+				if b_val == 0xFF {
 					if run_lo < 0 { run_lo = byi << 3 }
 					valid_count += 8
 					continue
@@ -112,10 +113,10 @@ _sum_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (sum: f64, valid_co
 					sum += _sum_run(data[off + run_lo:], (byi << 3) - run_lo)
 					run_lo = -1
 				}
-				if byte != 0 {
+				if b_val != 0 {
 					eb := byi << 3
 					for k in 0..<8 {
-						if (byte >> uint(k)) & 1 == 1 { sum += f64(data[off + eb + k]); valid_count += 1 }
+						if (b_val >> uint(k)) & 1 == 1 { sum += f64(data[off + eb + k]); valid_count += 1 }
 					}
 				}
 			}
@@ -181,7 +182,7 @@ _min_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (min_val: f64, vali
 	data := cast([^]T)arr.buffers[1].data
 	off  := arr.offset
 	n    := arr.length
-	if n == 0 do return
+	if n == 0 { return }
 	best: T
 	if arr.buffers[0].data == nil {
 		when T == i32 {
@@ -207,8 +208,8 @@ _min_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (min_val: f64, vali
 			seen       := false
 			run_lo     := -1
 			for byi in 0..<full_bytes {
-				byte := vbits[bstart + byi]
-				if byte == 0xFF {
+				b_val := vbits[bstart + byi]
+				if b_val == 0xFF {
 					if run_lo < 0 { run_lo = byi << 3 }
 					valid_count += 8
 					continue
@@ -218,10 +219,10 @@ _min_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (min_val: f64, vali
 					best = seen ? min(best, r) : r; seen = true
 					run_lo = -1
 				}
-				if byte != 0 {
+				if b_val != 0 {
 					eb := byi << 3
 					for k in 0..<8 {
-						if (byte >> uint(k)) & 1 == 1 {
+						if (b_val >> uint(k)) & 1 == 1 {
 							v := data[off + eb + k]
 							best = seen ? min(best, v) : v; seen = true
 							valid_count += 1
@@ -250,7 +251,7 @@ _max_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (max_val: f64, vali
 	data := cast([^]T)arr.buffers[1].data
 	off  := arr.offset
 	n    := arr.length
-	if n == 0 do return
+	if n == 0 { return }
 	best: T
 	if arr.buffers[0].data == nil {
 		when T == i32 {
@@ -276,8 +277,8 @@ _max_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (max_val: f64, vali
 			seen       := false
 			run_lo     := -1
 			for byi in 0..<full_bytes {
-				byte := vbits[bstart + byi]
-				if byte == 0xFF {
+				b_val := vbits[bstart + byi]
+				if b_val == 0xFF {
 					if run_lo < 0 { run_lo = byi << 3 }
 					valid_count += 8
 					continue
@@ -287,10 +288,10 @@ _max_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (max_val: f64, vali
 					best = seen ? max(best, r) : r; seen = true
 					run_lo = -1
 				}
-				if byte != 0 {
+				if b_val != 0 {
 					eb := byi << 3
 					for k in 0..<8 {
-						if (byte >> uint(k)) & 1 == 1 {
+						if (b_val >> uint(k)) & 1 == 1 {
 							v := data[off + eb + k]
 							best = seen ? max(best, v) : v; seen = true
 							valid_count += 1
@@ -377,8 +378,8 @@ _min_max_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (min_val: f64, 
 			seen       := false
 			run_lo     := -1
 			for byi in 0..<full_bytes {
-				byte := vbits[bstart + byi]
-				if byte == 0xFF {
+				b_val := vbits[bstart + byi]
+				if b_val == 0xFF {
 					if run_lo < 0 { run_lo = byi << 3 }
 					valid_count += 8
 					continue
@@ -388,10 +389,10 @@ _min_max_typed :: #force_inline proc(arr: ^Array, $T: typeid) -> (min_val: f64, 
 					if seen { lo = min(lo, rl); hi = max(hi, rh) } else { lo = rl; hi = rh; seen = true }
 					run_lo = -1
 				}
-				if byte != 0 {
+				if b_val != 0 {
 					eb := byi << 3
 					for k in 0..<8 {
-						if (byte >> uint(k)) & 1 == 1 {
+						if (b_val >> uint(k)) & 1 == 1 {
 							v := data[off + eb + k]
 							if seen { if v < lo { lo = v }; if v > hi { hi = v } } else { lo = v; hi = v; seen = true }
 							valid_count += 1
@@ -509,10 +510,10 @@ _filter_typed :: proc(arr, mask: ^Array, $T: typeid, allocator: mem.Allocator) -
 			// Dense: byte-at-a-time, skipping empty bytes.
 			n_full := (n / 8) * 8
 			for i := 0; i < n_full; i += 8 {
-				byte := mask_bits[i >> 3]
-				if byte == 0 { continue }
+				b_val := mask_bits[i >> 3]
+				if b_val == 0 { continue }
 				for bit in u8(0)..<8 {
-					if (byte >> bit) & 1 == 1 {
+					if (b_val >> bit) & 1 == 1 {
 						dst[out_i] = src[arr_off + i + int(bit)]
 						out_i += 1
 					}
@@ -653,18 +654,32 @@ _take_primitive :: proc(arr, indices: ^Array, $T: typeid, allocator: mem.Allocat
 	dst := cast([^]T)data_buf.data
 
 	src_bm := arr.buffers[0].data
+	idx_bm := indices.buffers[0].data
 	bitmap_buf: Buffer
 	null_count := 0
-	if src_bm == nil {
-		for i in 0..<n {
-			dst[i] = src[idx[i]]
-		}
-	} else {
-		bitmap_buf = buffer_make(bitmap_byte_count(n), allocator) or_return
+	if src_bm == nil && idx_bm == nil {
 		for i in 0..<n {
 			j := idx[i]
+			assert(j >= 0 && int(j) < arr.length, "compute_take: index out of bounds")
 			dst[i] = src[j]
-			if bitmap_get(src_bm, arr.offset + int(j)) {
+		}
+	} else {
+		bm, bm_err := buffer_make(bitmap_byte_count(n), allocator)
+		if bm_err != nil {
+			buffer_free(&data_buf)
+			return {}, bm_err
+		}
+		bitmap_buf = bm
+		for i in 0..<n {
+			if idx_bm != nil && !bitmap_get(idx_bm, indices.offset + i) {
+				dst[i] = {}
+				null_count += 1
+				continue
+			}
+			j := idx[i]
+			assert(j >= 0 && int(j) < arr.length, "compute_take: index out of bounds")
+			dst[i] = src[j]
+			if src_bm == nil || bitmap_get(src_bm, arr.offset + int(j)) {
 				bitmap_set(bitmap_buf.data, i)
 			} else {
 				null_count += 1
@@ -688,7 +703,12 @@ _take_bool :: proc(arr, indices: ^Array, allocator: mem.Allocator) -> (result: A
 	b := builder_make(bool, n, allocator)
 	defer builder_destroy(&b)
 	for i in 0..<n {
+		if array_is_null(indices, i) {
+			builder_append_null(&b)
+			continue
+		}
 		idx := int(array_get(indices, i, i64))
+		assert(idx >= 0 && idx < arr.length, "compute_take: index out of bounds")
 		if array_is_null(arr, idx) {
 			builder_append_null(&b)
 		} else {
@@ -703,7 +723,12 @@ _take_string :: proc(arr, indices: ^Array, allocator: mem.Allocator) -> (result:
 	b := string_builder_make(n, allocator)
 	defer string_builder_destroy(&b)
 	for i in 0..<n {
+		if array_is_null(indices, i) {
+			string_builder_append_null(&b)
+			continue
+		}
 		idx := int(array_get(indices, i, i64))
+		assert(idx >= 0 && idx < arr.length, "compute_take: index out of bounds")
 		if array_is_null(arr, idx) {
 			string_builder_append_null(&b)
 		} else {
@@ -718,7 +743,12 @@ _take_binary :: proc(arr, indices: ^Array, allocator: mem.Allocator) -> (result:
 	b := binary_builder_make(n, allocator)
 	defer binary_builder_destroy(&b)
 	for i in 0..<n {
+		if array_is_null(indices, i) {
+			binary_builder_append_null(&b)
+			continue
+		}
 		idx := int(array_get(indices, i, i64))
+		assert(idx >= 0 && idx < arr.length, "compute_take: index out of bounds")
 		if array_is_null(arr, idx) {
 			binary_builder_append_null(&b)
 		} else {
@@ -788,15 +818,15 @@ _cast_impl :: proc(arr: ^Array, $From, $To: typeid, allocator: mem.Allocator) ->
 	dst := cast([^]To)data_buf.data
 	src := (cast([^]From)arr.buffers[1].data)[arr.offset:]
 	start := 0
-	if arr.offset == 0 && n * size_of(To) >= _NT_STORE_MIN_BYTES {
-		K  :: 8
-		VS :: #simd[K]From
-		VD :: #simd[K]To
+	K  :: 8
+	VS :: #simd[K]From
+	VD :: #simd[K]To
+	if n * size_of(To) >= _NT_STORE_MIN_BYTES && (uintptr(dst) & uintptr(align_of(VD)-1)) == 0 {
 		svp := cast([^]VS)src
 		dvp := cast([^]VD)dst
 		nv  := n / K
 		for i in 0..<nv {
-			intrinsics.non_temporal_store(&dvp[i], cast(VD)svp[i])
+			intrinsics.non_temporal_store(&dvp[i], cast(VD)intrinsics.unaligned_load(&svp[i]))
 		}
 		intrinsics.atomic_thread_fence(.Seq_Cst)
 		start = nv * K
@@ -805,7 +835,11 @@ _cast_impl :: proc(arr: ^Array, $From, $To: typeid, allocator: mem.Allocator) ->
 		dst[i] = To(src[i])
 	}
 	// Cast preserves null positions exactly — copy the validity bitmap wholesale.
-	bitmap_buf := _validity_copy(arr, allocator) or_return
+	bitmap_buf, bm_err := _validity_copy(arr, allocator)
+	if bm_err != nil {
+		buffer_free(&data_buf)
+		return {}, bm_err
+	}
 	result = Array{
 		type       = _data_type_for(To),
 		length     = n,
@@ -819,14 +853,21 @@ _cast_impl :: proc(arr: ^Array, $From, $To: typeid, allocator: mem.Allocator) ->
 // zero-value Buffer when the input has no validity bitmap (all valid).
 _validity_copy :: proc(arr: ^Array, allocator: mem.Allocator) -> (buf: Buffer, err: mem.Allocator_Error) {
 	src := arr.buffers[0].data
-	if src == nil do return
+	if src == nil { return }
 	n := arr.length
 	buf = buffer_make(bitmap_byte_count(n), allocator) or_return
 	if arr.offset & 7 == 0 {
-		mem.copy(rawptr(buf.data), rawptr(src[arr.offset >> 3:]), bitmap_byte_count(n))
+		n_bytes := (n + 7) / 8
+		mem.copy(rawptr(buf.data), rawptr(src[arr.offset >> 3:]), n_bytes)
+		rem := uint(n) & 7
+		if rem != 0 && n_bytes > 0 {
+			buf.data[n_bytes - 1] &= u8((1 << rem) - 1)
+		}
 	} else {
 		for i in 0..<n {
-			if bitmap_get(src, arr.offset + i) do bitmap_set(buf.data, i)
+			if bitmap_get(src, arr.offset + i) {
+				bitmap_set(buf.data, i)
+			}
 		}
 	}
 	return
@@ -841,6 +882,7 @@ Arithmetic_Op :: enum { Add, Sub, Mul, Div }
 // null the output element is null.
 compute_arithmetic :: proc(left, right: ^Array, op: Arithmetic_Op, allocator := context.allocator) -> (result: Array, err: mem.Allocator_Error) {
 	assert(left.length == right.length, "compute_arithmetic: length mismatch")
+	assert(left.type == right.type, "compute_arithmetic: type mismatch")
 	switch op {
 	case .Add: return _arith_op(left, right, .Add, allocator)
 	case .Sub: return _arith_op(left, right, .Sub, allocator)
@@ -879,43 +921,82 @@ _arith_impl :: proc(left, right: ^Array, $T: typeid, $OP: Arithmetic_Op, allocat
 	dst := cast([^]T)data_buf.data
 	l := (cast([^]T)left.buffers[1].data)[left.offset:]
 	r := (cast([^]T)right.buffers[1].data)[right.offset:]
-	start := 0
-	// Div is excluded: integer SIMD division isn't available, and it isn't a
-	// hot path. Add/Sub/Mul stream large outputs past the cache.
-	when OP != .Div {
-		if left.offset == 0 && right.offset == 0 && n * size_of(T) >= _NT_STORE_MIN_BYTES {
+	lbm := left.buffers[0].data
+	rbm := right.buffers[0].data
+	has_nulls := lbm != nil || rbm != nil
+
+	when OP == .Div && T != f32 && T != f64 {
+		// Integer division traps on 0 and signed min(T) / -1, so never divide
+		// unmasked null slots.
+		if !has_nulls {
+			for i in 0..<n {
+				assert(r[i] != 0, "compute_div: integer division by zero")
+				when T == i8 || T == i16 || T == i32 || T == i64 {
+					if l[i] == min(T) && r[i] == -1 {
+						dst[i] = min(T)
+						continue
+					}
+				}
+				dst[i] = l[i] / r[i]
+			}
+		} else {
+			for i in 0..<n {
+				if array_is_valid(left, i) && array_is_valid(right, i) {
+					assert(r[i] != 0, "compute_div: integer division by zero")
+					when T == i8 || T == i16 || T == i32 || T == i64 {
+						if l[i] == min(T) && r[i] == -1 {
+							dst[i] = min(T)
+							continue
+						}
+					}
+					dst[i] = l[i] / r[i]
+				} else {
+					dst[i] = 0
+				}
+			}
+		}
+	} else {
+		start := 0
+		when OP != .Div {
 			K  :: 64 / size_of(T) // one cache line per store
 			V  :: #simd[K]T
-			lv := cast([^]V)l
-			rv := cast([^]V)r
-			dv := cast([^]V)dst
-			nv := n / K
-			for i in 0..<nv {
-				v: V
-				when      OP == .Add { v = lv[i] + rv[i] }
-				else when OP == .Sub { v = lv[i] - rv[i] }
-				else when OP == .Mul { v = lv[i] * rv[i] }
-				intrinsics.non_temporal_store(&dv[i], v)
+			if n * size_of(T) >= _NT_STORE_MIN_BYTES && (uintptr(dst) & uintptr(align_of(V)-1)) == 0 {
+				lv := cast([^]V)l
+				rv := cast([^]V)r
+				dv := cast([^]V)dst
+				nv := n / K
+				for i in 0..<nv {
+					vl := intrinsics.unaligned_load(&lv[i])
+					vr := intrinsics.unaligned_load(&rv[i])
+					v: V
+					when      OP == .Add { v = vl + vr }
+					else when OP == .Sub { v = vl - vr }
+					else when OP == .Mul { v = vl * vr }
+					intrinsics.non_temporal_store(&dv[i], v)
+				}
+				intrinsics.atomic_thread_fence(.Seq_Cst)
+				start = nv * K
 			}
-			intrinsics.atomic_thread_fence(.Seq_Cst)
-			start = nv * K
 		}
-	}
-	for i in start..<n {
-		when      OP == .Add { dst[i] = l[i] + r[i] }
-		else when OP == .Sub { dst[i] = l[i] - r[i] }
-		else when OP == .Mul { dst[i] = l[i] * r[i] }
-		else when OP == .Div { dst[i] = l[i] / r[i] }
+		for i in start..<n {
+			when      OP == .Add { dst[i] = l[i] + r[i] }
+			else when OP == .Sub { dst[i] = l[i] - r[i] }
+			else when OP == .Mul { dst[i] = l[i] * r[i] }
+			else when OP == .Div { dst[i] = l[i] / r[i] }
+		}
 	}
 
 	// Validity: null propagates if either side is null. Skip entirely when
 	// both inputs are fully valid (the common, hot path).
 	bitmap_buf: Buffer
 	null_count := 0
-	lbm := left.buffers[0].data
-	rbm := right.buffers[0].data
-	if lbm != nil || rbm != nil {
-		bitmap_buf = buffer_make(bitmap_byte_count(n), allocator) or_return
+	if has_nulls {
+		bm, bm_err := buffer_make(bitmap_byte_count(n), allocator)
+		if bm_err != nil {
+			buffer_free(&data_buf)
+			return {}, bm_err
+		}
+		bitmap_buf = bm
 		for i in 0..<n {
 			if array_is_valid(left, i) && array_is_valid(right, i) {
 				bitmap_set(bitmap_buf.data, i)
@@ -990,6 +1071,7 @@ _sort_finish_indices :: proc(idx: []i64, allocator: mem.Allocator) -> (result: A
 // are bias-encoded (flip the sign bit) so an unsigned byte radix yields signed
 // order. Passes whose radix byte is constant are skipped (small-range columns).
 _radix_sort_indices :: proc(arr: ^Array, $T: typeid, allocator: mem.Allocator) -> (result: Array, err: mem.Allocator_Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	n    := arr.length
 	data := (cast([^]T)arr.buffers[1].data)[arr.offset:]
 
@@ -1035,6 +1117,7 @@ _radix_sort_indices :: proc(arr: ^Array, $T: typeid, allocator: mem.Allocator) -
 }
 
 _sort_indices_typed :: proc(arr: ^Array, $T: typeid, allocator: mem.Allocator) -> (result: Array, err: mem.Allocator_Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	n := arr.length
 	when T != f32 && T != f64 {
 		// Null-free integer columns: radix sort (floats keep the comparison
@@ -1089,6 +1172,7 @@ _sort_indices_typed :: proc(arr: ^Array, $T: typeid, allocator: mem.Allocator) -
 }
 
 _sort_indices_string :: proc(arr: ^Array, allocator: mem.Allocator) -> (result: Array, err: mem.Allocator_Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	n := arr.length
 	idx := make([]i64, n, context.temp_allocator)
 	for i in 0..<n { idx[i] = i64(i) }

@@ -64,7 +64,7 @@ _compress_sparse :: proc "contextless" (mbits: [^]u8, n: int, out: []i32) {
 	words   := cast([^]u64)mbits
 	n_words := n / 64
 	for w in 0..<n_words {
-		bits := words[w]
+		bits := intrinsics.unaligned_load(&words[w])
 		base := w * 64
 		for bits != 0 {
 			t := intrinsics.count_trailing_zeros(bits)
@@ -235,6 +235,9 @@ record_batch_take :: proc(batch: ^Record_Batch, sel: ^Selection, allocator := co
 		cols[ci] = c
 	}
 	rb, made := record_batch_make(batch.schema, cols, allocator)
+	if !made {
+		for k in 0..<len(cols) { array_free(&cols[k], allocator) }
+	}
 	delete(cols, allocator)   // record_batch_make copied the slice (shares buffers)
 	return rb, made
 }

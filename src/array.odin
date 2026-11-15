@@ -23,21 +23,34 @@ Array :: struct {
 
 // True if element i is null.
 array_is_null :: #force_inline proc "contextless" (arr: ^Array, i: int) -> bool {
+	#partial switch _ in arr.type {
+	case Null_Type:
+		return true
+	}
 	bm := &arr.buffers[0]
-	if bm.data == nil do return false
+	if bm.data == nil { return false }
 	return !bitmap_get(bm.data, arr.offset + i)
 }
 
 // True if element i is valid (not null).
 array_is_valid :: #force_inline proc "contextless" (arr: ^Array, i: int) -> bool {
+	#partial switch _ in arr.type {
+	case Null_Type:
+		return false
+	}
 	bm := &arr.buffers[0]
-	if bm.data == nil do return true
+	if bm.data == nil { return true }
 	return bitmap_get(bm.data, arr.offset + i)
 }
 
 // Return the null count, recounting from the bitmap if the cached value is -1.
 array_null_count :: proc(arr: ^Array) -> int {
-	if arr.null_count >= 0 do return arr.null_count
+	#partial switch _ in arr.type {
+	case Null_Type:
+		arr.null_count = arr.length
+		return arr.length
+	}
+	if arr.null_count >= 0 { return arr.null_count }
 	if arr.buffers[0].data == nil {
 		arr.null_count = 0
 		return 0
@@ -107,17 +120,149 @@ array_free :: proc(arr: ^Array, allocator := context.allocator) {
 // Recount nulls by scanning the bitmap. Forces arr.null_count >= 0.
 // Equivalent to array_null_count but always scans (ignores the cache).
 array_recount_nulls :: proc(arr: ^Array) -> int {
+	#partial switch _ in arr.type {
+	case Null_Type:
+		arr.null_count = arr.length
+		return arr.length
+	}
 	arr.null_count = -1
 	return array_null_count(arr)
 }
 
 // Helper: copy an Array and its owned buffers into a new allocation.
+// If src.offset > 0, the copied array is rebased to offset 0 with only the
+// slice window [src.offset ..< src.offset + src.length) copied.
 // Children are NOT deep-copied (Phase 4+ concern).
 array_copy :: proc(src: ^Array, allocator := context.allocator) -> (dst: Array, err: mem.Allocator_Error) {
+	if src.offset > 0 {
+		return _array_copy_rebased(src, allocator)
+	}
 	dst = src^
 	for i in 0..<3 {
-		if src.buffers[i].data != nil && src.buffers[i].allocator.procedure != nil {
-			dst.buffers[i] = buffer_copy(&src.buffers[i], allocator) or_return
+		dst.buffers[i] = {}
+	}
+	for i in 0..<3 {
+		if src.buffers[i].data != nil {
+			buf, b_err := buffer_copy(&src.buffers[i], allocator)
+			if b_err != nil {
+				for j in 0..<i {
+					buffer_free(&dst.buffers[j])
+				}
+				return {}, b_err
+			}
+			dst.buffers[i] = buf
+		}
+	}
+	return
+}
+
+_array_copy_rebased :: proc(src: ^Array, allocator: mem.Allocator) -> (dst: Array, err: mem.Allocator_Error) {
+	dst = src^
+	dst.offset = 0
+	for i in 0..<3 {
+		dst.buffers[i] = {}
+	}
+	n := src.length
+	off := src.offset
+
+	// Copy validity bitmap shifted to bit 0.
+	if src.buffers[0].data != nil && n > 0 {
+		bm_bytes := bitmap_byte_count(n)
+		bm_buf, b_err := buffer_make(bm_bytes, allocator)
+		if b_err != nil { return {}, b_err }
+		bm_slice := ([^]u8)(bm_buf.data)[:bm_bytes]
+		src_bm := ([^]u8)(src.buffers[0].data)
+		for i in 0..<n {
+			bit_idx := off + i
+			if (src_bm[bit_idx >> 3] & (1 << u32(bit_idx & 7))) != 0 {
+				bm_slice[i >> 3] |= 1 << u32(i & 7)
+			}
+		}
+		dst.buffers[0] = bm_buf
+	}
+
+	cleanup :: proc(d: ^Array) {
+		for j in 0..<3 { buffer_free(&d.buffers[j]) }
+	}
+
+	switch t in src.type {
+	case Null_Type:
+		// No data buffers.
+	case Bool_Type:
+		if src.buffers[1].data != nil && n > 0 {
+			data_bytes := bitmap_byte_count(n)
+			dbuf, d_err := buffer_make(data_bytes, allocator)
+			if d_err != nil { cleanup(&dst); return {}, d_err }
+			dst_bits := ([^]u8)(dbuf.data)[:data_bytes]
+			src_bits := ([^]u8)(src.buffers[1].data)
+			for i in 0..<n {
+				bit_idx := off + i
+				if (src_bits[bit_idx >> 3] & (1 << u32(bit_idx & 7))) != 0 {
+					dst_bits[i >> 3] |= 1 << u32(i & 7)
+				}
+			}
+			dst.buffers[1] = dbuf
+		}
+	case String_Type, Binary_Type:
+		if src.buffers[1].data != nil {
+			src_offs := ([^]i32)(src.buffers[1].data)
+			base := src_offs[off]
+			end_off := src_offs[off + n]
+			off_bytes := (n + 1) * size_of(i32)
+			obuf, o_err := buffer_make(off_bytes, allocator)
+			if o_err != nil { cleanup(&dst); return {}, o_err }
+			dst_offs := ([^]i32)(obuf.data)
+			for i in 0..=n {
+				dst_offs[i] = src_offs[off + i] - base
+			}
+			dst.buffers[1] = obuf
+
+			data_bytes := int(end_off - base)
+			dbuf, d_err := buffer_make(data_bytes, allocator)
+			if d_err != nil { cleanup(&dst); return {}, d_err }
+			if data_bytes > 0 && src.buffers[2].data != nil {
+				mem.copy(dbuf.data, rawptr(uintptr(src.buffers[2].data) + uintptr(base)), data_bytes)
+			}
+			dst.buffers[2] = dbuf
+		}
+	case Large_String_Type, Large_Binary_Type:
+		if src.buffers[1].data != nil {
+			src_offs := ([^]i64)(src.buffers[1].data)
+			base := src_offs[off]
+			end_off := src_offs[off + n]
+			off_bytes := (n + 1) * size_of(i64)
+			obuf, o_err := buffer_make(off_bytes, allocator)
+			if o_err != nil { cleanup(&dst); return {}, o_err }
+			dst_offs := ([^]i64)(obuf.data)
+			for i in 0..=n {
+				dst_offs[i] = src_offs[off + i] - base
+			}
+			dst.buffers[1] = obuf
+
+			data_bytes := int(end_off - base)
+			dbuf, d_err := buffer_make(data_bytes, allocator)
+			if d_err != nil { cleanup(&dst); return {}, d_err }
+			if data_bytes > 0 && src.buffers[2].data != nil {
+				mem.copy(dbuf.data, rawptr(uintptr(src.buffers[2].data) + uintptr(base)), data_bytes)
+			}
+			dst.buffers[2] = dbuf
+		}
+	case Int8_Type, Int16_Type, Int32_Type, Int64_Type,
+	     UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
+	     Float32_Type, Float64_Type:
+		elem_sz := 0
+		#partial switch _ in src.type {
+		case Int8_Type, UInt8_Type: elem_sz = 1
+		case Int16_Type, UInt16_Type: elem_sz = 2
+		case Int32_Type, UInt32_Type, Float32_Type: elem_sz = 4
+		case Int64_Type, UInt64_Type, Float64_Type: elem_sz = 8
+		}
+		if src.buffers[1].data != nil && n > 0 && elem_sz > 0 {
+			data_bytes := n * elem_sz
+			dbuf, d_err := buffer_make(data_bytes, allocator)
+			if d_err != nil { cleanup(&dst); return {}, d_err }
+			mem.copy(dbuf.data, rawptr(uintptr(src.buffers[1].data) + uintptr(off * elem_sz)), data_bytes)
+			dst.buffers[1] = dbuf
 		}
 	}
 	return

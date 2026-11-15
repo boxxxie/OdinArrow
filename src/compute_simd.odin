@@ -25,10 +25,15 @@ _sum_f64_simd :: #force_inline proc "contextless" (data: [^]f64, n: int) -> f64 
 	v4 := nv / 4
 	for i in 0..<v4 {
 		j := i * 4
-		a += vp[j]; b += vp[j+1]; c += vp[j+2]; d += vp[j+3]
+		a += intrinsics.unaligned_load(&vp[j])
+		b += intrinsics.unaligned_load(&vp[j+1])
+		c += intrinsics.unaligned_load(&vp[j+2])
+		d += intrinsics.unaligned_load(&vp[j+3])
 	}
 	acc := a + b + c + d
-	for i := v4 * 4; i < nv; i += 1 { acc += vp[i] }
+	for i := v4 * 4; i < nv; i += 1 {
+		acc += intrinsics.unaligned_load(&vp[i])
+	}
 
 	sum := intrinsics.simd_reduce_add_ordered(acc)
 	for i := nv * 4; i < n; i += 1 { sum += data[i] }
@@ -56,34 +61,62 @@ _sum_i32_simd :: #force_inline proc "contextless" (data: [^]i32, n: int) -> i64 
 // ── i32 min / max ─────────────────────────────────────────────────────────────
 
 _min_i32_simd :: #force_inline proc "contextless" (data: [^]i32, n: int) -> i32 {
-	a, b, c, d, e, f, g, h := data[0], data[0], data[0], data[0],
-	                           data[0], data[0], data[0], data[0]
-	i := 0
-	for i + 8 <= n {
-		a = min(a, data[i]);   b = min(b, data[i+1])
-		c = min(c, data[i+2]); d = min(d, data[i+3])
-		e = min(e, data[i+4]); f = min(f, data[i+5])
-		g = min(g, data[i+6]); h = min(h, data[i+7])
-		i += 8
+	V  :: #simd[8]i32
+	vp := cast([^]V)data
+	nv := n / 8
+	if nv > 0 {
+		v0  := intrinsics.unaligned_load(&vp[0])
+		lo0 := v0
+		lo1 := v0
+		i   := 1
+		for i + 1 < nv {
+			lo0 = intrinsics.simd_min(lo0, intrinsics.unaligned_load(&vp[i]))
+			lo1 = intrinsics.simd_min(lo1, intrinsics.unaligned_load(&vp[i + 1]))
+			i += 2
+		}
+		for ; i < nv; i += 1 {
+			lo0 = intrinsics.simd_min(lo0, intrinsics.unaligned_load(&vp[i]))
+		}
+		best := intrinsics.simd_reduce_min(intrinsics.simd_min(lo0, lo1))
+		for j := nv * 8; j < n; j += 1 {
+			best = min(best, data[j])
+		}
+		return best
 	}
-	best := min(min(min(a, b), min(c, d)), min(min(e, f), min(g, h)))
-	for ; i < n; i += 1 { best = min(best, data[i]) }
+	best := data[0]
+	for j in 1 ..< n {
+		best = min(best, data[j])
+	}
 	return best
 }
 
 _max_i32_simd :: #force_inline proc "contextless" (data: [^]i32, n: int) -> i32 {
-	a, b, c, d, e, f, g, h := data[0], data[0], data[0], data[0],
-	                           data[0], data[0], data[0], data[0]
-	i := 0
-	for i + 8 <= n {
-		a = max(a, data[i]);   b = max(b, data[i+1])
-		c = max(c, data[i+2]); d = max(d, data[i+3])
-		e = max(e, data[i+4]); f = max(f, data[i+5])
-		g = max(g, data[i+6]); h = max(h, data[i+7])
-		i += 8
+	V  :: #simd[8]i32
+	vp := cast([^]V)data
+	nv := n / 8
+	if nv > 0 {
+		v0  := intrinsics.unaligned_load(&vp[0])
+		hi0 := v0
+		hi1 := v0
+		i   := 1
+		for i + 1 < nv {
+			hi0 = intrinsics.simd_max(hi0, intrinsics.unaligned_load(&vp[i]))
+			hi1 = intrinsics.simd_max(hi1, intrinsics.unaligned_load(&vp[i + 1]))
+			i += 2
+		}
+		for ; i < nv; i += 1 {
+			hi0 = intrinsics.simd_max(hi0, intrinsics.unaligned_load(&vp[i]))
+		}
+		best := intrinsics.simd_reduce_max(intrinsics.simd_max(hi0, hi1))
+		for j := nv * 8; j < n; j += 1 {
+			best = max(best, data[j])
+		}
+		return best
 	}
-	best := max(max(max(a, b), max(c, d)), max(max(e, f), max(g, h)))
-	for ; i < n; i += 1 { best = max(best, data[i]) }
+	best := data[0]
+	for j in 1 ..< n {
+		best = max(best, data[j])
+	}
 	return best
 }
 
@@ -110,16 +143,25 @@ _min_max_i32_simd :: proc "contextless" (data: [^]i32, n: int) -> (lo: i32, hi: 
 	vp := cast([^]V)data
 	nv := n / 8
 	if nv > 0 {
-		lo0 := vp[0]; lo1 := vp[0]
-		hi0 := vp[0]; hi1 := vp[0]
+		v0 := intrinsics.unaligned_load(&vp[0])
+		lo0 := v0
+		lo1 := v0
+		hi0 := v0
+		hi1 := v0
 		i := 1
 		for i + 1 < nv {
-			lo0 = intrinsics.simd_min(lo0, vp[i]);   hi0 = intrinsics.simd_max(hi0, vp[i])
-			lo1 = intrinsics.simd_min(lo1, vp[i+1]); hi1 = intrinsics.simd_max(hi1, vp[i+1])
+			vi0 := intrinsics.unaligned_load(&vp[i])
+			vi1 := intrinsics.unaligned_load(&vp[i+1])
+			lo0 = intrinsics.simd_min(lo0, vi0)
+			hi0 = intrinsics.simd_max(hi0, vi0)
+			lo1 = intrinsics.simd_min(lo1, vi1)
+			hi1 = intrinsics.simd_max(hi1, vi1)
 			i += 2
 		}
 		for ; i < nv; i += 1 {
-			lo0 = intrinsics.simd_min(lo0, vp[i]); hi0 = intrinsics.simd_max(hi0, vp[i])
+			vi := intrinsics.unaligned_load(&vp[i])
+			lo0 = intrinsics.simd_min(lo0, vi)
+			hi0 = intrinsics.simd_max(hi0, vi)
 		}
 		lo = intrinsics.simd_reduce_min(intrinsics.simd_min(lo0, lo1))
 		hi = intrinsics.simd_reduce_max(intrinsics.simd_max(hi0, hi1))

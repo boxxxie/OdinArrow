@@ -28,7 +28,7 @@ bitmap_clear :: #force_inline proc "contextless" (data: [^]u8, i: int) {
 // is masked before counting so that bits belonging to neighbouring elements
 // (e.g. past the end of a slice) are never included in the total.
 bitmap_popcount :: proc "contextless" (data: [^]u8, n_bits: int) -> int {
-	if n_bits == 0 do return 0
+	if n_bits == 0 { return 0 }
 	n_bytes := (n_bits + 7) / 8
 	count   := 0
 	n_words := n_bytes / 8
@@ -61,7 +61,7 @@ bitmap_popcount :: proc "contextless" (data: [^]u8, n_bits: int) -> int {
 // Set all n_bits bits to 1 (mark every element valid).
 // Bits beyond n_bits within the last byte are cleared to preserve the zero-tail invariant.
 bitmap_set_all :: proc "contextless" (data: [^]u8, n_bits: int) {
-	if n_bits == 0 do return
+	if n_bits == 0 { return }
 	n_bytes := (n_bits + 7) / 8
 	for i in 0..<n_bytes {
 		data[i] = 0xFF

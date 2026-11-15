@@ -11,9 +11,12 @@ setup_tracking :: proc(t: ^testing.T) -> (track: mem.Tracking_Allocator) {
 	return
 }
 
-check_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator) {
+check_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, loc := #caller_location) {
 	for _, leak in track.allocation_map {
-		testing.expectf(t, false, "memory leak: %v bytes at %v", leak.size, leak.location)
+		testing.expectf(t, false, "memory leak: %v bytes at %v", leak.size, leak.location, loc = loc)
+	}
+	for bad in track.bad_free_array {
+		testing.expectf(t, false, "bad free at %v", bad.location, loc = loc)
 	}
 	mem.tracking_allocator_destroy(track)
 }

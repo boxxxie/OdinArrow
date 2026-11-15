@@ -104,17 +104,22 @@ _buffer_pool_proc :: proc(
 @(private="file")
 _pool_get :: proc(pool: ^Buffer_Pool, size, alignment: int) -> (rawptr, mem.Allocator_Error) {
 	if size == 0 { return nil, .None }
+	req_align := uintptr(max(alignment, 1))
 	if stack, ok := pool.free_list[size]; ok && len(stack) > 0 {
-		s := stack
-		user := pop(&s)
-		pool.free_list[size] = s
-		return user, .None
+		for i := len(stack) - 1; i >= 0; i -= 1 {
+			if uintptr(stack[i]) % req_align == 0 {
+				user := stack[i]
+				unordered_remove(&pool.free_list[size], i)
+				return user, .None
+			}
+		}
 	}
-	total := _POOL_HDR + alignment + size
-	raw, err := mem.alloc_bytes_non_zeroed(total, alignment, pool.backing)
+	effective_align := max(alignment, align_of(_Pool_Header))
+	total := _POOL_HDR + effective_align + size
+	raw, err := mem.alloc_bytes_non_zeroed(total, effective_align, pool.backing)
 	if err != .None || raw == nil { return nil, .Out_Of_Memory }
 	base := raw_data(raw)
-	au   := uintptr(alignment)
+	au   := uintptr(effective_align)
 	user := (uintptr(base) + uintptr(_POOL_HDR) + au - 1) & ~(au - 1)
 	header := (^_Pool_Header)(rawptr(user - uintptr(_POOL_HDR)))
 	header.size = size
@@ -151,7 +156,8 @@ _pool_resize :: proc(pool: ^Buffer_Pool, old_memory: rawptr, old_size, new_size,
 	}
 	header   := (^_Pool_Header)(rawptr(uintptr(old_memory) - uintptr(_POOL_HDR)))
 	capacity := header.size
-	if new_size <= capacity {
+	req_align := uintptr(max(alignment, 1))
+	if new_size <= capacity && uintptr(old_memory) % req_align == 0 {
 		if zeroed && new_size > old_size {
 			mem.zero(rawptr(uintptr(old_memory) + uintptr(old_size)), new_size - old_size)
 		}

@@ -19,11 +19,11 @@ build_array :: proc(vals: []$T, allocator := context.allocator) -> oa.Array {
 }
 
 // Verify every element of arr matches vals and is non-null.
-check_values :: proc(t: ^testing.T, arr: ^oa.Array, vals: []$T) {
-	testing.expect_value(t, arr.length, len(vals))
+check_values :: proc(t: ^testing.T, arr: ^oa.Array, vals: []$T, loc := #caller_location) {
+	testing.expect_value(t, arr.length, len(vals), loc = loc)
 	for i in 0..<len(vals) {
-		testing.expect(t, oa.array_is_valid(arr, i), "element must be valid")
-		testing.expect_value(t, oa.array_get(arr, i, T), vals[i])
+		testing.expect(t, oa.array_is_valid(arr, i), "element must be valid", loc = loc)
+		testing.expect_value(t, oa.array_get(arr, i, T), vals[i], loc = loc)
 	}
 }
 
@@ -232,7 +232,7 @@ test_empty_array :: proc(t: ^testing.T) {
 
 // ── all numeric types ─────────────────────────────────────────────────────────
 
-roundtrip :: proc(t: ^testing.T, vals: []$T) {
+roundtrip :: proc(t: ^testing.T, vals: []$T, loc := #caller_location) {
 	b := oa.builder_make(T)
 	defer oa.builder_destroy(&b)
 	for v in vals {
@@ -240,8 +240,8 @@ roundtrip :: proc(t: ^testing.T, vals: []$T) {
 	}
 	arr, err := oa.builder_finish(&b)
 	defer oa.array_free(&arr)
-	testing.expect(t, err == nil)
-	check_values(t, &arr, vals)
+	testing.expect(t, err == nil, loc = loc)
+	check_values(t, &arr, vals, loc = loc)
 }
 
 @(test) test_i8_roundtrip  :: proc(t: ^testing.T) { roundtrip(t, []i8{-128, 0, 127}) }
