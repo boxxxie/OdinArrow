@@ -38,6 +38,7 @@ Parquet_Writer :: struct {
 	row_groups:    [dynamic]RG_Meta,
 	wbuf:          []u8,
 	wbuf_pos:      int,
+	val_buf:       [dynamic]u8,
 	write_err:     os.Error,
 	page_overflow: bool,
 }
@@ -66,8 +67,10 @@ pw_flush :: proc(pw: ^Parquet_Writer) {
 pw_write_bytes :: proc(pw: ^Parquet_Writer, data: []u8) {
 	if len(data) == 0 || pw.write_err != nil { return }
 	src := data
-	for len(src) > 0 {
-		if len(pw.wbuf) == 0 {
+	if len(src) >= len(pw.wbuf) {
+		pw_flush(pw)
+		if pw.write_err != nil { return }
+		for len(src) > 0 {
 			n, err := os.write(pw.file, src)
 			if err != nil {
 				pw.write_err = err
@@ -78,8 +81,10 @@ pw_write_bytes :: proc(pw: ^Parquet_Writer, data: []u8) {
 				return
 			}
 			src = src[n:]
-			continue
 		}
+		return
+	}
+	for len(src) > 0 {
 		avail := len(pw.wbuf) - pw.wbuf_pos
 		n := min(avail, len(src))
 		copy(pw.wbuf[pw.wbuf_pos:], src[:n])
@@ -126,27 +131,22 @@ pw_write_column :: proc(pw: ^Parquet_Writer, arr: ^oa.Array) -> Col_Write_Meta {
 	meta.num_values    = i64(arr.length)
 
 	// Build value bytes (PLAIN BYTE_ARRAY: [i32 len][bytes] per value)
-	val_buf: [dynamic]u8
-	defer delete(val_buf)
+	clear(&pw.val_buf)
 	for i in 0..<arr.length {
 		s := oa.array_get_string(arr, i)
 		n := len(s)
-		if n > int(max(i32)) {
+		if n > int(max(i32)) || i64(len(pw.val_buf)) + 4 + i64(n) > i64(max(i32)) {
 			pw.page_overflow = true
 			return meta
 		}
 		b4: [4]u8
 		b4[0] = u8(n);       b4[1] = u8(n >> 8)
 		b4[2] = u8(n >> 16); b4[3] = u8(n >> 24)
-		append(&val_buf, ..b4[:])
-		append(&val_buf, ..transmute([]u8)s)
-		if len(val_buf) > int(max(i32)) {
-			pw.page_overflow = true
-			return meta
-		}
+		append(&pw.val_buf, ..b4[:])
+		append(&pw.val_buf, ..transmute([]u8)s)
 	}
 
-	comp_size := len(val_buf)
+	comp_size := len(pw.val_buf)
 	num_vals  := arr.length
 	if comp_size > int(max(i32)) || num_vals > int(max(i32)) {
 		pw.page_overflow = true
@@ -179,7 +179,7 @@ pw_write_column :: proc(pw: ^Parquet_Writer, arr: ^oa.Array) -> Col_Write_Meta {
 	total     := i64(len(hdr_bytes)) + i64(comp_size)
 
 	pw_write_bytes(pw, hdr_bytes)
-	pw_write_bytes(pw, val_buf[:])
+	pw_write_bytes(pw, pw.val_buf[:])
 	pw.offset += total
 
 	meta.uncomp_size = total
@@ -270,6 +270,10 @@ pw_finish :: proc(pw: ^Parquet_Writer) {
 	tw_stop(&footer_tw) // FileMetaData
 
 	footer_bytes := tw_bytes(&footer_tw)
+	if len(footer_bytes) > int(max(i32)) {
+		pw.page_overflow = true
+		return
+	}
 	footer_len   := i32(len(footer_bytes))
 
 	pw_write_bytes(pw, footer_bytes)
@@ -287,6 +291,7 @@ pw_finish :: proc(pw: ^Parquet_Writer) {
 
 pw_destroy :: proc(pw: ^Parquet_Writer) {
 	delete(pw.wbuf)
+	delete(pw.val_buf)
 	for rg in pw.row_groups { delete(rg.cols) }
 	delete(pw.row_groups)
 }

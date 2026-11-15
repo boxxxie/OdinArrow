@@ -138,10 +138,10 @@ csv_to_parquet_stream :: proc(
 	}
 	write_ok := false
 	defer {
-		if !write_ok {
-			_ = os.truncate(out_file, 0)
-		}
 		os.close(out_file)
+		if !write_ok {
+			_ = os.remove(out_path)
+		}
 	}
 
 	pw := pw_open(out_file, csv.col_names)
