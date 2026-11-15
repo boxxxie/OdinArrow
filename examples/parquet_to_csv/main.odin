@@ -1,6 +1,7 @@
 package parquet_to_csv
 
 import "core:fmt"
+import "core:io"
 import "core:os"
 import "core:strconv"
 import "core:time"
@@ -9,9 +10,10 @@ import oa "../../skadi"
 // ── output buffer ─────────────────────────────────────────────────────────────
 
 Out :: struct {
-	fd:  ^os.File,
-	buf: []u8,
-	pos: int,
+	fd:        ^os.File,
+	buf:       []u8,
+	pos:       int,
+	write_err: os.Error,
 }
 
 out_make :: proc(fd: ^os.File) -> Out {
@@ -21,10 +23,24 @@ out_make :: proc(fd: ^os.File) -> Out {
 out_destroy :: proc(o: ^Out) { delete(o.buf) }
 
 out_flush :: proc(o: ^Out) {
-	if o.pos > 0 {
-		os.write(o.fd, o.buf[:o.pos])
+	if o.pos == 0 || o.write_err != nil {
 		o.pos = 0
+		return
 	}
+	written := 0
+	for written < o.pos {
+		n, err := os.write(o.fd, o.buf[written:o.pos])
+		if err != nil {
+			o.write_err = err
+			break
+		}
+		if n <= 0 {
+			o.write_err = io.Error.Short_Write
+			break
+		}
+		written += n
+	}
+	o.pos = 0
 }
 
 out_bytes :: proc(o: ^Out, b: []u8) {
@@ -104,27 +120,93 @@ main :: proc() {
 	}
 
 	mem_limit := i64(max_mb) * 1024 * 1024
+	t0 := time.now()
 
-	// Open file for footer reading only
-	file, file_err := os.open(in_path)
-	if file_err != nil {
-		fmt.eprintfln("error: cannot open %s: %v", in_path, file_err)
+	num_rows, chunk_rows, conv_err := parquet_to_csv_stream(in_path, out_path, mem_limit)
+	switch &e in conv_err {
+	case nil:
+	case Parquet_To_CSV_Open_Input_Error:
+		fmt.eprintfln("error: cannot open %s: %v", in_path, e.err)
+		os.exit(1)
+	case Parquet_To_CSV_Bad_Footer_Error:
+		fmt.eprintln("error: bad parquet footer")
+		os.exit(1)
+	case Parquet_To_CSV_Stream_Init_Error:
+		col_name := string(e.name_buf[:e.name_len])
+		if len(col_name) > 0 {
+			fmt.eprintfln("error: failed to open stream for column %s", col_name)
+		} else {
+			fmt.eprintln("error: failed to open column stream")
+		}
+		os.exit(1)
+	case Parquet_To_CSV_Open_Output_Error:
+		fmt.eprintfln("error: cannot open %s: %v", out_path, e.err)
+		os.exit(1)
+	case Parquet_To_CSV_Write_Output_Error:
+		fmt.eprintfln("error: write failed on %s: %v", out_path, e.err)
 		os.exit(1)
 	}
 
-	t0 := time.now()
+	total_ns := time.duration_nanoseconds(time.since(t0))
+	fmt.eprintfln("rows:       %d", num_rows)
+	fmt.eprintfln("chunk_rows: %d", chunk_rows)
+	fmt.eprintfln("mem_limit:  %dMB", max_mb)
+	fmt.eprintfln("total_ms:   %.1f", f64(total_ns) / 1e6)
+}
 
-	num_rows, metas, footer_ok := parse_footer_from_file(file)
+Parquet_To_CSV_Open_Input_Error :: struct {
+	err: os.Error,
+}
+
+Parquet_To_CSV_Bad_Footer_Error :: struct {}
+
+Parquet_To_CSV_Stream_Init_Error :: struct {
+	name_buf: [256]u8,
+	name_len: int,
+}
+
+Parquet_To_CSV_Open_Output_Error :: struct {
+	err: os.Error,
+}
+
+Parquet_To_CSV_Write_Output_Error :: struct {
+	err: os.Error,
+}
+
+Parquet_To_CSV_Error :: union {
+	Parquet_To_CSV_Open_Input_Error,
+	Parquet_To_CSV_Bad_Footer_Error,
+	Parquet_To_CSV_Stream_Init_Error,
+	Parquet_To_CSV_Open_Output_Error,
+	Parquet_To_CSV_Write_Output_Error,
+}
+
+parquet_to_csv_stream :: proc(
+	in_path:            string,
+	out_path:           string,
+	mem_limit:          i64,
+	chunk_rows_override := 0,
+) -> (num_rows: i64, chunk_rows: int, err: Parquet_To_CSV_Error) {
+	// Open file for footer reading only
+	file, file_err := os.open(in_path)
+	if file_err != nil {
+		return 0, 0, Parquet_To_CSV_Open_Input_Error{err = file_err}
+	}
+
+	metas: []Column_Chunk_Meta
+	footer_ok: bool
+	num_rows, metas, footer_ok = parse_footer_from_file(file)
 	os.close(file) // footer parsed; column streams open their own handles
 	if !footer_ok {
-		fmt.eprintln("error: bad parquet footer")
-		os.exit(1)
+		return 0, 0, Parquet_To_CSV_Bad_Footer_Error{}
 	}
 	defer {
 		for &m in metas {
 			delete(transmute([]u8)m.name)
 			delete(m.extra_rg_data_offsets)
 			delete(m.extra_rg_num_values)
+			delete(m.extra_rg_dict_offsets)
+			delete(m.extra_rg_has_dict)
 		}
 		delete(metas)
 	}
@@ -153,23 +235,40 @@ main :: proc() {
 	}
 	if bytes_per_row == 0 { bytes_per_row = 80 }
 
-	chunk_rows := int(avail / bytes_per_row)
-	if chunk_rows < 1            { chunk_rows = 1 }
-	if chunk_rows > int(num_rows) { chunk_rows = int(num_rows) }
+	chunk_rows = int(avail / bytes_per_row)
+	if num_rows > 0 && chunk_rows > int(num_rows) {
+		chunk_rows = int(num_rows)
+	}
+	if chunk_rows_override > 0 {
+		chunk_rows = chunk_rows_override
+		if num_rows > 0 && chunk_rows > int(num_rows) {
+			chunk_rows = int(num_rows)
+		}
+	}
+	if chunk_rows < 1 {
+		chunk_rows = 1
+	}
 
 	// Open per-column streaming readers
 	streams := make([]Col_Stream, n_cols)
+	initialized := 0
 	defer {
-		for j in 0..<n_cols { col_stream_destroy(&streams[j]) }
+		for j in 0 ..< initialized {
+			col_stream_destroy(&streams[j])
+		}
 		delete(streams)
 	}
-	for j in 0..<n_cols {
+	for j in 0 ..< n_cols {
 		s, s_ok := col_stream_init(in_path, metas[j])
 		if !s_ok {
-			fmt.eprintfln("error: failed to open stream for column %s", metas[j].name)
-			os.exit(1)
+			init_err: Parquet_To_CSV_Stream_Init_Error
+			n_copy := min(len(metas[j].name), len(init_err.name_buf))
+			copy(init_err.name_buf[:n_copy], metas[j].name[:n_copy])
+			init_err.name_len = n_copy
+			return 0, 0, init_err
 		}
 		streams[j] = s
+		initialized += 1
 	}
 
 	// OdinArrow arrays for the current chunk; one per column, freed after each chunk.
@@ -181,10 +280,9 @@ main :: proc() {
 	opened_file: ^os.File
 	using_file := out_path != "-"
 	if using_file {
-		f, err := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
-		if err != nil {
-			fmt.eprintfln("error: cannot open %s: %v", out_path, err)
-			os.exit(1)
+		f, open_err := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
+		if open_err != nil {
+			return 0, 0, Parquet_To_CSV_Open_Output_Error{err = open_err}
 		}
 		opened_file = f
 	}
@@ -198,7 +296,7 @@ main :: proc() {
 	// CSV header
 	for j in 0..<n_cols {
 		if j > 0 { out_str(&o, ",") }
-		out_str(&o, metas[j].name)
+		out_csv_field(&o, metas[j].name)
 	}
 	out_str(&o, "\n")
 
@@ -213,6 +311,16 @@ main :: proc() {
 				chunk_arrays[j] = col_stream_to_i32_array(&streams[j], n)
 			} else {
 				chunk_arrays[j] = col_stream_to_string_array(&streams[j], n)
+			}
+			if chunk_arrays[j].length != n {
+				for k in 0..=j {
+					oa.array_free(&chunk_arrays[k])
+				}
+				init_err: Parquet_To_CSV_Stream_Init_Error
+				n_copy := min(len(metas[j].name), len(init_err.name_buf))
+				copy(init_err.name_buf[:n_copy], metas[j].name[:n_copy])
+				init_err.name_len = n_copy
+				return 0, 0, init_err
 			}
 		}
 
@@ -233,14 +341,17 @@ main :: proc() {
 			out_str(&o, "\n")
 		}
 
-		for j in 0..<n_cols { oa.array_free(&chunk_arrays[j]) }
+		for j in 0 ..< n_cols {
+			oa.array_free(&chunk_arrays[j])
+		}
+		if o.write_err != nil {
+			return 0, 0, Parquet_To_CSV_Write_Output_Error{err = o.write_err}
+		}
 		rows_done += n
 	}
 	out_flush(&o)
-
-	total_ns := time.duration_nanoseconds(time.since(t0))
-	fmt.eprintfln("rows:       %d", num_rows)
-	fmt.eprintfln("chunk_rows: %d", chunk_rows)
-	fmt.eprintfln("mem_limit:  %dMB", max_mb)
-	fmt.eprintfln("total_ms:   %.1f", f64(total_ns) / 1e6)
+	if o.write_err != nil {
+		return 0, 0, Parquet_To_CSV_Write_Output_Error{err = o.write_err}
+	}
+	return num_rows, chunk_rows, nil
 }

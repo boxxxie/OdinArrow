@@ -35,69 +35,121 @@ main :: proc() {
 	}
 
 	mem_limit := i64(max_mb) * 1024 * 1024
+	t0 := time.now()
 
-	// ── CSV reader ────────────────────────────────────────────────────────────
-	// Read buffer: 10% of memory limit, clamped to [4 MB, 64 MB].
-	buf_size := int(mem_limit / 10)
-	if buf_size < 4  * 1024 * 1024 { buf_size = 4  * 1024 * 1024 }
-	if buf_size > 64 * 1024 * 1024 { buf_size = 64 * 1024 * 1024 }
-
-	csv, csv_ok := csv_stream_open(in_path, buf_size)
-	if !csv_ok {
-		fmt.eprintfln("error: cannot open CSV %s", in_path)
+	total_rows, total_chunks, conv_err := csv_to_parquet_stream(in_path, out_path, mem_limit)
+	switch e in conv_err {
+	case nil:
+	case CSV_To_Parquet_Open_CSV_Error:
+		fmt.eprintfln("error: cannot open CSV %s: %v", in_path, e.err)
+		os.exit(1)
+	case CSV_To_Parquet_Invalid_CSV_Error:
+		fmt.eprintfln("error: empty or invalid CSV header in %s", in_path)
+		os.exit(1)
+	case CSV_To_Parquet_Create_Output_Error:
+		fmt.eprintfln("error: cannot create %s: %v", out_path, e.err)
 		os.exit(1)
 	}
-	defer csv_stream_destroy(&csv)
-
-	n_cols := csv.n_cols
-
-	// ── Parquet output ────────────────────────────────────────────────────────
-	out_file, out_err := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
-	if out_err != nil {
-		fmt.eprintfln("error: cannot create %s: %v", out_path, out_err)
-		os.exit(1)
-	}
-	defer os.close(out_file)
-
-	pw := pw_open(out_file, csv.col_names)
-	defer pw_destroy(&pw)
-
-	// ── Memory budget → chunk size ────────────────────────────────────────────
-	// Budget: buf_size (CSV read) + 32 MB overhead, rest for OdinArrow string
-	// builder data (offsets + bytes).  Conservative 200 bytes per field.
-	overhead    := i64(buf_size) + 32 * 1024 * 1024
-	col_buf_cap := mem_limit - overhead
-	if col_buf_cap < 8 * 1024 * 1024 { col_buf_cap = 8 * 1024 * 1024 }
-
-	per_row_est := n_cols * 200
-	if per_row_est < 1 { per_row_est = 200 }
-
-	max_rows := int(col_buf_cap) / per_row_est
-	if max_rows < 1 { max_rows = 1 }
-
-	// ── Conversion loop ───────────────────────────────────────────────────────
-	t0           := time.now()
-	total_rows   := 0
-	total_chunks := 0
-
-	for {
-		arrays, n := csv_stream_read_chunk(&csv, max_rows)
-		if n == 0 { break }
-
-		pw_write_row_group(&pw, arrays)
-
-		for ci in 0..<n_cols { oa.array_free(&arrays[ci]) }
-		delete(arrays)
-
-		total_rows   += n
-		total_chunks += 1
-	}
-
-	pw_finish(&pw)
 
 	total_ns := time.duration_nanoseconds(time.since(t0))
 	fmt.eprintfln("rows:        %d", total_rows)
 	fmt.eprintfln("row_groups:  %d", total_chunks)
 	fmt.eprintfln("mem_limit:   %dMB", max_mb)
 	fmt.eprintfln("total_ms:    %.1f", f64(total_ns) / 1e6)
+}
+
+CSV_To_Parquet_Open_CSV_Error :: struct {
+	err: os.Error,
+}
+
+CSV_To_Parquet_Invalid_CSV_Error :: struct {}
+
+CSV_To_Parquet_Create_Output_Error :: struct {
+	err: os.Error,
+}
+
+CSV_To_Parquet_Error :: union {
+	CSV_To_Parquet_Open_CSV_Error,
+	CSV_To_Parquet_Invalid_CSV_Error,
+	CSV_To_Parquet_Create_Output_Error,
+}
+
+csv_to_parquet_stream :: proc(
+	in_path:          string,
+	out_path:         string,
+	mem_limit:        i64,
+	buf_size_override := 0,
+	max_rows_override := 0,
+) -> (total_rows: int, total_chunks: int, err: CSV_To_Parquet_Error) {
+	// Read buffer: 10% of memory limit, clamped to [4 MB, 64 MB].
+	buf_size := int(mem_limit / 10)
+	if buf_size < 4 * 1024 * 1024 {
+		buf_size = 4 * 1024 * 1024
+	}
+	if buf_size > 64 * 1024 * 1024 {
+		buf_size = 64 * 1024 * 1024
+	}
+	if buf_size_override > 0 {
+		buf_size = buf_size_override
+	}
+
+	open_err: os.Error
+	csv, csv_ok := csv_stream_open(in_path, buf_size, &open_err)
+	if !csv_ok {
+		if open_err != nil {
+			return 0, 0, CSV_To_Parquet_Open_CSV_Error{err = open_err}
+		}
+		return 0, 0, CSV_To_Parquet_Invalid_CSV_Error{}
+	}
+	defer csv_stream_destroy(&csv)
+
+	n_cols := csv.n_cols
+
+	out_file, out_err := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
+	if out_err != nil {
+		return 0, 0, CSV_To_Parquet_Create_Output_Error{err = out_err}
+	}
+	defer os.close(out_file)
+
+	pw := pw_open(out_file, csv.col_names)
+	defer pw_destroy(&pw)
+
+	overhead := i64(buf_size) + 32 * 1024 * 1024
+	col_buf_cap := mem_limit - overhead
+	if col_buf_cap < 8 * 1024 * 1024 {
+		col_buf_cap = 8 * 1024 * 1024
+	}
+
+	per_row_est := n_cols * 200
+	if per_row_est < 1 {
+		per_row_est = 200
+	}
+
+	max_rows := int(col_buf_cap) / per_row_est
+	if max_rows < 1 {
+		max_rows = 1
+	}
+	if max_rows_override > 0 {
+		max_rows = max_rows_override
+	}
+
+	for {
+		arrays, n := csv_stream_read_chunk(&csv, max_rows)
+		if n == 0 {
+			break
+		}
+
+		pw_write_row_group(&pw, arrays)
+
+		for ci in 0 ..< n_cols {
+			oa.array_free(&arrays[ci])
+		}
+		delete(arrays)
+
+		total_rows += n
+		total_chunks += 1
+	}
+
+	pw_finish(&pw)
+	return total_rows, total_chunks, nil
 }

@@ -15,23 +15,19 @@ CSV_Stream :: struct {
 }
 
 // csv_stream_open opens path, reads the header row, and returns a ready reader.
-csv_stream_open :: proc(path: string, buf_size: int) -> (cs: CSV_Stream, ok: bool) {
-	f, err := os.open(path)
-	if err != nil { return }
-	cs.file    = f
+csv_stream_open :: proc(path: string, buf_size: int, open_err: ^os.Error = nil) -> (CSV_Stream, bool) {
+	fd, err := os.open(path)
+	if err != nil {
+		if open_err != nil {
+			open_err^ = err
+		}
+		return {}, false
+	}
+	cs: CSV_Stream
+	cs.file    = fd
 	cs.buf     = make([]u8, buf_size)
 
 	csv_refill(&cs)
-
-	// Parse header row into a temp arena so we own the bytes.
-	hdr_arena := make([dynamic]u8, 0, 4096)
-	defer {
-		// col_names slice will be kept; hdr_arena backing buf must outlive it.
-		// Transfer ownership by not deleting hdr_arena here — we keep it in the
-		// returned CSV_Stream.  Instead store arena backing in col_names backing.
-		// Actually: header names are short so just allocate each separately.
-		delete(hdr_arena)
-	}
 
 	names: [dynamic]string
 	field_tmp := make([dynamic]u8, 0, 256)
@@ -39,7 +35,7 @@ csv_stream_open :: proc(path: string, buf_size: int) -> (cs: CSV_Stream, ok: boo
 	for {
 		clear(&field_tmp)
 		eor, eof := csv_read_field_into(&cs, &field_tmp)
-		if eof && len(field_tmp) == 0 { break }
+		if eof && len(field_tmp) == 0 && len(names) == 0 { break }
 		// Make a stable heap copy of the name.
 		name_buf := make([]u8, len(field_tmp))
 		copy(name_buf, field_tmp[:])
@@ -47,11 +43,16 @@ csv_stream_open :: proc(path: string, buf_size: int) -> (cs: CSV_Stream, ok: boo
 		if eor { break }
 	}
 
-	if len(names) == 0 { os.close(f); return }
+	if len(names) == 0 || (len(names) == 1 && len(names[0]) == 0) {
+		for s in names { delete(transmute([]u8)s) }
+		delete(names)
+		delete(cs.buf)
+		os.close(fd)
+		return {}, false
+	}
 	cs.col_names = names[:]
 	cs.n_cols    = len(names)
-	ok = true
-	return
+	return cs, true
 }
 
 csv_stream_destroy :: proc(cs: ^CSV_Stream) {
@@ -97,6 +98,9 @@ csv_read_field_into :: proc(cs: ^CSV_Stream, dst: ^[dynamic]u8) -> (eor: bool, e
 				ch := cs.buf[cs.buf_pos]
 				if ch == '"' {
 					cs.buf_pos += 1
+					if cs.buf_pos >= cs.buf_len && !cs.eof {
+						csv_refill(cs)
+					}
 					if cs.buf_pos < cs.buf_len && cs.buf[cs.buf_pos] == '"' {
 						// Escaped double-quote
 						append(dst, '"')
@@ -157,6 +161,9 @@ csv_consume_sep :: proc(cs: ^CSV_Stream) -> (eor: bool) {
 	}
 	if ch == '\r' {
 		cs.buf_pos += 1
+		if cs.buf_pos >= cs.buf_len && !cs.eof {
+			csv_refill(cs)
+		}
 		if cs.buf_pos < cs.buf_len && cs.buf[cs.buf_pos] == '\n' {
 			cs.buf_pos += 1
 		}
@@ -187,14 +194,27 @@ csv_stream_read_chunk :: proc(cs: ^CSV_Stream, max_rows: int) -> (arrays: []oa.A
 
 	for n < max_rows && !csv_stream_at_eof(cs) {
 		ok := true
+		eor := false
 		for ci in 0..<cs.n_cols {
 			clear(&field_tmp)
-			eor, eof := csv_read_field_into(cs, &field_tmp)
-			if eof && ci == 0 && len(field_tmp) == 0 { ok = false; break }
+			var_eof: bool
+			eor, var_eof = csv_read_field_into(cs, &field_tmp)
+			if var_eof && eor && ci == 0 && len(field_tmp) == 0 { ok = false; break }
 			oa.string_builder_append(&builders[ci], string(field_tmp[:]))
-			_ = eor
+			if eor {
+				for rci in ci + 1 ..< cs.n_cols {
+					oa.string_builder_append(&builders[rci], "")
+				}
+				break
+			}
 		}
 		if !ok { break }
+		if !eor {
+			for !eor && !csv_stream_at_eof(cs) {
+				clear(&field_tmp)
+				eor, _ = csv_read_field_into(cs, &field_tmp)
+			}
+		}
 		n += 1
 	}
 
