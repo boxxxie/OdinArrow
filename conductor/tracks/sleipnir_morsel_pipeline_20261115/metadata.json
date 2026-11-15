@@ -1,0 +1,8 @@
+{
+  "track_id": "sleipnir_morsel_pipeline_20261115",
+  "type": "feature",
+  "status": "completed",
+  "created_at": "2026-11-15T12:26:00Z",
+  "updated_at": "2026-11-15T05:12:00Z",
+  "description": "Sleipnir Actor & Sharded SPSC Cache-Resident Morsel Pipeline"
+}

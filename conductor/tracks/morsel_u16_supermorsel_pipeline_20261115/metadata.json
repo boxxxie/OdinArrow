@@ -1,0 +1,8 @@
+{
+  "track_id": "morsel_u16_supermorsel_pipeline_20261115",
+  "type": "performance",
+  "status": "completed",
+  "created_at": "2026-11-15T14:22:00Z",
+  "updated_at": "2026-11-15T15:00:00Z",
+  "description": "L1d u16 Morsel Fast-Path & Sleipnir Super-Morsel Coarsening"
+}

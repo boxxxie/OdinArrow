@@ -1,0 +1,8 @@
+{
+  "track_id": "compute_precision_encodings_20261111",
+  "type": "bug",
+  "status": "completed",
+  "created_at": "2026-11-11T16:05:00Z",
+  "updated_at": "2026-11-14T22:26:00Z",
+  "description": "Compute Precision, Type Safety & Encoding Integrity"
+}
