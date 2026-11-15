@@ -460,10 +460,12 @@ compute_filter :: proc(arr, mask: ^Array, allocator := context.allocator) -> (re
 	case UInt64_Type:  return _filter_typed(arr, mask, u64, allocator)
 	case Float32_Type: return _filter_typed(arr, mask, f32, allocator)
 	case Float64_Type: return _filter_typed(arr, mask, f64, allocator)
-	case Bool_Type:    return _filter_bool(arr, mask, allocator)
-	case String_Type:  return _filter_string(arr, mask, allocator)
-	case Binary_Type:  return _filter_binary(arr, mask, allocator)
-	case Null_Type, Large_String_Type, Large_Binary_Type:
+	case Bool_Type:         return _filter_bool(arr, mask, allocator)
+	case String_Type:       return _filter_string(arr, mask, allocator)
+	case Binary_Type:       return _filter_binary(arr, mask, allocator)
+	case Large_String_Type: return _filter_large_string(arr, mask, allocator)
+	case Large_Binary_Type: return _filter_large_binary(arr, mask, allocator)
+	case Null_Type:
 		panic("compute_filter: unsupported source type")
 	}
 	return
@@ -611,6 +613,36 @@ _filter_binary :: proc(arr, mask: ^Array, allocator: mem.Allocator) -> (result: 
 		}
 	}
 	return binary_builder_finish(&b, allocator)
+}
+
+_filter_large_string :: proc(arr, mask: ^Array, allocator: mem.Allocator) -> (result: Array, err: mem.Allocator_Error) {
+	b := large_string_builder_make(64, allocator)
+	defer large_string_builder_destroy(&b)
+	for i in 0..<arr.length {
+		if _mask_passes(mask, i) {
+			if array_is_null(arr, i) {
+				large_string_builder_append_null(&b)
+			} else {
+				large_string_builder_append(&b, array_get_large_string(arr, i))
+			}
+		}
+	}
+	return large_string_builder_finish(&b, allocator)
+}
+
+_filter_large_binary :: proc(arr, mask: ^Array, allocator: mem.Allocator) -> (result: Array, err: mem.Allocator_Error) {
+	b := large_binary_builder_make(64, allocator)
+	defer large_binary_builder_destroy(&b)
+	for i in 0..<arr.length {
+		if _mask_passes(mask, i) {
+			if array_is_null(arr, i) {
+				large_binary_builder_append_null(&b)
+			} else {
+				large_binary_builder_append(&b, array_get_large_binary(arr, i))
+			}
+		}
+	}
+	return large_binary_builder_finish(&b, allocator)
 }
 
 // ── take ──────────────────────────────────────────────────────────────────────
@@ -1135,7 +1167,7 @@ _sort_indices_typed :: proc(arr: ^Array, $T: typeid, allocator: mem.Allocator) -
 	has_nulls := arr.null_count != 0
 	vbits     := arr.buffers[0].data
 
-	// a ≤ b under "nulls last, then ascending value, ties keep order".
+	// a ≤ b under "nulls last, then ascending value (NaNs after finite/+Inf, before nulls), ties keep order".
 	le :: #force_inline proc(data: [^]T, off: int, has_nulls: bool, vbits: [^]u8, ai, bi: i64) -> bool {
 		if has_nulls && vbits != nil {
 			an := !bitmap_get(vbits, off + int(ai))
@@ -1144,7 +1176,16 @@ _sort_indices_typed :: proc(arr: ^Array, $T: typeid, allocator: mem.Allocator) -
 			if an       { return false }  // a null → after b
 			if bn       { return true }   // b null → a before
 		}
-		return data[off + int(ai)] <= data[off + int(bi)]
+		av := data[off + int(ai)]
+		bv := data[off + int(bi)]
+		when T == f32 || T == f64 {
+			a_nan := av != av
+			b_nan := bv != bv
+			if a_nan && b_nan { return true }  // preserve stability among NaNs
+			if a_nan          { return false } // NaN after finite/+Inf
+			if b_nan          { return true }
+		}
+		return av <= bv
 	}
 
 	tmp := make([]i64, n, context.temp_allocator)

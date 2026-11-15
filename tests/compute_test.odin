@@ -1,5 +1,6 @@
 package skadi_tests
 
+import "core:math"
 import "core:mem"
 import "core:os"
 import "core:testing"
@@ -916,5 +917,372 @@ test_compute_sort_indices_temp_allocator_no_leak :: proc(t: ^testing.T) {
 		testing.expect_value(t, err, mem.Allocator_Error.None)
 		testing.expect_value(t, oa.array_get(&idx, 0, i64), i64(N - 1))
 		oa.array_free(&idx)
+	}
+}
+
+@(test)
+test_compute_arithmetic_direct_dispatch :: proc(t: ^testing.T) {
+	ab := oa.builder_make(i32, 4)
+	defer oa.builder_destroy(&ab)
+	oa.builder_append(&ab, i32(20))
+	oa.builder_append(&ab, i32(15))
+	oa.builder_append_null(&ab)
+	oa.builder_append(&ab, i32(12))
+	a, a_err := oa.builder_finish(&ab)
+	testing.expect_value(t, a_err, nil)
+	defer oa.array_free(&a)
+
+	bb := oa.builder_make(i32, 4)
+	defer oa.builder_destroy(&bb)
+	oa.builder_append(&bb, i32(4))
+	oa.builder_append_null(&bb)
+	oa.builder_append(&bb, i32(5))
+	oa.builder_append(&bb, i32(3))
+	b, b_err := oa.builder_finish(&bb)
+	testing.expect_value(t, b_err, nil)
+	defer oa.array_free(&b)
+
+	Arith_Case :: struct {
+		op:    oa.Arithmetic_Op,
+		want0: i32,
+		want3: i32,
+	}
+	cases := []Arith_Case{
+		{.Add, 24, 15},
+		{.Sub, 16,  9},
+		{.Mul, 80, 36},
+		{.Div,  5,  4},
+	}
+	for c in cases {
+		res, err := oa.compute_arithmetic(&a, &b, c.op)
+		testing.expect_value(t, err, nil)
+		testing.expect_value(t, res.length, 4)
+		testing.expect_value(t, oa.array_null_count(&res), 2)
+		testing.expect(t, oa.array_is_valid(&res, 0))
+		testing.expect_value(t, oa.array_get(&res, 0, i32), c.want0)
+		testing.expect(t, oa.array_is_null(&res, 1))
+		testing.expect(t, oa.array_is_null(&res, 2))
+		testing.expect(t, oa.array_is_valid(&res, 3))
+		testing.expect_value(t, oa.array_get(&res, 3, i32), c.want3)
+		oa.array_free(&res)
+	}
+}
+
+@(test)
+test_sort_indices_sliced_nullable_strings :: proc(t: ^testing.T) {
+	sb := oa.string_builder_make(9)
+	defer oa.string_builder_destroy(&sb)
+	oa.string_builder_append(&sb, "zzz_head_pad_123")
+	oa.string_builder_append(&sb, "shared_prefix_zzzz")
+	oa.string_builder_append_null(&sb)
+	oa.string_builder_append(&sb, "shared_prefix_aaaa")
+	oa.string_builder_append(&sb, "cherry")
+	oa.string_builder_append(&sb, "shared_prefix_aaaa")
+	oa.string_builder_append_null(&sb)
+	oa.string_builder_append(&sb, "aaa")
+	oa.string_builder_append(&sb, "000_tail_pad")
+	full, f_err := oa.string_builder_finish(&sb)
+	testing.expect_value(t, f_err, nil)
+	defer oa.array_free(&full)
+
+	sliced := oa.array_slice(full, 1, 8)
+	// sliced:
+	//   0: "shared_prefix_zzzz"
+	//   1: null
+	//   2: "shared_prefix_aaaa"
+	//   3: "cherry"
+	//   4: "shared_prefix_aaaa"
+	//   5: null
+	//   6: "aaa"
+	idx, s_err := oa.compute_sort_indices(&sliced)
+	testing.expect_value(t, s_err, nil)
+	defer oa.array_free(&idx)
+
+	want_idx := []i64{6, 3, 2, 4, 0, 1, 5}
+	testing.expect_value(t, idx.length, len(want_idx))
+	for w, i in want_idx {
+		testing.expect_value(t, oa.array_get(&idx, i, i64), w)
+	}
+
+	sorted, t_err := oa.compute_take(&sliced, &idx)
+	testing.expect_value(t, t_err, nil)
+	defer oa.array_free(&sorted)
+	testing.expect_value(t, sorted.length, 7)
+	testing.expect_value(t, oa.array_null_count(&sorted), 2)
+	testing.expect_value(t, oa.array_get_string(&sorted, 0), "aaa")
+	testing.expect_value(t, oa.array_get_string(&sorted, 1), "cherry")
+	testing.expect_value(t, oa.array_get_string(&sorted, 2), "shared_prefix_aaaa")
+	testing.expect_value(t, oa.array_get_string(&sorted, 3), "shared_prefix_aaaa")
+	testing.expect_value(t, oa.array_get_string(&sorted, 4), "shared_prefix_zzzz")
+	testing.expect(t, oa.array_is_null(&sorted, 5))
+	testing.expect(t, oa.array_is_null(&sorted, 6))
+}
+
+@(test)
+test_sort_indices_float_signed_zero_nan_and_nulls :: proc(t: ^testing.T) {
+	// f64 sliced (offset=1): [-Inf, +0.0, NaN, -1.5, null, -0.0, +Inf, NaN, null, 2.5]
+	{
+		nan := math.nan_f64()
+		neg_zero := f64(-0.0)
+		pos_zero := f64(+0.0)
+		b := oa.builder_make(f64, 12)
+		defer oa.builder_destroy(&b)
+		oa.builder_append(&b, f64(999.0))
+		oa.builder_append(&b, math.inf_f64(-1)) // slice 0
+		oa.builder_append(&b, pos_zero)          // slice 1
+		oa.builder_append(&b, nan)               // slice 2
+		oa.builder_append(&b, f64(-1.5))         // slice 3
+		oa.builder_append_null(&b)               // slice 4
+		oa.builder_append(&b, neg_zero)          // slice 5
+		oa.builder_append(&b, math.inf_f64(1))   // slice 6
+		oa.builder_append(&b, nan)               // slice 7
+		oa.builder_append_null(&b)               // slice 8
+		oa.builder_append(&b, f64(2.5))          // slice 9
+		oa.builder_append(&b, f64(-999.0))
+		full, f_err := oa.builder_finish(&b)
+		testing.expect_value(t, f_err, nil)
+		defer oa.array_free(&full)
+
+		sliced := oa.array_slice(full, 1, 11)
+		idx, s_err := oa.compute_sort_indices(&sliced)
+		testing.expect_value(t, s_err, nil)
+		defer oa.array_free(&idx)
+
+		// Expected order:
+		//  -Inf(0), -1.5(3), +0.0(1), -0.0(5), 2.5(9), +Inf(6), NaN(2), NaN(7), null(4), null(8)
+		want := []i64{0, 3, 1, 5, 9, 6, 2, 7, 4, 8}
+		testing.expect_value(t, idx.length, len(want))
+		for w, i in want {
+			testing.expect_value(t, oa.array_get(&idx, i, i64), w)
+		}
+	}
+
+	// f32 (offset=1) with NaN before -Inf and nulls
+	{
+		nan32 := math.nan_f32()
+		b32 := oa.builder_make(f32, 8)
+		defer oa.builder_destroy(&b32)
+		oa.builder_append(&b32, f32(123.0))
+		oa.builder_append(&b32, nan32)            // slice 0
+		oa.builder_append(&b32, math.inf_f32(1))  // slice 1
+		oa.builder_append_null(&b32)              // slice 2
+		oa.builder_append(&b32, f32(-0.0))        // slice 3
+		oa.builder_append(&b32, f32(+0.0))        // slice 4
+		oa.builder_append(&b32, nan32)            // slice 5
+		oa.builder_append(&b32, math.inf_f32(-1)) // slice 6
+		full32, f_err := oa.builder_finish(&b32)
+		testing.expect_value(t, f_err, nil)
+		defer oa.array_free(&full32)
+
+		sliced32 := oa.array_slice(full32, 1, 8)
+		idx32, s_err := oa.compute_sort_indices(&sliced32)
+		testing.expect_value(t, s_err, nil)
+		defer oa.array_free(&idx32)
+
+		want32 := []i64{6, 3, 4, 1, 0, 5, 2}
+		testing.expect_value(t, idx32.length, len(want32))
+		for w, i in want32 {
+			testing.expect_value(t, oa.array_get(&idx32, i, i64), w)
+		}
+	}
+}
+
+@(test)
+test_compute_div_floats_and_signed_min_neg_one :: proc(t: ^testing.T) {
+	// 1. Float division (f32 and f64) on sliced nullable arrays with 0.0 divisors
+	{
+		ab := oa.builder_make(f64, 6)
+		defer oa.builder_destroy(&ab)
+		oa.builder_append(&ab, f64(999.0))
+		oa.builder_append(&ab, f64(10.0))
+		oa.builder_append(&ab, f64(3.0))
+		oa.builder_append(&ab, f64(-3.0))
+		oa.builder_append(&ab, f64(0.0))
+		oa.builder_append_null(&ab)
+		afull, a_err := oa.builder_finish(&ab)
+		testing.expect_value(t, a_err, nil)
+		defer oa.array_free(&afull)
+
+		bb := oa.builder_make(f64, 6)
+		defer oa.builder_destroy(&bb)
+		oa.builder_append(&bb, f64(1.0))
+		oa.builder_append(&bb, f64(2.0))
+		oa.builder_append(&bb, f64(0.0))
+		oa.builder_append(&bb, f64(0.0))
+		oa.builder_append(&bb, f64(0.0))
+		oa.builder_append(&bb, f64(0.0))
+		bfull, b_err := oa.builder_finish(&bb)
+		testing.expect_value(t, b_err, nil)
+		defer oa.array_free(&bfull)
+
+		as := oa.array_slice(afull, 1, 6)
+		bs := oa.array_slice(bfull, 1, 6)
+		res, d_err := oa.compute_div(&as, &bs)
+		testing.expect_value(t, d_err, nil)
+		defer oa.array_free(&res)
+
+		testing.expect_value(t, res.length, 5)
+		testing.expect_value(t, oa.array_get(&res, 0, f64), f64(5.0))
+		testing.expect(t, math.is_inf(oa.array_get(&res, 1, f64), 1))
+		testing.expect(t, math.is_inf(oa.array_get(&res, 2, f64), -1))
+		testing.expect(t, math.is_nan(oa.array_get(&res, 3, f64)))
+		testing.expect(t, oa.array_is_null(&res, 4))
+	}
+
+	{
+		ab32 := oa.builder_make(f32, 4)
+		defer oa.builder_destroy(&ab32)
+		oa.builder_append(&ab32, f32(12.0))
+		oa.builder_append(&ab32, f32(-6.0))
+		oa.builder_append(&ab32, f32(1.0))
+		oa.builder_append_null(&ab32)
+		a32, a_err := oa.builder_finish(&ab32)
+		testing.expect_value(t, a_err, nil)
+		defer oa.array_free(&a32)
+
+		bb32 := oa.builder_make(f32, 4)
+		defer oa.builder_destroy(&bb32)
+		oa.builder_append(&bb32, f32(3.0))
+		oa.builder_append(&bb32, f32(0.0))
+		oa.builder_append_null(&bb32)
+		oa.builder_append(&bb32, f32(2.0))
+		b32, b_err := oa.builder_finish(&bb32)
+		testing.expect_value(t, b_err, nil)
+		defer oa.array_free(&b32)
+
+		res32, d_err := oa.compute_div(&a32, &b32)
+		testing.expect_value(t, d_err, nil)
+		defer oa.array_free(&res32)
+		testing.expect_value(t, oa.array_get(&res32, 0, f32), f32(4.0))
+		testing.expect(t, math.is_inf(f64(oa.array_get(&res32, 1, f32)), -1))
+		testing.expect(t, oa.array_is_null(&res32, 2))
+		testing.expect(t, oa.array_is_null(&res32, 3))
+	}
+
+	// 2. Non-null signed min(T) / -1 across i8, i16, i32, i64 must not trap
+	check_min_neg1 :: proc(t: ^testing.T, $T: typeid) {
+		a := build_array([]T{min(T), T(-12), T(15)})
+		b := build_array([]T{T(-1),  T(3),   T(-5)})
+		defer oa.array_free(&a)
+		defer oa.array_free(&b)
+
+		res, err := oa.compute_div(&a, &b)
+		testing.expect_value(t, err, nil)
+		defer oa.array_free(&res)
+		testing.expect_value(t, res.length, 3)
+		testing.expect_value(t, oa.array_null_count(&res), 0)
+		testing.expect_value(t, oa.array_get(&res, 0, T), min(T))
+		testing.expect_value(t, oa.array_get(&res, 1, T), T(-4))
+		testing.expect_value(t, oa.array_get(&res, 2, T), T(-3))
+	}
+	check_min_neg1(t, i8)
+	check_min_neg1(t, i16)
+	check_min_neg1(t, i32)
+	check_min_neg1(t, i64)
+}
+
+@(test)
+test_compute_cast_narrowing_float_to_int_and_sliced_nulls :: proc(t: ^testing.T) {
+	// Narrowing i64 -> i8 on offset=3 sliced nullable array
+	{
+		b := oa.builder_make(i64, 7)
+		defer oa.builder_destroy(&b)
+		for _ in 0..<3 { oa.builder_append(&b, i64(111)) }
+		oa.builder_append(&b, i64(-128))
+		oa.builder_append_null(&b)
+		oa.builder_append(&b, i64(127))
+		oa.builder_append(&b, i64(42))
+		full, err := oa.builder_finish(&b)
+		testing.expect_value(t, err, nil)
+		defer oa.array_free(&full)
+
+		sliced := oa.array_slice(full, 3, 7)
+		narrow, c_err := oa.compute_cast(&sliced, oa.Int8_Type{})
+		testing.expect_value(t, c_err, nil)
+		defer oa.array_free(&narrow)
+
+		testing.expect_value(t, narrow.length, 4)
+		testing.expect_value(t, oa.array_null_count(&narrow), 1)
+		testing.expect_value(t, oa.array_get(&narrow, 0, i8), i8(-128))
+		testing.expect(t, oa.array_is_null(&narrow, 1))
+		testing.expect_value(t, oa.array_get(&narrow, 2, i8), i8(127))
+		testing.expect_value(t, oa.array_get(&narrow, 3, i8), i8(42))
+	}
+
+	// Cross-signedness i32 -> u8 and u16 -> i32 on offset=3 sliced nullable array
+	{
+		b := oa.builder_make(i32, 7)
+		defer oa.builder_destroy(&b)
+		for _ in 0..<3 { oa.builder_append(&b, i32(55)) }
+		oa.builder_append(&b, i32(0))
+		oa.builder_append(&b, i32(255))
+		oa.builder_append_null(&b)
+		oa.builder_append(&b, i32(19))
+		full, err := oa.builder_finish(&b)
+		testing.expect_value(t, err, nil)
+		defer oa.array_free(&full)
+
+		sliced := oa.array_slice(full, 3, 7)
+		cast_u8, c_err := oa.compute_cast(&sliced, oa.UInt8_Type{})
+		testing.expect_value(t, c_err, nil)
+		defer oa.array_free(&cast_u8)
+
+		testing.expect_value(t, cast_u8.length, 4)
+		testing.expect_value(t, oa.array_null_count(&cast_u8), 1)
+		testing.expect_value(t, oa.array_get(&cast_u8, 0, u8), u8(0))
+		testing.expect_value(t, oa.array_get(&cast_u8, 1, u8), u8(255))
+		testing.expect(t, oa.array_is_null(&cast_u8, 2))
+		testing.expect_value(t, oa.array_get(&cast_u8, 3, u8), u8(19))
+
+		cast_i16, c_err2 := oa.compute_cast(&cast_u8, oa.Int16_Type{})
+		testing.expect_value(t, c_err2, nil)
+		defer oa.array_free(&cast_i16)
+		testing.expect_value(t, oa.array_get(&cast_i16, 1, i16), i16(255))
+		testing.expect(t, oa.array_is_null(&cast_i16, 2))
+	}
+
+	// Float-to-int f64 -> i32 & f32 -> i64 on sliced nullable arrays
+	{
+		fb := oa.builder_make(f64, 5)
+		defer oa.builder_destroy(&fb)
+		oa.builder_append(&fb, f64(9.0))
+		oa.builder_append(&fb, f64(-3.9))
+		oa.builder_append_null(&fb)
+		oa.builder_append(&fb, f64(42.75))
+		oa.builder_append(&fb, f64(0.0))
+		full, err := oa.builder_finish(&fb)
+		testing.expect_value(t, err, nil)
+		defer oa.array_free(&full)
+
+		sliced := oa.array_slice(full, 1, 5)
+		ci32, c_err := oa.compute_cast(&sliced, oa.Int32_Type{})
+		testing.expect_value(t, c_err, nil)
+		defer oa.array_free(&ci32)
+		testing.expect_value(t, ci32.length, 4)
+		testing.expect_value(t, oa.array_null_count(&ci32), 1)
+		testing.expect_value(t, oa.array_get(&ci32, 0, i32), i32(-3))
+		testing.expect(t, oa.array_is_null(&ci32, 1))
+		testing.expect_value(t, oa.array_get(&ci32, 2, i32), i32(42))
+		testing.expect_value(t, oa.array_get(&ci32, 3, i32), i32(0))
+
+		fb32 := oa.builder_make(f32, 4)
+		defer oa.builder_destroy(&fb32)
+		oa.builder_append(&fb32, f32(1.0))
+		oa.builder_append(&fb32, f32(-17.8))
+		oa.builder_append_null(&fb32)
+		oa.builder_append(&fb32, f32(1000.25))
+		full32, err32 := oa.builder_finish(&fb32)
+		testing.expect_value(t, err32, nil)
+		defer oa.array_free(&full32)
+
+		sliced32 := oa.array_slice(full32, 1, 4)
+		ci64, c_err32 := oa.compute_cast(&sliced32, oa.Int64_Type{})
+		testing.expect_value(t, c_err32, nil)
+		defer oa.array_free(&ci64)
+		testing.expect_value(t, ci64.length, 3)
+		testing.expect_value(t, oa.array_null_count(&ci64), 1)
+		testing.expect_value(t, oa.array_get(&ci64, 0, i64), i64(-17))
+		testing.expect(t, oa.array_is_null(&ci64, 1))
+		testing.expect_value(t, oa.array_get(&ci64, 2, i64), i64(1000))
 	}
 }
