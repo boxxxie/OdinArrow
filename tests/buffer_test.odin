@@ -205,3 +205,37 @@ test_align_up :: proc(t: ^testing.T) {
 		testing.expect_value(t, got, c[2])
 	}
 }
+
+// ── uninitialised buffer ──────────────────────────────────────────────────────
+
+@(test)
+test_buffer_make_uninit_alignment_and_lifecycle :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+
+	sizes := []int{0, 1, 63, 64, 65, 1024, 10001}
+	for size in sizes {
+		buf, err := oa.buffer_make_uninit(size)
+		testing.expect(t, err == nil, "buffer_make_uninit must succeed")
+		testing.expect(t, buf.data != nil, "buffer_make_uninit data pointer must be non-nil")
+		testing.expect(
+			t,
+			uintptr(buf.data) % oa.ARROW_ALIGNMENT == 0,
+			"buffer_make_uninit pointer must be 64-byte aligned",
+		)
+		testing.expect_value(t, buf.size, size)
+		testing.expect(t, buf.capacity >= size, "capacity must cover requested size")
+		testing.expect(t, buf.capacity % oa.ARROW_ALIGNMENT == 0, "capacity must be multiple of ARROW_ALIGNMENT")
+		if size > 0 {
+			buf.data[0] = 0xAA
+			buf.data[size - 1] = 0x55
+		}
+		oa.buffer_free(&buf)
+		testing.expect(t, buf.data == nil, "buffer_free must clear data pointer")
+	}
+}

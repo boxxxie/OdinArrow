@@ -1,5 +1,6 @@
 package skadi_tests
 
+import "core:math"
 import "core:testing"
 import oa "../skadi"
 
@@ -127,4 +128,68 @@ test_dict_try_get_with_nulls :: proc(t: ^testing.T) {
 	nv2, nok2 := oa.dict_try_get(&nd, 2)
 	testing.expect(t, nok2)
 	testing.expect_value(t, nv2, i32(20))
+}
+
+@(test)
+test_dict_nan_dedup_and_null_decode :: proc(t: ^testing.T) {
+	// Multiple NaNs in Float64 must deduplicate to 1 dictionary entry.
+	fb64 := oa.builder_make(f64, 5)
+	defer oa.builder_destroy(&fb64)
+	oa.builder_append(&fb64, 1.5)
+	oa.builder_append(&fb64, math.nan_f64())
+	oa.builder_append(&fb64, 2.5)
+	oa.builder_append(&fb64, math.nan_f64())
+	oa.builder_append(&fb64, 1.5)
+	arr64, err64 := oa.builder_finish(&fb64)
+	testing.expect_value(t, err64, nil)
+	defer oa.array_free(&arr64)
+
+	d64 := oa.dict_encode(&arr64, f64)
+	defer oa.dict_free(&d64)
+	testing.expect_value(t, oa.dict_size(&d64), 3)
+	testing.expect(t, math.is_nan(oa.dict_get(&d64, 1)))
+	testing.expect(t, math.is_nan(oa.dict_get(&d64, 3)))
+
+	// Multiple NaNs in Float32 must deduplicate to 1 dictionary entry.
+	fb32 := oa.builder_make(f32, 4)
+	defer oa.builder_destroy(&fb32)
+	oa.builder_append(&fb32, math.nan_f32())
+	oa.builder_append(&fb32, f32(3.0))
+	oa.builder_append(&fb32, math.nan_f32())
+	oa.builder_append(&fb32, f32(3.0))
+	arr32, err32 := oa.builder_finish(&fb32)
+	testing.expect_value(t, err32, nil)
+	defer oa.array_free(&arr32)
+
+	d32 := oa.dict_encode(&arr32, f32)
+	defer oa.dict_free(&d32)
+	testing.expect_value(t, oa.dict_size(&d32), 2)
+
+	// dict_decode must preserve null_count and validity bitmap.
+	nb := oa.builder_make(i32, 5)
+	defer oa.builder_destroy(&nb)
+	oa.builder_append(&nb, 10)
+	oa.builder_append_null(&nb)
+	oa.builder_append(&nb, 20)
+	oa.builder_append_null(&nb)
+	oa.builder_append(&nb, 10)
+	narr, nerr := oa.builder_finish(&nb)
+	testing.expect_value(t, nerr, nil)
+	defer oa.array_free(&narr)
+
+	nd := oa.dict_encode(&narr, i32)
+	defer oa.dict_free(&nd)
+	dec, derr := oa.dict_decode(&nd)
+	testing.expect_value(t, derr, nil)
+	defer oa.array_free(&dec)
+
+	testing.expect_value(t, dec.length, 5)
+	testing.expect_value(t, oa.array_null_count(&dec), 2)
+	testing.expect(t, !oa.array_is_null(&dec, 0))
+	testing.expect(t, oa.array_is_null(&dec, 1))
+	testing.expect(t, !oa.array_is_null(&dec, 2))
+	testing.expect(t, oa.array_is_null(&dec, 3))
+	testing.expect_value(t, oa.array_get(&dec, 0, i32), i32(10))
+	testing.expect_value(t, oa.array_get(&dec, 2, i32), i32(20))
+	testing.expect_value(t, oa.array_get(&dec, 4, i32), i32(10))
 }

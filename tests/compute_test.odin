@@ -1,5 +1,6 @@
 package skadi_tests
 
+import "core:mem"
 import "core:os"
 import "core:testing"
 import oa "../skadi"
@@ -838,4 +839,24 @@ test_agg_where_compare_i64_on_float_columns :: proc(t: ^testing.T) {
 	testing.expect(t, aggf.valid)
 	testing.expect_value(t, aggf.count, 2)
 	testing.expect_value(t, aggf.sum, 50.0)
+}
+
+@(test)
+test_compute_sort_indices_temp_allocator_no_leak :: proc(t: ^testing.T) {
+	N :: 2048
+	b := oa.builder_make(i32, N)
+	defer oa.builder_destroy(&b)
+	for i in 0..<N {
+		oa.builder_append(&b, i32(N - i))
+	}
+	arr, arr_err := oa.builder_finish(&b)
+	testing.expect_value(t, arr_err, mem.Allocator_Error.None)
+	defer oa.array_free(&arr)
+
+	for _ in 0..<25 {
+		idx, err := oa.compute_sort_indices(&arr)
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+		testing.expect_value(t, oa.array_get(&idx, 0, i64), i64(N - 1))
+		oa.array_free(&idx)
+	}
 }
