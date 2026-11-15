@@ -9,17 +9,35 @@ import "core:time"
 
 when ODIN_OS == .Linux {
 	foreign import libparquet_capi "../../lib/libparquet_capi.so"
-}
 
-@(default_calling_convention = "c")
-foreign libparquet_capi {
+	@(default_calling_convention = "c")
+	foreign libparquet_capi {
+		parquet_capi_from_csv_mem :: proc(
+			input_path:       cstring,
+			output_path:      cstring,
+			max_memory_bytes: i64,
+			errbuf:           [^]u8,
+			errbuf_len:       i32,
+		) -> i32 ---
+	}
+} else {
 	parquet_capi_from_csv_mem :: proc(
-		input_path:      cstring,
-		output_path:     cstring,
+		input_path:       cstring,
+		output_path:      cstring,
 		max_memory_bytes: i64,
-		errbuf:          [^]u8,
-		errbuf_len:      i32,
-	) -> i32 ---
+		errbuf:           [^]u8,
+		errbuf_len:       i32,
+	) -> i32 {
+		msg := "FFI parquet_capi_from_csv_mem requires Linux libparquet_capi.so"
+		if errbuf != nil && errbuf_len > 0 {
+			n := min(len(msg), int(errbuf_len) - 1)
+			for k in 0 ..< n {
+				errbuf[k] = msg[k]
+			}
+			errbuf[n] = 0
+		}
+		return -1
+	}
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -66,7 +84,8 @@ main :: proc() {
 	total_ns := time.duration_nanoseconds(time.since(t0))
 
 	if rc != 0 {
-		fmt.eprintfln("error: %s", string(errbuf[:]))
+		errbuf[len(errbuf) - 1] = 0
+		fmt.eprintfln("error: %s", string(cstring(&errbuf[0])))
 		os.exit(1)
 	}
 
