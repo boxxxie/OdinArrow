@@ -1,5 +1,6 @@
 SRC         := skadi
 TESTS       := tests
+SPECS       := specs
 BIN         := bin
 CHECK_FLAGS := -vet -strict-style -disallow-do -warnings-as-errors
 
@@ -31,7 +32,7 @@ endif
 
 TEST_DATA ?= test_data.parquet
 
-.PHONY: all check test test-cpp bench-odin bench-python bench bench-compare \
+.PHONY: all check test test-specs test-cpp bench-odin bench-python bench bench-compare \
         build-arrow-capi bench-arrow-cpp \
         build-parquet-capi parquet-odin parquet-ffi bench-parquet \
         csv-to-parquet-odin csv-to-parquet-ffi clean
@@ -49,6 +50,7 @@ lib:
 check:
 	odin check $(SRC) -no-entry-point $(CHECK_FLAGS)
 	odin check $(TESTS) -no-entry-point $(CHECK_FLAGS)
+	odin check $(SPECS) -no-entry-point $(CHECK_FLAGS)
 	odin check tests_cpp -no-entry-point $(CHECK_FLAGS)
 	odin check examples/quickstart $(CHECK_FLAGS)
 	odin check examples/csv_to_parquet $(CHECK_FLAGS)
@@ -58,8 +60,12 @@ check:
 	odin check benchmarks/odin $(CHECK_FLAGS)
 	odin check benchmarks/odin_c $(CHECK_FLAGS)
 
+test-specs: $(BIN)
+	odin test $(SPECS) -out:$(BIN)/spec_runner $(CHECK_FLAGS)
+
 test: $(BIN)
 	odin test $(TESTS) -out:$(BIN)/test_runner $(CHECK_FLAGS)
+	odin test $(SPECS) -out:$(BIN)/spec_runner $(CHECK_FLAGS)
 
 # ── Arrow C++ shared library (for Odin FFI) ───────────────────────────────────
 
