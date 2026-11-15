@@ -40,19 +40,19 @@ Splits oversized ATDD Layer 2/3 files by domain and fixes weak assertions and te
 ## Phase 3: Complete Uncovered Public APIs, Encodings, Compute & Parallel Kernels
 Adds unit and property/spec coverage for all remaining `skadi/` gaps identified in the audit.
 
-- [ ] Task: Cover Remaining Unreferenced Public `skadi/` Procedures
-    - [ ] Add unit tests for `table_column_at` (in-bounds and out-of-bounds indices) in `tests/batch_test.odin`
-    - [ ] Add unit tests for `binary_builder_reset`, `large_string_builder_reset`, and `large_binary_builder_reset` (with nulls, non-nulls, and leak tracking) in `tests/strings_test.odin`
-    - [ ] Add exhaustive unit test for `type_is_variable_length` across all 16 `DataType` variants in `tests/types_test.odin`
-    - [ ] Add direct unit tests for `compute_arithmetic` across `.Add`, `.Sub`, `.Mul`, and `.Div` in `tests/compute_test.odin`
-- [ ] Task: Cover RLE & Numeric Dictionary Null, Empty, All-Null, and NaN Edge Cases
-    - [ ] Add tests in `tests/rle_test.odin` for `rle_encode`, `rle_decode`, `rle_sum`, and `rle_min_max` on empty (`0`), all-null, nullable numeric arrays, and `NaN` run coalescing
-    - [ ] Add tests in `tests/dict_test.odin` for `dict_encode`, `dict_decode`, `dict_sum`, `dict_min_max`, and `dict_value_counts` on empty (`0`), all-null, and nullable numeric `Dict_Array`
-- [ ] Task: Cover Sorting, Arithmetic, Cast & Parallel Compute Edge Cases
-    - [ ] Add tests in `tests/compute_test.odin` for `compute_sort_indices` on sliced (`offset > 0`) nullable `String_Type` arrays and `f32`/`f64` arrays with `-0.0`, `+0.0`, `NaN`, and nulls
-    - [ ] Add tests in `tests/compute_test.odin` for `compute_div` on `f32`/`f64` (including nulls and zero divisors) and non-null signed `min(T) / -1` (`i8`, `i16`, `i32`, `i64`), plus `compute_cast` narrowing, float-to-int, and signed/unsigned cross-casts on sliced nullable arrays
-    - [ ] Add tests in `tests/parallel_test.odin` for `compute_sum_parallel`, `compute_min_parallel`, `compute_max_parallel`, `compute_mean_parallel`, and `compute_min_max_parallel` on `f64`/`i64` with `offset > 0` and nulls, and `compute_filter_parallel` on `f64`, `Binary_Type`, `Large_String_Type`, `Large_Binary_Type`, and sliced inputs
-    - [ ] Run `make check && make test` and confirm 0 warnings/failures
+- [x] Task: Cover Remaining Unreferenced Public `skadi/` Procedures `b9c18c1` (`compute_arithmetic` in `ebd6271`)
+    - [x] Add unit tests for `table_column_at` (in-bounds and out-of-bounds indices) in `tests/batch_test.odin` (`tests/schema_test.odin`)
+    - [x] Add unit tests for `binary_builder_reset`, `large_string_builder_reset`, and `large_binary_builder_reset` (with nulls, non-nulls, and leak tracking) in `tests/strings_test.odin`
+    - [x] Add exhaustive unit test for `type_is_variable_length` across all 16 `DataType` variants in `tests/types_test.odin` (`tests/array_test.odin`)
+    - [x] Add direct unit tests for `compute_arithmetic` across `.Add`, `.Sub`, `.Mul`, and `.Div` in `tests/compute_test.odin`
+- [x] Task: Cover RLE & Numeric Dictionary Null, Empty, All-Null, and NaN Edge Cases `f6a9faf`
+    - [x] Add tests in `tests/rle_test.odin` for `rle_encode`, `rle_decode`, `rle_sum`, and `rle_min_max` on empty (`0`), all-null, nullable numeric arrays, and `NaN` run coalescing
+    - [x] Add tests in `tests/dict_test.odin` for `dict_encode`, `dict_decode`, `dict_sum`, `dict_min_max`, and `dict_value_counts` on empty (`0`), all-null, and nullable numeric `Dict_Array`
+- [x] Task: Cover Sorting, Arithmetic, Cast & Parallel Compute Edge Cases `ebd6271`
+    - [x] Add tests in `tests/compute_test.odin` for `compute_sort_indices` on sliced (`offset > 0`) nullable `String_Type` arrays and `f32`/`f64` arrays with `-0.0`, `+0.0`, `NaN`, and nulls
+    - [x] Add tests in `tests/compute_test.odin` for `compute_div` on `f32`/`f64` (including nulls and zero divisors) and non-null signed `min(T) / -1` (`i8`, `i16`, `i32`, `i64`), plus `compute_cast` narrowing, float-to-int, and signed/unsigned cross-casts on sliced nullable arrays
+    - [x] Add tests in `tests/parallel_test.odin` (`tests/compute_parallel_test.odin`) for `compute_sum_parallel`, `compute_min_parallel`, `compute_max_parallel`, `compute_mean_parallel`, and `compute_min_max_parallel` on `f64`/`i64` with `offset > 0` and nulls, and `compute_filter_parallel` on `f64`, `Binary_Type`, `Large_String_Type`, `Large_Binary_Type`, and sliced inputs
+    - [x] Run `make check && make test` and confirm 0 warnings/failures
 - [ ] Task: Conductor - User Manual Verification 'Phase 3: Complete Uncovered Public APIs, Encodings, Compute & Parallel Kernels' (Protocol in workflow.md)
 
 ---
