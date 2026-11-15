@@ -64,10 +64,12 @@ check:
 
 test-specs: $(BIN)
 	odin test $(SPECS) -out:$(BIN)/spec_runner $(CHECK_FLAGS)
+	python3 -m unittest benchmarks/test_compare_1v1.py
 
 test: $(BIN)
 	odin test $(TESTS) -out:$(BIN)/test_runner $(CHECK_FLAGS)
 	odin test $(SPECS) -out:$(BIN)/spec_runner $(CHECK_FLAGS)
+	python3 -m unittest benchmarks/test_compare_1v1.py
 
 # ── Arrow C++ shared library (for Odin FFI) ───────────────────────────────────
 
@@ -157,6 +159,10 @@ csv-to-parquet-ffi: bin/csv_to_parquet_ffi
 
 bench-parquet: bin/parquet_to_csv_odin bin/parquet_to_csv_ffi
 	bash benchmarks/parquet_bench.sh $(TEST_DATA)
+
+.PHONY: bench-1v1
+bench-1v1: bin/bench_arrow_cpp
+	python3 benchmarks/compare_1v1.py
 
 clean:
 	rm -rf $(BIN) lib

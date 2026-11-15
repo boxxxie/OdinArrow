@@ -3,7 +3,7 @@
 # Usage: bash benchmarks/parquet_bench.sh <input.parquet>
 set -euo pipefail
 
-PARQUET="${1:-$HOME/Work/Projects/Odin/test_data.parquet}"
+PARQUET="${1:-test_data.parquet}"
 TRIALS=3
 OUT=/dev/null   # discard CSV output; we time the conversion only
 

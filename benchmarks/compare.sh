@@ -9,7 +9,7 @@ echo "Building Odin benchmark binary..."
 odin build "$ROOT/benchmarks/odin" -out:"$ROOT/bin/bench_runner" -o:speed
 
 echo "Running Odin benchmarks (threaded)..."
-ODIN_OUT=$("$ROOT/bin/bench_runner")
+ODIN_OUT=$("$ROOT/bin/bench_runner" --legacy --no-history)
 
 echo "Running Python benchmarks (array)..."
 PY_ARRAY=$(python3 "$ROOT/benchmarks/python/bench_array.py")
@@ -18,7 +18,7 @@ echo "Running Python benchmarks (compute)..."
 PY_COMPUTE=$(python3 "$ROOT/benchmarks/python/bench_compute.py")
 
 echo "Running Arrow C++ benchmarks..."
-CPP_OUT=$("$ROOT/bin/bench_arrow_cpp")
+CPP_OUT=$("$ROOT/bin/bench_arrow_cpp" --legacy --no-history)
 
 PY_OUT="${PY_ARRAY}
 ${PY_COMPUTE}"
