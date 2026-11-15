@@ -21,17 +21,33 @@ Arrow project has accomplished.
 
 - **Columnar memory** — 64-byte-aligned buffers, packed validity bitmaps,
   zero-copy slicing, the Arrow C Data Interface buffer layout.
-- **Type system** — a tagged union of Arrow types (no vtables): Bool, Int8…64,
-  UInt8…64, Float32/64, Utf8/Binary (i32 offsets), LargeUtf8/LargeBinary
-  (i64 offsets), Null.
-- **Builders** — raw-buffer, zero-copy `finish()`, lazy validity bitmaps, plus a
-  reusable [`Buffer_Pool`](skadi/buffer_pool.odin) that recycles freed blocks.
-- **Compute kernels** — `sum`, `min`/`max`, `mean`, `count`, `filter`, `take`,
-  `cast`, element-wise arithmetic, and `sort_indices` (stable, nulls-last).
-  SIMD paths for the numeric hot loops; multi-threaded `*_parallel` variants.
+- **Type system & compressed encodings** — a tagged union of Arrow types (no
+  vtables): `Bool`, `Int8…64`, `UInt8…64`, `Float32/64`, `Utf8`/`Binary`
+  (`i32` offsets), `LargeUtf8`/`LargeBinary` (`i64` offsets), `Null` — plus
+  encoding-aware arrays: [`Umbra_Array`](skadi/umbra.odin) (16-byte German strings
+  with inline/prefix fast paths), [`RLE_Array(T)`](skadi/rle.odin) (run-end
+  encoding), and [`Dict_Array(T)` / `Str_Dict_Array`](skadi/dict.odin) (dictionary
+  encoding).
+- **Builders** — raw-buffer, zero-copy `finish()`, pre-reserved capacity
+  (`string_builder_reserve_data`), lazy validity bitmaps, plus a reusable
+  [`Buffer_Pool`](skadi/buffer_pool.odin) that recycles freed blocks.
+- **Compute kernels, fusion & selection vectors** — `sum`, `min`/`max`, `mean`,
+  `count`, `filter`, `take`, `cast`, element-wise arithmetic, and `sort_indices`
+  (packed `u32` LSD radix sort for integers, prefix radix + tie-break merge
+  sort for strings/Umbra); fused operators (`compute_sum_where`,
+  `compute_agg_where_compare`) and lazy [`Selection`](skadi/selection.odin)
+  vectors with L1d-resident `u16` morsel kernels
+  ([`skadi/hardware_config.odin`](skadi/hardware_config.odin)).
+- **Parallel & Sleipnir actor execution** — work-stealing `*_parallel` kernels
+  ([`skadi/thread_pool.odin`](skadi/thread_pool.odin)) and the cache-resident
+  **Sleipnir actor & sharded SPSC morsel pipeline**
+  ([`skadi/pipeline/sleipnir_pipeline.odin`](skadi/pipeline/sleipnir_pipeline.odin))
+  for super-morsel fused aggregations, dictionary histograms, and MSB-bucket
+  parallel radix/string/Umbra sorting.
 - **Arrow IPC** — file (random batch access) and stream (sequential) formats,
-  **memory-mapped zero-copy reads**, hand-rolled FlatBuffers encoder/decoder,
-  bidirectional PyArrow interop.
+  **vectored `writev` zero-copy writes**, **memory-mapped (`mmap`) zero-copy
+  reads**, hand-rolled FlatBuffers encoder/decoder, bidirectional PyArrow and
+  Arrow C++ interop.
 
 ## Quick example
 
@@ -78,67 +94,92 @@ table = ipc.open_file("data.arrow").read_all()
 
 ## Benchmarks
 
-Skadi vs **Apache Arrow C++** (the LLVM-compiled library PyArrow wraps,
-called directly) — **both single-threaded**, so this is a true apples-to-apples
-per-core comparison of Skadi's serial kernels against Arrow's. Median of 5
-trials, 10M-element numeric / 1M-element string workloads, recycling memory pools
-on both sides. `C++/Odin` is Arrow C++ time ÷ Skadi time; **> 1× means
-Skadi is faster**.
+Skadi vs **Apache Arrow C++ `25.0.1`** (`-O3`, the LLVM-compiled library
+PyArrow wraps, called directly) across 26 canonical 1v1 workloads — **both
+single-threaded (`Odin ST` vs `Arrow C++ ST`)** for an apples-to-apples per-core
+comparison, alongside **multi-threaded / Sleipnir actor scaling (`Odin MT`)**.
+Measured on an AMD Ryzen 7 7735U (8C/16T) with `--runs 5 --warmup 1` (median of
+5 trials, Odin `-o:speed -microarch:native`, recycling memory pools on both
+sides). Speedup `> 1×` means Skadi is faster.
 
-| Benchmark                           | Skadi (ms) | Arrow C++ (ms) |  C++/Odin |
-| ----------------------------------- | -------------: | -------------: | --------: |
-| Build 10M i32 (1% nulls)            |          17.89 |          32.94 | **1.84×** |
-| Build 1M strings (2% nulls)         |           5.10 |           6.41 | **1.26×** |
-| Sum 10M f64                         |           4.12 |           6.14 | **1.49×** |
-| Sum 10M f64 (1% nulls)              |           5.81 |           7.48 | **1.29×** |
-| Min+Max 10M i32                     |           2.06 |           2.06 | **1.00×** |
-| Mean 10M f64                        |           4.33 |           5.64 | **1.30×** |
-| Filter 10M i32 (50% pass)           |           7.65 |          36.43 | **4.76×** |
-| Filter 10M i32 (1% pass)            |           0.83 |           1.92 | **2.30×** |
-| Take 10M i32 (1M indices)           |           8.97 |           9.30 | **1.04×** |
-| Sort indices 1M i32                 |          32.42 |         124.36 | **3.84×** |
-| Cast 10M i32 → f64                  |           4.48 |           7.85 | **1.75×** |
-| Add 10M i32                         |           4.49 |           6.30 | **1.40×** |
-| Compare 10M f64 > k                 |           4.45 |           6.95 | **1.56×** |
-| Scan 1M strings                     |           1.15 |           9.35 | **8.14×** |
-| Sum-where 10M f64 (50%)             |           7.40 |          42.31 | **5.72×** |
-| Value counts 10M str (100 distinct) |           7.94 |          59.54 | **7.50×** |
-| IPC roundtrip 10M i32 (w+r)         |           5.12 |           9.75 | **1.90×** |
+| Benchmark                                                     | Odin ST (ms) | Arrow C++ ST (ms) |   ST Speedup | Odin MT (ms)       | MT vs C++            |
+| ------------------------------------------------------------- | -----------: | ----------------: | -----------: | -----------------: | -------------------: |
+| `array_build_10m_i32` (Build 10M `i32`, 1% nulls)             |        13.78 |             33.24 |    **2.41×** |                  - |                    - |
+| `string_build_1m` (Build 1M strings, 2% nulls)                |         3.49 |              4.66 |    **1.34×** |                  - |                    - |
+| `sum_10m_f64` (Sum 10M `f64`)                                 |         4.00 |              6.50 |    **1.63×** |               2.24 |            **2.91×** |
+| `sum_10m_f64_nulls` (Sum 10M `f64`, 1% nulls)                 |         5.22 |              8.20 |    **1.57×** |               2.55 |            **3.22×** |
+| `sum_10m_i32` (Sum 10M `i32`)                                 |         2.45 |              3.29 |    **1.34×** |               1.45 |            **2.26×** |
+| `min_max_10m_i32` (Min+Max 10M `i32`)                         |         2.19 |              2.37 |    **1.09×** |               1.04 |            **2.29×** |
+| `filter_10m_i32` (Filter 10M `i32`, 50% pass)                 |         5.25 |             40.02 |    **7.63×** |               2.47 |           **16.17×** |
+| `filter_10m_i32_sparse` (Filter 10M `i32`, 1% pass)           |         0.45 |              1.49 |    **3.28×** |                  - |                    - |
+| `filter_1m_string` (Filter 1M strings, 50% pass)              |         3.74 |              4.82 |    **1.29×** |               0.65 |            **7.44×** |
+| `take_1m_i32` (Take 10M `i32`, 1M indices)                    |         7.36 |              9.02 |    **1.22×** |               2.01 |            **4.49×** |
+| `sort_indices_1m_i32` (Sort indices 1M `i32`)                 |        22.49 |             40.99 |    **1.82×** |               4.98 |            **8.23×** |
+| `sort_indices_100k_str` (Sort indices 100K strings)           |         2.58 |              9.68 |    **3.76×** |               0.33 |           **28.90×** |
+| `cast_10m_i32_f64` (Cast 10M `i32` → `f64`)                   |         3.79 |              7.93 |    **2.09×** |                  - |                    - |
+| `arith_add_10m_f64` (Add 10M `f64`)                           |         6.84 |             11.97 |    **1.75×** |                  - |                    - |
+| `compare_gt_10m_i32` (Compare 10M `i32 > k`)                  |         2.08 |              5.89 |    **2.84×** |                  - |                    - |
+| `compare_gt_10m_f64` (Compare 10M `f64 > k`)                  |         4.32 |              7.57 |    **1.75×** |                  - |                    - |
+| `string_scan_1m` (Scan 1M strings)                            |         1.08 |              1.14 |    **1.05×** |                  - |                    - |
+| `sum_where_10m_f64` (Sum-where 10M `f64`, 50%)                |         6.17 |             39.02 |    **6.32×** |                  - |                    - |
+| `agg_where_10m_f64` (Fused `sum,count,min,max` 10M `f64`)     |        10.32 |             39.39 |    **3.82×** |               4.46 |            **8.82×** |
+| `sel_2pred_sum_10m_f64` (2-pred selection + sum 10M `f64`)    |        13.93 |             21.92 |    **1.57×** | 4.38 (5.76 actor)  | **5.00×** (3.80× actor) |
+| `dict_vc_1m_str` (Value counts 1M str, 100 distinct)          |         0.79 |              6.09 |    **7.73×** |               0.16 |           **37.95×** |
+| `rle_sum_10m_f64` (RLE sum 10M `f64`, 10K runs)               |         0.01 |              6.43 |  **532.62×** |                  - |                    - |
+| `umbra_sort_100k_str` (Umbra sort 100K strings)               |         2.58 |              9.80 |    **3.80×** |               0.27 |           **36.40×** |
+| `ipc_roundtrip_10m_i32` (IPC roundtrip 10M `i32` w+r)         |        13.07 |             46.97 |    **3.59×** |                  - |                    - |
+| `ipc_write_10m_i32` (IPC vectored write 10M `i32`)            |        12.53 |             36.42 |    **2.91×** |                  - |                    - |
+| `ipc_read_mmap_10m_i32` (IPC `mmap` read 10M `i32`)           |         0.02 |              0.16 |    **7.17×** |                  - |                    - |
 
-**All 17 kernels are at parity or faster than Arrow C++.** The big margins come
-from fused kernels (`filter`, `sum-where`), dictionary group-by (`value counts`),
-and an LSD radix sort; SIMD compares and a per-proc-AVX2 `min/max` remove ALU
-overhead; element-wise kernels (`cast`/`add`/`take`) reach or beat parity via the
-recycling buffer pool plus non-temporal stores that skip the output buffer's
-read-for-ownership traffic. `min/max` and `take` sit at the memory-bandwidth floor,
-where both libraries are limited by RAM, not code.
+**Every benchmark beats Arrow C++ single-threaded and scales further with
+multi-threading and the Sleipnir actor pipeline.** Key architectural drivers:
+- **Fused kernels & L1d `u16` morsels**: `sum_where`, `agg_where`, and
+  `Selection` pipelines evaluate predicates and aggregates inside L1d-sized
+  morsels ([`skadi/hardware_config.odin`](skadi/hardware_config.odin)) with `0`
+  intermediate heap allocations (`0` vs `1`–`4` allocs / up to `39.3 MB` in C++).
+- **Encoding-aware arrays**: [`RLE_Array`](skadi/rle.odin) sums 10M rows over 10K
+  runs in `0.01 ms` (`532.62×`), [`Dict_Array` / `Str_Dict_Array`](skadi/dict.odin)
+  computes 1M-row value counts in `0.79 ms` ST / `0.16 ms` actor MT (`37.95×` vs
+  C++), and [`Umbra_Array`](skadi/umbra.odin) eliminates pointer-chasing in string
+  sorting (`0.27 ms` actor MT, `36.40×` vs C++).
+- **Packed `u32` radix & MSB-bucket actor sort**: `sort_indices` packs keys and
+  indices into 8-byte entries for LSD radix sorting (`1.82×` ST) and fans MSB
+  buckets across Sleipnir actors (`4.98 ms`, `8.23×` vs C++); string/Umbra actor
+  sorts reach `28.90×`–`36.40×`.
+- **Vectored `writev` + `mmap` IPC**: Zero-copy vectored writes (`12.53 ms`,
+  `2.91×`) and lazy `mmap` reads (`0.02 ms`, `7.17×`) cut IPC heap buffer copies
+  to `0.0 MB` (vs `38.1 MB` in Arrow C++).
 
-Skadi also beats **PyArrow** on every benchmark — typically several× up to
-~20× on construction (Python overhead removal). The 3-way Skadi / PyArrow /
-Arrow C++ comparison (with Skadi's multi-threaded `*_parallel` kernels) and
-full methodology are in [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+Full statistical results (Welch's z-tests, CV%, bandwidth `GB/s`, allocation
+telemetry, and 3-way PyArrow comparisons) live in
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
-Reproduce: `bash benchmarks/bench_odin_c.sh` (single-threaded, vs Arrow C++) or
-`bash benchmarks/compare.sh` (3-way, also needs `pyarrow`). Both build the runners.
+Reproduce:
+- `make bench-1v1` — build and run the statistical 1v1 suite (Odin vs Arrow C++),
+  saving `benchmarks/odin.jsonl`, `benchmarks/cpp.jsonl`, and `benchmarks/history.jsonl`
+  (or `python3 benchmarks/compare_1v1.py --from-jsonl` to print from saved JSONL).
+- `bash benchmarks/bench_odin_c.sh` — single-threaded Odin vs Arrow C++ table.
+- `bash benchmarks/compare.sh` — 3-way Skadi / PyArrow / Arrow C++ comparison
+  (requires `pyarrow`).
 
 ## Building & testing
 
 Requires the [Odin compiler](https://odin-lang.org/docs/install/).
 
 ```sh
-make check                             # run strict static checks across all packages
-make test                              # build + run the test suite (-vet -strict-style -disallow-do)
+make test                              # unit tests + ATDD specs + benchmark comparator tests
+make check                             # strict static analysis across all packages (-vet -strict-style -disallow-do -warnings-as-errors)
+make test-cpp                          # Arrow C++ FFI layout compatibility tests (requires Arrow C++)
 odin run examples/quickstart -out:/tmp/quickstart   # run the runnable demo
-odin build skadi -build-mode:static -out:libskadi.a # build the package as a static library
+odin build skadi -build-mode:static -out:libskadi.a       # build the package
 ```
 
 To use it in your own project, import the `skadi` directory as the `skadi`
-package (either via a relative path or `-collection:skadi=...`). A complete,
-runnable tour of the API lives in
+package (either via a relative path or `-collection:skadi=...`). A complete, runnable tour of the API lives in
 [`examples/quickstart`](examples/quickstart/main.odin); running it prints:
 
 ```
-== OdinArrow quickstart ==
+== Skadi quickstart ==
 
 -- primitives + compute --
   length=10  null_count=1
@@ -161,29 +202,41 @@ runnable tour of the API lives in
 
 ## Capabilities
 
-| Area                                                 | Status       |
-| ---------------------------------------------------- | ------------ |
-| Aligned buffers, bitmaps (popcount), zero-copy slice | ✅           |
-| Primitive + variable-length arrays & builders        | ✅           |
-| LargeString / LargeBinary (i64 offsets)              | ✅           |
-| Schema, RecordBatch, Table / ChunkedArray            | ✅           |
-| Compute kernels (incl. SIMD + threaded)              | ✅           |
-| IPC file & stream formats (pyarrow-compatible)       | ✅           |
-| Memory-mapped zero-copy reads                        | ✅           |
-| Reusable buffer-pool allocator                       | ✅           |
-| Parquet, Flight RPC, GPU kernels                     | out of scope |
+| Area                                                                 | Status       |
+| -------------------------------------------------------------------- | ------------ |
+| Aligned buffers, bitmaps (popcount), zero-copy slice                 | ✅           |
+| Primitive + variable-length arrays & builders                        | ✅           |
+| LargeString / LargeBinary (`i64` offsets)                            | ✅           |
+| Schema, RecordBatch, Table / ChunkedArray                            | ✅           |
+| Compute kernels (SIMD, packed `u32` radix sort, threaded)            | ✅           |
+| Selection vectors & fused multi-aggregate operators                  | ✅           |
+| Compressed encodings (`Umbra_Array`, `RLE_Array`, `Dict_Array`)      | ✅           |
+| Hardware cache-adaptive config (`skadi/hardware_config.odin`)          | ✅           |
+| Sleipnir actor & sharded SPSC morsel pipeline (`skadi/pipeline/`)      | ✅           |
+| IPC file & stream formats (pyarrow-compatible)                       | ✅           |
+| Vectored `writev` zero-copy IPC writes + `mmap` zero-copy reads      | ✅           |
+| Reusable buffer-pool allocator                                       | ✅           |
+| Statistical 1v1 JSONL benchmark suite (`make bench-1v1`)             | ✅           |
+| Parquet, Flight RPC, GPU kernels                                     | out of scope |
+
 
 ## Project layout
 
 ```
-skadi/                 the skadi package (buffers, types, arrays, builders,
-                       compute, ipc, buffer_pool, ...)
-tests/                 the unit test suite (*_test.odin, run with `make test`)
-tests_cpp/             Arrow C++ FFI layout compatibility tests (`make test-cpp`)
-examples/quickstart/   a runnable tour of the API
-examples/csv_to_parquet/  native CSV -> Parquet CLI example
-examples/parquet_to_csv/  native Parquet -> CSV CLI example
-benchmarks/            odin / python / cpp / FFI runners + compare.sh + RESULTS.md
+skadi/                   the skadi package (buffers, types, arrays, builders,
+                         compute, selection, fusion, umbra, rle, dict, ipc,
+                         buffer_pool, hardware_config.odin, ...)
+skadi/pipeline/          Sleipnir actor & sharded SPSC morsel pipeline
+                         (sleipnir_pipeline.odin)
+deps/sleipnir/actor/     Sleipnir lock-free actor & SPSC/MPSC runtime
+tests/                   the unit & regression test suite (*_test.odin, run with `make test`)
+specs/                   4-layer ATDD executable specifications (`make test-specs` / `make test`)
+tests_cpp/               Arrow C++ FFI layout compatibility tests (`make test-cpp`)
+examples/quickstart/     a runnable tour of the API
+examples/csv_to_parquet/ native CSV -> Parquet CLI example
+examples/parquet_to_csv/ native Parquet -> CSV CLI example
+benchmarks/              odin / python / cpp / FFI runners + compare_1v1.py (`make bench-1v1`)
+                         + compare.sh + RESULTS.md
 ```
 
 ## License

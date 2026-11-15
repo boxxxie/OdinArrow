@@ -1,300 +1,340 @@
 # Skadi Benchmark Analysis
 
-Head-to-head comparison of **Skadi** against **PyArrow** (Python) and
-**Apache Arrow C++** (the same LLVM-compiled library PyArrow wraps, called
-directly through its C/C++ API — the "FFI" reference).
+Head-to-head comparison of **Skadi** against **Apache Arrow C++ `25.0.1`**
+(`-O3`, the same LLVM-compiled library PyArrow wraps, called directly through
+its C/C++ API) and **PyArrow** (Python).
 
 ## Environment
 
 | | |
 |---|---|
-| CPU | Intel Core i7-7700HQ @ 2.80 GHz (4 cores / 8 threads) |
-| Arrow / PyArrow | bundled libarrow 24.00 |
-| Odin | nightly, `-o:speed` |
-| Timing | `time.tick_now` / `perf_counter_ns` / `steady_clock`, **median of 5 trials** |
-| Workload | 10M elements (numeric), 1M elements (strings) |
+| CPU | AMD Ryzen 7 7735U with Radeon Graphics (8 cores / 16 threads, L1d 32 KB, L2 512 KB, L3 16 MB) |
+| Arrow C++ | Apache Arrow C++ `25.0.1` (`-O3`; plus PyArrow for 3-way comparisons) |
+| Odin | `odin build -o:speed -microarch:native` |
+| Timing & Stats | `time.tick_now` / `steady_clock`, `--runs 5 --warmup 1` (**median of 5 trials** + Welch's two-sample z-test via `make bench-1v1`) |
+| Workload | 10M elements (numeric), 1M elements (strings / take / `i32` sort / dict), 100K elements (string & Umbra sort) |
 
-Reproduce with `bash benchmarks/compare.sh`.
+Reproduce: `make bench-1v1` (or `python3 benchmarks/compare_1v1.py --from-jsonl`
+to inspect saved JSONL snapshots), `bash benchmarks/bench_odin_c.sh`, or
+`bash benchmarks/compare.sh` (3-way with PyArrow).
 
-## Methodology note (read this before the table)
+## Methodology note
 
-Skadi's `sum`, `min/max`, and `filter` run **multi-threaded across all 8
-hardware threads**; PyArrow and Arrow C++ here are **single-threaded**. So those
-four ratios reflect *Skadi's threading + per-core efficiency together*, not
-pure per-core speed. The other four rows — array build, string build, string
-scan, IPC roundtrip — are **single-threaded on all three**, so they are
-apples-to-apples.
+The canonical 1v1 suite ([`compare_1v1.py`](compare_1v1.py), persisted in
+`benchmarks/odin.jsonl`, `benchmarks/cpp.jsonl`, and `benchmarks/history.jsonl`)
+reports **apples-to-apples single-threaded timings (`Odin ST` vs `Arrow C++ ST`)**
+alongside **multi-threaded and Sleipnir actor scaling (`Odin MT`, `MT vs C++`,
+`MT Scale`)**, memory throughput (`GB/s`), and per-run allocation telemetry
+(`Allocs`, `Alloc MB`). Significance is computed with Welch's two-sample z-test
+(`*` indicates `z >= 1.96`, `~` indicates within measurement noise). Both sides
+use recycling memory pools (`Buffer_Pool` in Skadi, `arrow::default_memory_pool()`
+in Arrow C++).
 
-## Results
+## Headline summary (commit `fa6a1e4`)
 
-| Benchmark | Threading | Skadi (ms) | PyArrow (ms) | Arrow C++ (ms) | Py/Odin | C++/Odin |
-|---|---|---:|---:|---:|---:|---:|
-| Build 10M i32 (1% nulls) | all single | 44.20 | 957.49 | 41.69 | 21.66× | 0.94× |
-| Sum 10M f64 | Odin MT | 3.18 | 6.81 | 6.01 | 2.14× | 1.89× |
-| Sum 10M f64 (1% nulls) | Odin MT | 3.48 | 8.25 | 8.54 | 2.37× | 2.45× |
-| Sum 10M i32 | Odin MT | 2.05 | 2.45 | 2.47 | 1.20× | 1.20× |
-| Min+Max 10M i32 | Odin MT | 2.01 | 4.07 | 2.23 | 2.03× | 1.11× |
-| Filter 10M i32 (50% pass) | Odin MT | 13.16 | 36.13 | 39.52 | 2.75× | 3.00× |
-| Build 1M strings (2% nulls) | all single | 8.50 | 91.48 | 7.25 | 10.77× | 0.85× |
-| Scan 1M strings | all single | 1.04 | 9.49 | 9.16 | 9.11× | 8.80× |
-| IPC roundtrip 10M i32 (w+r) | all single | 5.24 | 10.97 | 10.27 | 2.09× | 1.96× |
+Below is a summary of the core workloads against Arrow C++ `25.0.1` ST; the
+complete 32-row statistical table (including `Δ Prev`, `z`-scores, `GB/s`,
+`Allocs`, `Alloc MB`, `MT Scale`, and `CV%`) is maintained in
+[Statistical 1v1 Comparison](#statistical-1v1-comparison-odin-st--mt-vs-arrow-c-st).
 
-Ratios > 1× mean Skadi is faster; < 1× mean it is slower.
-(Builders use a reusable buffer pool; IPC read is mmap'd and `finish()` is
-zero-copy — see the analysis below.)
+| Benchmark | Odin ST (ms) | Odin MT (ms) | Arrow C++ ST (ms) | ST Speedup | MT vs C++ |
+|---|---:|---:|---:|---:|---:|
+| `array_build_10m_i32` (1% nulls) | 13.78 | - | 33.24 | **2.41×** | - |
+| `string_build_1m` (2% nulls) | 3.49 | - | 4.66 | **1.34×** | - |
+| `sum_10m_f64` | 4.00 | 2.24 | 6.50 | **1.63×** | **2.91×** |
+| `sum_10m_f64_nulls` (1% nulls) | 5.22 | 2.55 | 8.20 | **1.57×** | **3.22×** |
+| `sum_10m_i32` | 2.45 | 1.45 | 3.29 | **1.34×** | **2.26×** |
+| `min_max_10m_i32` | 2.19 | 1.04 | 2.37 | **1.09×** | **2.29×** |
+| `filter_10m_i32` (50% pass) | 5.25 | 2.47 | 40.02 | **7.63×** | **16.17×** |
+| `take_1m_i32` | 7.36 | 2.01 | 9.02 | **1.22×** | **4.49×** |
+| `sort_indices_1m_i32` | 22.49 | 4.98 (actor) | 40.99 | **1.82×** | **8.23×** |
+| `sort_indices_100k_str` | 2.58 | 0.33 (actor) | 9.68 | **3.76×** | **28.90×** |
+| `string_scan_1m` | 1.08 | - | 1.14 | **1.05×** | - |
+| `sum_where_10m_f64` | 6.17 | - | 39.02 | **6.32×** | - |
+| `agg_where_10m_f64` | 10.32 | 4.46 (actor) | 39.39 | **3.82×** | **8.82×** |
+| `sel_2pred_sum_10m_f64` | 13.93 | 4.38 (5.76 actor) | 21.92 | **1.57×** | **5.00×** (3.80× actor) |
+| `dict_vc_1m_str` | 0.79 | 0.16 (actor) | 6.09 | **7.73×** | **37.95×** |
+| `rle_sum_10m_f64` | 0.01 | - | 6.43 | **532.62×** | - |
+| `umbra_sort_100k_str` | 2.58 | 0.27 (actor) | 9.80 | **3.80×** | **36.40×** |
+| `ipc_roundtrip_10m_i32` (w+r) | 13.07 | - | 46.97 | **3.59×** | - |
+
+Ratios `> 1×` mean Skadi is faster than Arrow C++.
 
 ## Per-benchmark analysis
 
-### Array build — 10M i32 (Odin 0.94× C++, 22× Python)
-Now at **parity with Arrow C++** (within ~6%). Three optimizations got here:
-**zero-copy `finish()`** (the builder hands its value/validity buffers straight
-to the Array — no 40 MB alloc+copy), **uninitialised data allocation** (the value
-buffer is fully overwritten, so the redundant zeroing pass is skipped), and a
-**reusable buffer pool** (`Buffer_Pool`) that recycles freed blocks instead of
-returning them to the OS — so repeated builds reuse warm, already-faulted pages
-exactly like Arrow's default memory pool does. The ~13× edge over PyArrow is
-still mostly Python-list materialisation overhead.
+### Array & string builders (`array_build_10m_i32`, `string_build_1m`)
+Skadi builds 10M `i32` values with 1% nulls in **13.78 ms** vs **33.24 ms**
+in Arrow C++ (**2.41×**, `z = 27.2*`, `2(2p)/2` allocs / `39.3 MB`), and builds
+1M strings with 2% nulls in **3.49 ms** vs **4.66 ms** (**1.34×**, `z = 3.9*`,
+`3(3p)/3` allocs / `14.4 MB`). Three optimizations drive this: **zero-copy
+`finish()`** (handing value, offset, and validity buffers directly to the
+`Array`), **uninitialized data allocation** (skipping redundant zeroing), and
+the **`Buffer_Pool`** recycling warm, pre-faulted blocks (`2p` / `3p` pool hits)
+alongside raw-buffer indexed writes in `String_Builder` (`string_builder_reserve_data`).
 
-### Sum f64 / i32 (Odin 1.9–2.2× C++, threaded)
-Multi-accumulator SIMD kernels fanned across 8 threads. On a 4-core machine the
-realistic threading ceiling is ~4× before memory bandwidth saturates; sum is
-memory-bound, so the observed ~2× over single-threaded C++ is bandwidth-limited
-rather than compute-limited. Per-core, Skadi's SIMD sum is roughly on par
-with Arrow C++.
+### Reductions — `sum_10m_f64`, `sum_10m_f64_nulls`, `sum_10m_i32`, `min_max_10m_i32`
+Single-threaded multi-accumulator SIMD kernels beat Arrow C++ across all four
+reductions and scale cleanly on 8C/16T:
+- `sum_10m_f64`: **4.00 ms ST** (`20.0 GB/s`) / **2.24 ms MT** (`35.8 GB/s`) vs
+  **6.50 ms** C++ (**1.63× ST** / **2.91× MT**, `z = 16.7*`, `0` allocs).
+- `sum_10m_f64_nulls` (1% nulls): **5.22 ms ST** (`15.6 GB/s`) / **2.55 ms MT**
+  vs **8.20 ms** C++ (**1.57× ST** / **3.22× MT**, `z = 25.1*`, `0` allocs).
+  Skadi walks the validity bitmap a byte at a time: an all-valid byte
+  (`0xFF`) coalesces 8 elements into a SIMD run, all-null bytes are skipped, and
+  only mixed bytes bit-test individual elements.
+- `sum_10m_i32`: **2.45 ms ST** / **1.45 ms MT** vs **3.29 ms** C++
+  (**1.34× ST** / **2.26× MT**, `z = 3.6*`).
+- `min_max_10m_i32`: **2.19 ms ST** (`18.3 GB/s`) / **1.04 ms MT** (`38.5 GB/s`)
+  vs **2.37 ms** C++ (**1.09× ST** / **2.29× MT**, `z = 1.6~` ST — both are
+  at the DRAM bandwidth floor per core, with Odin scaling `2.11×` multi-threaded).
 
-### Sum f64 with 1% nulls (Odin 2.4× C++, threaded) — the null-aware path
-The headline number is threaded, but the more telling figure is the **null
-overhead**: Skadi's sum goes from 3.18 → 3.48 ms when 1% of values are null
-(**+9%**), whereas Arrow C++ goes 6.01 → 8.54 ms (**+42%**) and PyArrow 6.81 →
-8.25 ms (+21%). Skadi handles nulls almost for free because the kernel walks
-the validity bitmap a **byte at a time**: an all-valid byte (`0xFF`) means "8
-valid in a row," coalesced into a run and summed with the SIMD kernel; all-null
-bytes are skipped; only mixed bytes are bit-tested. The previous code did a
-per-element `is_valid` branch.
+### Filter, compare, cast, add & take
+- `filter_10m_i32` (50% pass): **5.25 ms ST** / **2.47 ms MT** vs **40.02 ms**
+  C++ (**7.63× ST** / **16.17× MT**, `z = 11.7*`). Exact output sizing via
+  popcount plus a byte-at-a-time mask loop avoids dynamic resizing.
+- `filter_10m_i32_sparse` (1% pass): **0.45 ms ST** (`90.7 GB/s`) vs **1.49 ms**
+  C++ (**3.28×**, `z = 18.2*`).
+- `filter_1m_string` (50% pass): **3.74 ms ST** / **0.65 ms MT** vs **4.82 ms**
+  C++ (**1.29× ST** / **7.44× MT**, `5.78×` MT scale).
+- `compare_gt_10m_i32` (**2.08 ms** vs **5.89 ms**, **2.84×**, `z = 101.2*`),
+  `compare_gt_10m_f64` (**4.32 ms** vs **7.57 ms**, **1.75×**, `z = 69.7*`),
+  `cast_10m_i32_f64` (**3.79 ms** vs **7.93 ms**, **2.09×**, `z = 27.2*`), and
+  `arith_add_10m_f64` (**6.84 ms** vs **11.97 ms**, **1.75×**, `23.4 GB/s`,
+  `z = 16.3*`) benefit from monomorphised SIMD loops and recycled `Buffer_Pool`
+  allocations (`1(1p)` pool hit).
+- `take_1m_i32`: **7.36 ms ST** / **2.01 ms MT** vs **9.02 ms** C++ (**1.22× ST**
+  / **4.49× MT**, `3.67×` MT scale) using a validity-free fast path and explicit
+  software prefetching (`intrinsics.prefetch_read_data`).
 
-At 10M (DRAM-bound) the branch was partly hidden behind memory latency, so the
-end-to-end win there is ~13%. The real payoff is in the **compute-bound /
-cache-resident** regime, where the branch isn't masked: summing a 1.6 MB null
-array in a tight loop went from **245 µs → 75 µs per call (3.3×)**, same result.
-This is the B1 lesson in reverse — once a kernel is not bandwidth-limited,
-removing per-element branching matters a lot.
+### Radix & string sorting (`sort_indices_1m_i32`, `sort_indices_100k_str`)
+`sort_indices_1m_i32` uses a packed 8-byte `(key_u32, idx_u32)` LSD radix sort
+in **22.49 ms ST** vs **40.99 ms** Arrow C++ (**1.82×**, `z = 15.3*`), skipping
+constant radix bytes automatically. On 8C/16T, `pipeline_sort_indices` runs a
+race-free, zero-merge-pass Sleipnir actor MSB-bucket parallel radix sort in
+**4.98 ms** (**8.23×** vs C++, **4.52×** MT scale). For `sort_indices_100k_str`,
+Skadi packs an 8-byte string prefix for LSB radix passes + stable merge-sort
+tie-breaking (`string_sort_range_into`) in **2.58 ms ST** vs **9.68 ms** C++
+(**3.76×**, `z = 90.0*`), and **0.33 ms** on Sleipnir actors (**28.90×** vs C++,
+**7.69×** MT scale).
 
-### Min+Max — 10M i32 (Odin 1.4× C++, threaded)
-Single-pass combined min+max, SIMD + threaded. The smaller margin over C++ vs
-`sum` reflects that Arrow's `MinMax` is already well tuned and the kernel is
-even more bandwidth-bound.
+### String scan — `string_scan_1m`
+Skadi walks the `offsets` buffer in a tight loop summing lengths (`string_view_sum_lengths`)
+in **1.08 ms ST** (`12.9 GB/s`) vs **1.14 ms** Arrow C++ ST (`12.2 GB/s`,
+**1.05×**, `z = 4.8*`, `0` allocs). (In 3-way comparisons with PyArrow, Python's
+`utf8_length` + `sum` kernel dispatch takes ~9.5 ms — ~9× slower.)
 
-### Filter — 10M i32, 50% pass (Odin 3.7× C++, threaded)
-The largest threaded win. Skadi's filter exact-sizes the output via bitmap
-popcount, then runs a byte-at-a-time mask loop, parallelised. Filtering writes a
-full output array, so it scales better with threads than the reductions do.
-Even discounting threading (~4× headroom), the per-core path is competitive.
-
-### String build — 1M strings (Odin 0.85× C++, 11× Python)
-The `String_Builder` was rewritten from `[dynamic]` to **raw buffers** (direct
-`memcpy` of the bytes + indexed offset write, no dynamic-array runtime per
-append), with **zero-copy `finish()`**, **uninitialised data/offset buffers**,
-and the same **buffer pool**. Time fell from ~30 ms (0.31× C++) to ~8.5 ms
-(**0.85× C++**) — now within ~1.2× of Arrow C++'s `StringBuilder`, from ~3×.
-
-### String scan — 1M strings (Odin ~11.7× both)
-Skadi walks the offsets buffer in a tight loop summing lengths. PyArrow and
-Arrow C++ both pay **compute-kernel dispatch overhead** (`utf8_length` →
-`sum`) for what is a trivial pointer walk, which is why both land near 9 ms.
-This is partly an artifact of comparing a hand loop against a generic kernel
-pipeline — but it does show Skadi's zero-dispatch model paying off.
-
-### IPC roundtrip — write+read 10M i32 (Odin 2.1× both)
-Now a **win over both**. The reader is **memory-mapped** (`mmap`, `PROT_READ`,
-`MAP_PRIVATE`): columns are zero-copy views into the mapping, so the 40 MB never
-streams through a read syscall — pages fault in lazily. The "read" half drops to
-~0.04 ms (was ~14 ms with an eager read, ~39 ms before zero-copy), leaving the
-~5 ms write as the whole cost. PyArrow and Arrow C++ also mmap on read, so their
-~11.7 ms is dominated by *their* write path, which does more bookkeeping than
-Skadi's. The mapping is released with `munmap` when the owning batch is freed
-(`Record_Batch._backing_free`); on platforms without the unix mmap path the
-reader transparently falls back to a full read.
+### Arrow IPC — vectored `writev` & `mmap` zero-copy reads
+- `ipc_write_10m_i32`: **12.53 ms ST** (`0` heap allocs) vs **36.42 ms** Arrow
+  C++ (**2.91×**, `z = 29.2*`). The IPC writer emits metadata and column buffers
+  via scatter-gather `writev` (`_ipc_writev_all`) with zero intermediate payload
+  copies.
+- `ipc_read_mmap_10m_i32`: **0.02 ms ST** vs **0.16 ms** Arrow C++ (**7.17×**,
+  `z = 32.0*`). The reader maps the file with `mmap` (`PROT_READ`,
+  `MAP_PRIVATE`) and exposes columns as zero-copy views released via
+  `Record_Batch._ipc_backing.release` (`munmap`) in `record_batch_free`, with a
+  transparent read fallback on non-POSIX targets.
+- `ipc_roundtrip_10m_i32` (write + read): **13.07 ms ST** vs **46.97 ms** Arrow
+  C++ (**3.59×**, `z = 2.5*`, `0.0 MB` vs `38.1 MB` heap copies).
 
 ## Takeaways
 
-- **vs PyArrow:** Skadi is faster on **every** benchmark, by 1.3×–10×. Much
-  of the large wins (build, string build) is Python interpreter overhead rather
-  than Arrow itself, but the systems-language model removes that overhead by
-  construction.
-- **vs Arrow C++ (the real bar):**
-  - **Wins** on the threaded reductions/filter (1.4×–3.6×) — largely from using
-    all cores; per-core it is competitive, not dominant.
-  - **Wins big** on string scan (~7×), mostly because the C++ side goes through
-    a generic compute kernel for a trivial operation.
-  - **Wins** the IPC roundtrip (~2×) now that the reader is mmap-backed and the
-    write path is lighter.
-  - **At parity** on single-threaded *construction*: array build ~0.94× and
-    string build ~0.85× after zero-copy `finish()`, uninitialised data buffers,
-    and a reusable buffer pool. Skadi no longer materially trails Arrow C++
-    on any benchmark here.
-- The honest summary matches the plan's stated goal: a zero-overhead systems
-  language **matches or beats a Python-wrapped C++ library**, with much simpler,
-  more auditable code — while Arrow C++ still leads on its most tuned hot paths
-  (builders, mmap'd IO).
+- **Single-threaded parity surpassed across all 26 1v1 workloads:** Skadi
+  beats Arrow C++ `25.0.1` on every single-threaded benchmark in the suite
+  (`1.05×`–`532.62×`, `z >= 1.96` on 25/26 rows; `min_max_10m_i32` sits at the
+  memory-bandwidth floor at `1.09×` ST and `2.29×` MT).
+- **Multi-threaded & Sleipnir actor scaling:** Thread-pool `*_parallel` kernels
+  and cache-resident Sleipnir actor pipelines (`skadi/pipeline/sleipnir_pipeline.odin`)
+  deliver `2.26×`–`37.95×` end-to-end speedups over single-threaded Arrow C++
+  with `0` steady-state heap allocations on fused and reduction hot paths.
+- **vs PyArrow:** Skadi leads by `1.3×`–`20×+` across standard kernels due
+  to eliminating Python interpreter and generic dispatch overhead.
 
-## Optimizations applied (since the first run)
+## Optimizations applied
 
-- _The IPC reader is memory-mapped — former ~2× IPC-read deficit is a ~2× roundtrip win._
-- _`finish()` is zero-copy, builder data buffers are left uninitialised, and a
-  reusable `Buffer_Pool` recycles freed blocks — the array/string build gap to
-  Arrow C++ shrank from ~2.5–3× to ~parity (0.94× / 0.85×)._
-- _The IPC layer is i64-offset-aware, so LargeString/LargeBinary (and Binary)
-  columns round-trip end-to-end, pyarrow-interop verified in both directions._
-- _Null-aware bulk aggregation (sum/min/max) coalesces all-valid validity bytes
-  into SIMD runs instead of branching per element — null overhead drops to ~+9%
-  (vs Arrow C++'s +42%), and cache-resident null-sum is 3.3× faster than before._
+- **Vectored IPC (`writev`) + `mmap` zero-copy reads:** Zero-copy scatter-gather
+  writes (`12.53 ms`, `2.91×`) and `mmap` views (`0.02 ms`, `7.17×`) cut IPC
+  roundtrip payload heap allocations to `0.0 MB` (`3.59×` vs C++).
+- **Zero-copy builders + `Buffer_Pool`:** `finish()` transfers ownership without
+  copying, data allocations are uninitialized (`alloc_bytes_non_zeroed`), and
+  `Buffer_Pool` recycles freed blocks (`2.41×` on `array_build_10m_i32`).
+- **Null-aware byte-coalesced aggregation:** All-valid `0xFF` bytes dispatch to
+  SIMD runs, reducing `sum_10m_f64_nulls` overhead while holding `1.57×` ST /
+  `3.22×` MT over C++.
+- **Packed `u32` LSD radix sort & Sleipnir MSB-bucket actors:** Cuts integer
+  sorting to `22.49 ms` ST (`1.82×`) and `4.98 ms` actor MT (`8.23×`), and
+  string/Umbra sorting to `0.33 ms` / `0.27 ms` (`28.90×` / `36.40×`).
+- **L1d `u16` morsels, `Hardware_Config`, & Sleipnir super-morsel fusion:**
+  Sysfs cache discovery (`skadi/hardware_config.odin`) and `Sharded_SPSC_Mailbox`
+  worker reduction achieve `0`-alloc `4.46 ms` fused 4-aggregates (`8.82×` vs
+  C++) and `0.16 ms` dictionary `value_counts` (`37.95×` vs C++).
 
 ## Encoding-aware kernels — run-end encoding (beyond Arrow's plain layout)
 
-The aggregation experiments (B1/B2/B5) all converged on one lesson: the headline
-kernels are **memory-bound**, so the durable win is moving fewer bytes. Run-end
-encoding does exactly that — it stores a column of `length` elements as `k` runs
+The aggregation experiments all converged on one lesson: the headline kernels
+are **memory-bound**, so the durable win is moving fewer bytes. Run-end encoding
+does exactly that — it stores a column of `length` elements as `k` runs
 (`run_ends` + per-run `values`) and aggregates over the runs, never touching the
 elements the encoding collapsed.
 
-10M-element f64 column with 1000-long runs (10K runs), single-threaded:
+10M-element `f64` column with 1000-long runs (10K runs), single-threaded
+(`rle_sum_10m_f64` vs plain `sum_10m_f64`):
 
 | | time | size |
 |---|---:|---:|
-| Plain `compute_sum` (Skadi) | 4541 µs | 78 MB |
-| Plain `pc.sum` (PyArrow)        | 6045 µs | 78 MB |
-| **`rle_sum` (Skadi)**       | **11.8 µs** | **117 KB** |
+| Plain `sum_10m_f64` (Arrow C++ `25.0.1`) | 6.43 ms | 76.3 MB |
+| Plain `sum_10m_f64` (Skadi)          | 4.00 ms | 76.3 MB |
+| **`rle_sum` (Skadi)**                | **0.01 ms (~12 µs)** | **~117 KB** |
 
-That is **~385× faster** than Skadi's own plain sum and **~510× faster** than
-PyArrow's, on **667× less memory** — and **PyArrow cannot do it at all**: its
-`pc.sum` has no kernel for `run_end_encoded` input, so summing an REE column there
-means decoding back to 78 MB first. This is a compatibility-breaking layout (kept
-as a separate `RLE_Array(T)` type, not in the Arrow `Array` union), and it is the
-first piece of the "move fewer bytes" roadmap (Endeavor C4).
+That is **532.62× faster** (`z = 354.0*`) than Arrow C++ `25.0.1`'s plain sum
+and **~330× faster** than Skadi's own plain SIMD sum, on **~667× less memory**
+(`0` heap allocs). In earlier 3-way PyArrow runs, PyArrow `pc.sum` took ~6.0 ms
+because it must decode back to a dense float array first. This is a
+compatibility-breaking layout (kept as a separate `RLE_Array(T)` type, not in
+the Arrow `Array` union).
 
-## Umbra short strings — comparison without the pointer chase (Endeavor C1)
+## Umbra short strings — comparison without the pointer chase
 
 Arrow's `[offsets:i32][bytes:u8]` Utf8 layout takes a cache miss into the data
 buffer on **every** string comparison. Umbra ("German") strings store each
 element in a fixed 16-byte slot — `{ length:u32, data:[12]u8 }` — with the bytes
 inline for length ≤ 12 and a 4-byte **prefix** + side-buffer offset otherwise.
 The prefix lives in the slot, so most comparisons resolve in registers without
-touching the data buffer at all.
+touching the data buffer at all, and `umbra_sort_indices` runs a 4-pass LSD
+radix sort over the 4-byte prefix before merge-sorting equal-prefix runs.
 
-Sorting 1M random ~20-char strings (`sort_indices`):
+Canonical 1v1 suite — sorting 100K random strings (`umbra_sort_100k_str`):
 
-| | time |
-|---|---:|
-| Skadi Arrow-layout sort | 518 ms |
-| PyArrow `pc.sort_indices`   | 415 ms |
-| **Skadi Umbra sort**    | **272 ms** |
+| | time | vs Arrow C++ ST |
+|---|---:|---:|
+| Arrow C++ `25.0.1` ST (`sort_indices`)        | 9.80 ms | 1.00× |
+| Skadi `umbra_sort_indices` (ST)           | 2.58 ms | **3.80×** (`z = 50.5*`) |
+| **Skadi `pipeline_umbra_sort_indices` (Sleipnir Actor)** | **0.27 ms** | **36.40×** (`9.57×` MT scale) |
 
-**1.9× faster** than Skadi's own Arrow-layout sort and **1.5× faster** than
-PyArrow, with identical ordering. The cost is ~30% more memory (fixed 16-byte
-slots vs `offsets + bytes`) — the classic Umbra trade. Kept as a separate
-`Umbra_Array` type, transcoded at an Arrow/IPC boundary.
+(On larger 1M ~20-char strings in earlier 3-way PyArrow runs, Umbra sort cut
+Arrow-layout sort from 518 ms and PyArrow's 415 ms down to **272 ms**.) The
+cost is ~30% more memory (fixed 16-byte slots vs `offsets + bytes`) — the
+classic Umbra trade. Kept as a separate `Umbra_Array` type, transcoded at an
+Arrow/IPC boundary.
 
-## Dictionary encoding — group-by as an integer histogram (Endeavor C4)
+## Dictionary encoding — group-by as an integer histogram
 
-For a low-cardinality column, store the distinct values once and an i32 `code`
+For a low-cardinality column, store the distinct values once and an `i32` `code`
 per element. The codes **are** the group ids, so `value_counts`/group-by is an
 integer histogram over the codes — no string hashing or comparison.
 
-`value_counts` on 10M strings with 100 distinct values:
+Canonical 1v1 suite — `value_counts` on 1M strings with 100 distinct values
+(`dict_vc_1m_str`):
 
-| | time |
-|---|---:|
-| PyArrow `value_counts` (plain string) | 190.6 ms |
-| PyArrow `value_counts` (dictionary)   | 62.6 ms |
-| **Skadi `str_dict_value_counts`** | **6.6 ms** |
+| | time | vs Arrow C++ ST |
+|---|---:|---:|
+| Arrow C++ `25.0.1` ST (`value_counts`)        | 6.09 ms | 1.00× |
+| Skadi `str_dict_value_counts` (ST)        | 0.79 ms | **7.73×** (`z = 129.4*`) |
+| **Skadi `pipeline_dict_value_counts` (Sleipnir Actor)** | **0.16 ms** | **37.95×** (`4.91×` MT scale, `24.9 GB/s`) |
 
-**29× faster** than PyArrow's plain-string group-by and **9.5× faster** than even
-PyArrow's own dictionary `value_counts`. Encoding the column is a one-time 196 ms
-(amortised — columns commonly arrive dictionary-encoded from storage, e.g.
-Parquet). `str_dict_group_sum` extends the same idea to grouped aggregation (sum
-a second column bucketed by code).
+The Sleipnir actor path uses worker-private scratch buffers (including 4-bank
+`[257]u32` stack histograms for `dict_len <= 256`) and reduces per-worker
+buckets with `1` output allocation. (In earlier 10M-string PyArrow runs,
+`str_dict_value_counts` ran in **6.6 ms** vs PyArrow's **190.6 ms** plain /
+**62.6 ms** dictionary.) `str_dict_group_sum` and `pipeline_dict_group_sum`
+extend the same histogram pattern to grouped aggregation.
 
 A generic numeric `Dict_Array(T)` adds the same to numeric columns. Its standout
 is **min/max**: every logical element is one of the dictionary values, so the
-column min/max is just min/max of the (tiny) dictionary — O(n_dict), independent
-of length. 10M f64, 100 distinct:
+column min/max is just min/max of the (tiny) dictionary — `O(n_dict)`,
+independent of length. On 10M `f64` (100 distinct), `dict_min_max` resolves in
+**~0.1 µs** vs ~12.8 ms for a full plain scan.
 
-| | time |
-|---|---:|
-| Skadi plain `compute_min_max` | 12,795 µs |
-| **Skadi `dict_min_max`** | **0.1 µs (~126,000×)** |
+Honest counter-example, same file: **`dict_sum` is _not_ a win (~0.80×)** — it
+reads the narrower `i32` codes but the indexed lookup + accumulation is
+compute/latency-bound and loses to the plain SIMD sum. It's kept for summing an
+already-encoded column without decoding (`pipeline_dict_sum` also handles it
+zero-alloc), not as a speedup over plain arrays.
 
-Honest counter-example, same file: **`dict_sum` is _not_ a win (0.80×)** — it
-reads the narrower i32 codes but the histogram's data-dependent load-add-store is
-compute-bound and loses to the SIMD sum. It's kept for summing an
-already-encoded column without decoding, not as a speedup — another reminder that
-the bottleneck is rarely the byte count alone.
-
-## Fusion + selection vectors — don't materialise (Endeavor C3 + C2)
+## Fusion, selection vectors & Sleipnir super-morsel pipeline
 
 The most direct application of "move fewer bytes": don't build the intermediate
 filtered array at all.
 
-**C3 — operator fusion.** `compute_sum_where(values, mask)` does filter+sum in a
-single pass with no allocation, replacing `filter(values, mask)` then `sum(...)`.
-10M f64, 50% mask:
+**Operator fusion (`sum_where_10m_f64`).** `compute_sum_where(values, mask)`
+computes filter+sum in a single pass with `0` heap allocations (`0/1` allocs vs
+`38.1 MB` in Arrow C++): **6.17 ms ST** (`13.2 GB/s`) vs **39.02 ms** Arrow C++
+`25.0.1` ST (**6.32×**, `z = 85.2*`).
 
-| | time |
-|---|---:|
-| Skadi `filter` then `sum` | 34.2 ms |
-| PyArrow `sum(filter(...))`    | 41.6 ms |
-| **Skadi `sum_where`**     | **7.6 ms** |
+**Fused 4-aggregate pass (`agg_where_10m_f64`).** Beyond hand-written
+`sum_where`, `compute_agg_where_compare` computes **sum, count, min, and max in
+one pass under a predicate**, monomorphised at compile time on the value type
+and `$OP` — with no mask array and no filtered array. In parallel,
+`pipeline_agg_where_f64` partitions across Sleipnir super-morsels using
+4-way unrolled `morsel_agg_f64_u16` and reduces partials via `Sharded_SPSC_Mailbox`
+with `0` steady-state heap allocations:
 
-**4.5×** over Skadi's own filter+sum and **5.5×** over PyArrow — the
-intermediate array's allocation, dense copy, and re-read are all gone.
+| | time | vs Arrow C++ ST | Allocs (Odin/C++) |
+|---|---:|---:|---:|
+| Arrow C++ `25.0.1` ST (mask + filter + aggs) | 39.39 ms | 1.00× | - / 2 (`39.3 MB`) |
+| Skadi `compute_agg_where_compare` (ST)     | 10.32 ms | **3.82×** (`z = 74.3*`) | `0` / 2 |
+| **Skadi `pipeline_agg_where_f64` (Sleipnir Actor)** | **4.46 ms** | **8.82×** (`2.31×` MT scale, `35.8 GB/s`) | **`0` / 2** |
 
-**General fusion via compile-time specialisation.** Beyond hand-written
-`sum_where`, a single generic driver computes **sum, count, min and max in one
-pass under a predicate**, with no mask array and no filtered array. A query
-engine generates such a loop at runtime (codegen); Odin's monomorphisation does
-it at compile time — the driver is parameterised on the value type and a comptime
-`$OP`, so the compiler emits a tight fused kernel for each combination.
-`SELECT sum,count,min,max WHERE pred > 50` on 10M f64:
+**Selection vectors & chained predicates (`sel_2pred_sum_10m_f64`).**
+`compute_select_compare` + `selection_refine_compare` evaluate conjunctive (`AND`)
+predicates over a batch without materialising intermediate columns, keeping only
+surviving row indices in a `Selection`. For cache-resident execution,
+`morsel_select_compare_f64_u16` and `pipeline_sel_2pred_sum_f64` process
+L1d-sized `u16` index morsels discovered via `Hardware_Config`
+(`skadi/hardware_config.odin`):
 
-| | time |
-|---|---:|
-| Unfused (compare→mask, then 3 aggregate passes) | 27.6 ms |
-| PyArrow (mask + filter + sum + min_max + count)  | 70.2 ms |
-| **Fused (one pass)**                             | **16.8 ms** |
+| | time | vs Arrow C++ ST | Allocs / Alloc MB |
+|---|---:|---:|---:|
+| Arrow C++ `25.0.1` ST (`and` + filter + sum) | 21.92 ms | 1.00× | 4 / `25.4 MB` |
+| Skadi 2-pred morsel selection + sum (ST) | 13.93 ms | **1.57×** (`z = 12.3*`) | **`0` / `0.0 MB`** |
+| Skadi 2-pred Sleipnir Actor (`pipeline_sel_2pred_sum_f64`) | **5.76 ms** | **3.80×** (`2.42×` MT scale, `41.6 GB/s`) | **`0` / `0.0 MB`** |
+| **Skadi 2-pred thread-pool parallel (MT)** | **4.38 ms** | **5.00×** (`3.18×` MT scale, `54.7 GB/s`) | **`0` / `0.0 MB`** |
 
-**1.64×** over Skadi's own unfused pipeline and **4.2×** over PyArrow — one
-pass over the two columns, all four aggregates, zero intermediate arrays.
+Each added predicate narrows the surviving `u16` morsel indices instead of
+re-copying unused columns — in earlier 4-conjunct runs (`WHERE c0..c3 > 50 →
+SUM(pay)` on 10M rows), chained selection ran **3.66× faster** than
+materialise-between (`54.8 ms` vs `200.8 ms`), and the `-o:speed -microarch:native`
+build accelerates the monomorphised compare cleanly across all 16 threads.
 
-**C2 — selection vectors.** A predicate over a batch yields a `Selection` (just
-the surviving row indices); each column is then aggregated or materialised
-lazily, so unused columns are never copied. Filtering a 4-column batch (10% pass)
-and summing 2 of the columns:
 
-| | time |
-|---|---:|
-| Materialise the filtered batch, then sum 2 cols | 43.7 ms |
-| **Keep a selection, sum 2 cols through it**     | **13.2 ms** |
+## Statistical 1v1 Comparison (Odin ST / MT vs Arrow C++ ST)
 
-**3.3×** — the selection skips copying the two unused columns and the whole
-record-batch allocation. (For a *single* filter→aggregate the two are a wash;
-the win is multi-column / multi-step, which is the realistic query shape.)
+Measured on commit `fa6a1e4` (`--runs 5 --warmup 1`, Odin `-o:speed -microarch:native`, Apache Arrow C++ `25.0.1` `-O3`) via `make bench-1v1` (`benchmarks/compare_1v1.py`, outputting `benchmarks/odin.jsonl`, `benchmarks/cpp.jsonl`, and `benchmarks/history.jsonl`). Significance is computed with two-sample Welch's z-test (`*` indicates `z >= 1.96`, `~` indicates within measurement noise); `MT Scale` reports `odin_st / odin_mt`.
 
-**Chained predicates.** `compute_select_compare` + `selection_refine_compare`
-short-circuit a conjunctive (AND) query: each successive predicate is evaluated
-only on the rows that survived the previous one, and the final aggregate gathers
-only the survivors — no array is materialised between predicates. `WHERE
-c0..c3 > 50 → SUM(pay)` on 10M rows:
+<!-- BENCHMARK_1V1_START -->
 
-| #predicates | materialise between | chained selection |
-|---|---:|---:|
-| 2 | 33.3 ms | **21.0 ms** |
-| 4 | 200.8 ms | **54.8 ms (3.66×)** |
+| Benchmark | Group | Odin ST (ms) | Δ Prev | Arrow C++ ST (ms) | ST Speedup (z) | Odin GB/s | C++ GB/s | Allocs (Odin/C++) | Alloc MB (Odin/C++) | Odin MT (ms) | MT vs C++ | MT Scale | Odin ST CV% | C++ CV% |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `array_build_10m_i32` | builders | 13.78 | +0.5%~ | 33.24 | 2.41x (27.2*) | 3.0 | 1.2 | 2(2p)/2 | 39.3/39.3 | - | - | - | 3.3% | 4.7% |
+| `sum_10m_f64` | compute | 4.00 | -5.4%~ | 6.50 | 1.63x (16.7*) | 20.0 | 12.3 | 0/0 | 0.0/0.0 | 2.24 | 2.91x | 1.79x | 7.3% | 2.2% |
+| `sum_10m_f64_nulls` | compute | 5.22 | -11.3%* | 8.20 | 1.57x (25.1*) | 15.6 | 9.9 | 0/0 | 0.0/0.0 | 2.55 | 3.22x | 2.05x | 4.2% | 1.9% |
+| `sum_10m_i32` | compute | 2.45 | +10.8%* | 3.29 | 1.34x (3.6*) | 16.4 | 12.2 | 0/0 | 0.0/0.0 | 1.45 | 2.26x | 1.69x | 10.7% | 10.6% |
+| `min_max_10m_i32` | compute | 2.19 | +0.9%~ | 2.37 | 1.09x (1.6~) | 18.3 | 16.8 | 0/0 | 0.0/0.0 | 1.04 | 2.29x | 2.11x | 3.8% | 11.2% |
+| `filter_10m_i32` | compute | 5.25 | -17.1%~ | 40.02 | 7.63x (11.7*) | 7.9 | 1.0 | 1(1p)/1 | 19.1/19.1 | 2.47 | 16.17x | 2.12x | 10.1% | 16.5% |
+| `string_build_1m` | strings | 3.49 | +3.0%~ | 4.66 | 1.34x (3.9*) | 4.1 | 3.0 | 3(3p)/3 | 14.4/14.4 | - | - | - | 16.9% | 0.5% |
+| `string_scan_1m` | strings | 1.08 | -1.5%~ | 1.14 | 1.05x (4.8*) | 12.9 | 12.2 | 0/0 | 0.0/0.0 | - | - | - | 0.8% | 2.6% |
+| `ipc_roundtrip_10m_i32` | ipc | 13.07 | -56.2%* | 46.97 | 3.59x (2.5*) | 3.1 | 0.9 | 6/5 | 0.0/38.1 | - | - | - | 3.1% | 71.3% |
+| `compare_gt_10m_i32` | compute | 2.08 | -5.0%* | 5.89 | 2.84x (101.2*) | 19.3 | 6.8 | 1(1p)/1 | 1.2/1.2 | - | - | - | 2.3% | 1.2% |
+| `arith_add_10m_f64` | compute | 6.84 | +7.3%~ | 11.97 | 1.75x (16.3*) | 23.4 | 13.4 | 1(1p)/1 | 76.3/76.3 | - | - | - | 6.2% | 4.4% |
+| `cast_10m_i32_f64` | compute | 3.79 | +1.5%~ | 7.93 | 2.09x (27.2*) | 10.6 | 5.0 | 1(1p)/1 | 76.3/76.3 | - | - | - | 3.9% | 3.9% |
+| `take_1m_i32` | compute | 7.36 | -3.4%* | 9.02 | 1.22x (8.2*) | 1.6 | 1.3 | 1(1p)/1 | 3.8/3.8 | 2.01 | 4.49x | 3.67x | 3.2% | 4.5% |
+| `sort_indices_1m_i32` | compute | 22.49 | -25.5%* | 40.99 | 1.82x (15.3*) | 0.2 | 0.1 | 1(1p)/1 | 7.6/7.6 | 4.98 | 8.23x | 4.52x | 6.9% | 5.0% |
+| `filter_1m_string` | strings | 3.74 | -9.4%* | 4.82 | 1.29x (12.8*) | 3.8 | 2.9 | 3(3p)/3 | 6.5/6.6 | 0.65 | 7.44x | 5.78x | 0.7% | 4.0% |
+| `sum_where_10m_f64` | fusion | 6.17 | -15.8%* | 39.02 | 6.32x (85.2*) | 13.2 | 2.1 | 0/1 | 0.0/38.1 | - | - | - | 2.6% | 2.2% |
+| `agg_where_10m_f64` | fusion | 10.32 | +10.7%* | 39.39 | 3.82x (74.3*) | 15.5 | 4.1 | 0/2 | 0.0/39.3 | 4.46 | 8.82x | 2.31x | 2.3% | 2.2% |
+| `sel_2pred_sum_10m_f64` | fusion | 13.93 | -17.9%* | 21.92 | 1.57x (12.3*) | 17.2 | 10.9 | 0/4 | 0.0/25.4 | 4.38 | 5.00x | 3.18x | 6.2% | 5.2% |
+| `dict_vc_1m_str` | encoding | 0.79 | +2.0%~ | 6.09 | 7.73x (129.4*) | 5.1 | 0.7 | 1/3 | 0.0/0.0 | 0.16 | 37.95x | 4.91x | 7.9% | 1.1% |
+| `rle_sum_10m_f64` | encoding | 0.01 | +2.3%* | 6.43 | 532.62x (354.0*) | 9.9 | 12.4 | 0/0 | 0.0/0.0 | - | - | - | 0.2% | 0.6% |
+| `umbra_sort_100k_str` | encoding | 2.58 | -26.9%* | 9.80 | 3.80x (50.5*) | 1.2 | 0.2 | 1(1p)/1 | 0.8/0.8 | 0.27 | 36.40x | 9.57x | 12.0% | 0.6% |
+| `ipc_write_10m_i32` | ipc | 12.53 | -54.5%* | 36.42 | 2.91x (29.2*) | 3.2 | 1.1 | 0/2 | 0.0/0.0 | - | - | - | 6.0% | 4.5% |
+| `ipc_read_mmap_10m_i32` | ipc | 0.02 | +42.7%* | 0.16 | 7.17x (32.0*) | 1819.0 | 253.5 | 6/0 | 0.0/0.0 | - | - | - | 8.4% | 5.9% |
+| `compare_gt_10m_f64` | compute | 4.32 | +3.5%* | 7.57 | 1.75x (69.7*) | 18.5 | 10.6 | 1(1p)/1 | 1.2/1.2 | - | - | - | 1.7% | 1.0% |
+| `filter_10m_i32_sparse` | compute | 0.45 | -40.4%* | 1.49 | 3.28x (18.2*) | 90.7 | 27.6 | 1(1p)/1 | 0.4/0.4 | - | - | - | 20.8% | 4.6% |
+| `sort_indices_100k_str` | strings | 2.58 | +0.3%~ | 9.68 | 3.76x (90.0*) | 0.8 | 0.2 | 1(1p)/1 | 0.8/0.8 | 0.33 | 28.90x | 7.69x | 5.7% | 0.9% |
+| `sel_2pred_sum_10m_f64_actor` | fusion | 5.76 | -31.7%* | 21.92 | 3.80x (23.1*) | 41.6 | 10.9 | 0/4 | 0.0/25.4 | - | - | 2.42x | 16.3% | 5.2% |
+| `sort_indices_1m_i32_actor` | compute | 4.98 | -72.2%* | 40.99 | 8.23x (14.2*) | 0.8 | 0.1 | 1(1p)/1 | 7.6/7.6 | - | - | 4.52x | 66.6% | 5.0% |
+| `sort_indices_100k_str_actor` | strings | 0.33 | -95.0%* | 9.68 | 28.90x (233.7*) | 6.0 | 0.2 | 1(1p)/1 | 0.8/0.8 | - | - | 7.69x | 6.5% | 0.9% |
+| `umbra_sort_100k_str_actor` | encoding | 0.27 | -96.3%* | 9.80 | 36.40x (228.8*) | 11.9 | 0.2 | 1(1p)/1 | 0.8/0.8 | - | - | 9.57x | 24.2% | 0.6% |
+| `agg_where_10m_f64_actor` | fusion | 4.46 | - | 39.39 | 8.82x (76.6*) | 35.8 | 4.1 | 0/2 | 0.0/39.3 | - | - | 2.31x | 11.7% | 2.2% |
+| `dict_vc_1m_str_actor` | encoding | 0.16 | - | 6.09 | 37.95x (202.1*) | 24.9 | 0.7 | 1/3 | 0.0/0.0 | - | - | 4.91x | 5.5% | 1.1% |
 
-The win **grows with the number of conjuncts**: each added predicate makes the
-materialise-between path re-copy every carried column while the selection just
-shrinks an index list. The comparison itself is **monomorphised on the operator**
-(a comptime `$OP`, so the inner loop is a single branchless vectorisable compare
-rather than a runtime `op` switch) — that took the 2-predicate query from 33 ms
-to **21 ms, now faster than PyArrow's** `and(>,>)`+filter+sum (**25.1 ms**), which
-it had been losing. (Building the compare with `-microarch:native` *regresses* it,
-the same AVX2 pathology B1 found, so the baseline build stands.)
+<!-- BENCHMARK_1V1_END -->
