@@ -2,6 +2,7 @@ package skadi_tests
 
 import "core:mem"
 import "core:testing"
+import bs "../benchmarks/odin/stats"
 import oa "../skadi"
 
 // ── String: basic roundtrip ───────────────────────────────────────────────────
@@ -392,4 +393,123 @@ test_varlen_builders_reset_reuse_with_nulls :: proc(t: ^testing.T) {
 		testing.expect_value(t, arr2.length, 1)
 		testing.expect(t, mem.compare(oa.array_get_large_binary(&arr2, 0), []u8{0x77}) == 0)
 	}
+}
+
+@(test)
+test_string_builder_initial_data_cap_exact_allocs :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+
+	state: bs.Bench_Alloc_State
+	cnt := bs.Counting_Allocator_Data{
+		backing = context.allocator,
+		state   = &state,
+	}
+	alloc := bs.counting_allocator(&cnt)
+
+	n :: 2000
+	samples := [4]string{"alpha_0001", "bravo_0002", "charlie_03", "delta_0004"}
+	b := oa.string_builder_make(n, alloc, n * 12)
+	for i in 0..<n {
+		if i % 50 == 0 {
+			oa.string_builder_append_null(&b)
+		} else {
+			oa.string_builder_append(&b, samples[i & 3])
+		}
+	}
+	arr, err := oa.string_builder_finish(&b, alloc)
+	testing.expect_value(t, err, mem.Allocator_Error.None)
+	testing.expect_value(t, state.alloc_count, u64(3))
+	testing.expect_value(t, state.resize_count, u64(0))
+	testing.expect(t, state.trial_live_bytes > 0)
+
+	for i in 0..<n {
+		if i % 50 == 0 {
+			testing.expect(t, oa.array_is_null(&arr, i))
+		} else {
+			testing.expect_value(t, oa.array_get_string(&arr, i), samples[i & 3])
+		}
+	}
+
+	oa.array_free(&arr, alloc)
+	oa.string_builder_destroy(&b)
+	testing.expect_value(t, state.trial_live_bytes, i64(0))
+
+	// Zero-data capacity case: all nulls should still roundtrip and free to 0 live bytes.
+	state = {}
+	b_zero := oa.string_builder_make(16, alloc, 0)
+	for _ in 0..<16 {
+		oa.string_builder_append_null(&b_zero)
+	}
+	arr_zero, err_zero := oa.string_builder_finish(&b_zero, alloc)
+	testing.expect_value(t, err_zero, mem.Allocator_Error.None)
+	testing.expect_value(t, state.alloc_count, u64(3))
+	oa.array_free(&arr_zero, alloc)
+	oa.string_builder_destroy(&b_zero)
+	testing.expect_value(t, state.trial_live_bytes, i64(0))
+}
+
+@(test)
+test_string_array_view_and_sum_lengths :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+
+	// Dense (no nulls)
+	b_dense := oa.string_builder_make(130, context.allocator, 130 * 10)
+	defer oa.string_builder_destroy(&b_dense)
+	ref_dense := i64(0)
+	for i in 0..<130 {
+		s := "abcd" if (i & 1) == 0 else "efghij"
+		oa.string_builder_append(&b_dense, s)
+		ref_dense += i64(len(s))
+	}
+	arr_dense, _ := oa.string_builder_finish(&b_dense)
+	defer oa.array_free(&arr_dense)
+
+	sv_dense := oa.array_string_view(&arr_dense)
+	testing.expect_value(t, oa.string_view_sum_lengths(&sv_dense), ref_dense)
+	testing.expect_value(t, oa.string_view_get(&sv_dense, 0), "abcd")
+	testing.expect_value(t, oa.string_view_len(&sv_dense, 1), 6)
+
+	// Nullable with non-zero slice offset spanning u64 validity boundaries
+	b_null := oa.string_builder_make(200, context.allocator, 200 * 10)
+	defer oa.string_builder_destroy(&b_null)
+	for i in 0..<200 {
+		if i % 7 == 0 {
+			oa.string_builder_append_null(&b_null)
+		} else {
+			oa.string_builder_append(&b_null, "hello_1" if (i % 3 == 0) else "xy")
+		}
+	}
+	arr_null, _ := oa.string_builder_finish(&b_null)
+	defer oa.array_free(&arr_null)
+
+	sliced := oa.array_slice(arr_null, 7, 190)
+	ref_sliced := i64(0)
+	for i in 0..<sliced.length {
+		if !oa.array_is_null(&sliced, i) {
+			ref_sliced += i64(len(oa.array_get_string(&sliced, i)))
+		}
+	}
+	sv_sliced := oa.array_string_view(&sliced)
+	testing.expect_value(t, oa.string_view_sum_lengths(&sv_sliced), ref_sliced)
+	testing.expect_value(t, oa.string_view_is_null(&sv_sliced, 0), oa.array_is_null(&sliced, 0))
+
+	// Empty array and all-null array
+	b_empty := oa.string_builder_make(0, context.allocator, 0)
+	defer oa.string_builder_destroy(&b_empty)
+	arr_empty, _ := oa.string_builder_finish(&b_empty)
+	defer oa.array_free(&arr_empty)
+	sv_empty := oa.array_string_view(&arr_empty)
+	testing.expect_value(t, oa.string_view_sum_lengths(&sv_empty), i64(0))
 }
