@@ -5,6 +5,7 @@ import "core:math"
 import "core:mem"
 import "core:os"
 import "core:testing"
+import bs "../benchmarks/odin/stats"
 import oa "../skadi"
 
 // Red-First: Buffer_Pool must honour 64-byte alignment even after recycling a 1-byte-aligned block of equal size
@@ -393,7 +394,7 @@ test_compute_div_unsigned_null_divisor :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_builder_lazy_bitmap_and_reset :: proc(t: ^testing.T) {
+test_builder_lazy_bitmap_and_reserve_data :: proc(t: ^testing.T) {
 	track := setup_tracking(t)
 	saved_alloc := context.allocator
 	context.allocator = mem.tracking_allocator(&track)
@@ -442,6 +443,37 @@ test_builder_lazy_bitmap_and_reset :: proc(t: ^testing.T) {
 	testing.expect_value(t, pa3.null_count, 1)
 	testing.expect_value(t, oa.bitmap_popcount(pa3.buffers[0].data, pa3.length), 10)
 	testing.expect(t, oa.array_is_null(&pa3, 10))
+
+	// String_Builder with reserve_data + lazy bitmap
+	sb := oa.string_builder_make(4)
+	defer oa.string_builder_destroy(&sb)
+	oa.string_builder_reserve_data(&sb, 1024)
+	testing.expect(t, sb.data_cap >= 1024, "string_builder_reserve_data must grow data_cap")
+	oa.string_builder_append(&sb, "alpha")
+	oa.string_builder_append_null(&sb)
+	oa.string_builder_append(&sb, "gamma")
+	sa1, s_err1 := oa.string_builder_finish(&sb)
+	testing.expect_value(t, s_err1, mem.Allocator_Error.None)
+	defer oa.array_free(&sa1)
+	testing.expect_value(t, sa1.null_count, 1)
+	testing.expect_value(t, oa.bitmap_popcount(sa1.buffers[0].data, sa1.buffers[0].size * 8), 2)
+	testing.expect_value(t, oa.array_get_string(&sa1, 0), "alpha")
+	testing.expect(t, oa.array_is_null(&sa1, 1))
+	testing.expect_value(t, oa.array_get_string(&sa1, 2), "gamma")
+
+	// Binary_Builder with reserve_data
+	bb := oa.binary_builder_make(4)
+	defer oa.binary_builder_destroy(&bb)
+	oa.binary_builder_reserve_data(&bb, 512)
+	testing.expect(t, bb.data_cap >= 512, "binary_builder_reserve_data must grow data_cap")
+	oa.binary_builder_append(&bb, []u8{1, 2, 3})
+	oa.binary_builder_append_null(&bb)
+	ba1, b_err1 := oa.binary_builder_finish(&bb)
+	testing.expect_value(t, b_err1, mem.Allocator_Error.None)
+	defer oa.array_free(&ba1)
+	testing.expect_value(t, ba1.null_count, 1)
+	testing.expect_value(t, len(oa.array_get_binary(&ba1, 0)), 3)
+	testing.expect(t, oa.array_is_null(&ba1, 1))
 }
 
 @(test)
@@ -457,6 +489,7 @@ test_compute_filter_parallel_varlen :: proc(t: ^testing.T) {
 	n := oa.PARALLEL_MIN_LENGTH + 137
 	sb := oa.string_builder_make(n)
 	defer oa.string_builder_destroy(&sb)
+	oa.string_builder_reserve_data(&sb, n * 8)
 
 	mb := oa.builder_make(bool, n)
 	defer oa.builder_destroy(&mb)
@@ -501,6 +534,7 @@ test_compute_filter_parallel_varlen :: proc(t: ^testing.T) {
 	// Dense string array (null_count == 0) parallel filter
 	sb_dense := oa.string_builder_make(n)
 	defer oa.string_builder_destroy(&sb_dense)
+	oa.string_builder_reserve_data(&sb_dense, n * 8)
 	for i in 0..<n {
 		oa.string_builder_append(&sb_dense, "even_item" if (i & 1) == 0 else "odd")
 	}
@@ -586,6 +620,45 @@ test_compute_sum_simd_integers_and_null_mix :: proc(t: ^testing.T) {
 	got_f64, cnt_f64 := oa.compute_sum(&a_f64)
 	testing.expect_value(t, cnt_f64, expected_cnt)
 	testing.expect(t, math.abs(got_f64 - expected_f64) <= 1e-9, "f64 mixed-null sum mismatch")
+}
+
+@(test)
+test_compute_take_parallel :: proc(t: ^testing.T) {
+	n :: 200_000
+	m :: 75_000
+
+	b := oa.builder_make(i32, n)
+	defer oa.builder_destroy(&b)
+	for i in 0..<n {
+		oa.builder_append(&b, i32(i * 3 - 7))
+	}
+	arr, arr_err := oa.builder_finish(&b)
+	testing.expect_value(t, arr_err, mem.Allocator_Error.None)
+	defer oa.array_free(&arr)
+
+	ib := oa.builder_make(i64, m)
+	defer oa.builder_destroy(&ib)
+	for i in 0..<m {
+		oa.builder_append(&ib, i64((u64(i) * 2654435761) % u64(n)))
+	}
+	idx, idx_err := oa.builder_finish(&ib)
+	testing.expect_value(t, idx_err, mem.Allocator_Error.None)
+	defer oa.array_free(&idx)
+
+	seq, seq_err := oa.compute_take(&arr, &idx)
+	testing.expect_value(t, seq_err, mem.Allocator_Error.None)
+	defer oa.array_free(&seq)
+
+	par, par_err := oa.compute_take_parallel(&arr, &idx, 4)
+	testing.expect_value(t, par_err, mem.Allocator_Error.None)
+	defer oa.array_free(&par)
+
+	testing.expect_value(t, par.length, seq.length)
+	seq_data := cast([^]i32)seq.buffers[1].data
+	par_data := cast([^]i32)par.buffers[1].data
+	for i in 0..<m {
+		testing.expect_value(t, par_data[i], seq_data[i])
+	}
 }
 
 @(test)
@@ -675,7 +748,7 @@ test_radix_sort_string_and_umbra_ties :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_compare_and_refine_f64_and_i64 :: proc(t: ^testing.T) {
+test_compare_and_refine_f64_avx2 :: proc(t: ^testing.T) {
 	n :: 103
 	bf := oa.builder_make(f64, n)
 	defer oa.builder_destroy(&bf)
@@ -716,6 +789,239 @@ test_compare_and_refine_f64_and_i64 :: proc(t: ^testing.T) {
 	sum, vc := oa.compute_sum_selection(&arr_f64, &s2)
 	testing.expect_value(t, vc, 59)
 	testing.expect_value(t, sum, f64((21 + 79) * 59 / 2))
+}
+
+@(test)
+test_select_compare_stack_chunk_and_refine_inplace :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+
+	n :: 20_000 // > 16_384 to exercise the chunked [512]u8 path
+	ba := oa.builder_make(f64, n)
+	defer oa.builder_destroy(&ba)
+	bb := oa.builder_make(f64, n)
+	defer oa.builder_destroy(&bb)
+	bi := oa.builder_make(i64, n)
+	defer oa.builder_destroy(&bi)
+
+	for i in 0..<n {
+		if i % 37 == 0 {
+			oa.builder_append_null(&ba)
+		} else if i % 97 == 0 {
+			oa.builder_append(&ba, math.nan_f64())
+		} else {
+			oa.builder_append(&ba, f64(i % 1000))
+		}
+		oa.builder_append(&bb, f64((i * 7 + 3) % 1000))
+		if i % 53 == 0 {
+			oa.builder_append_null(&bi)
+		} else {
+			oa.builder_append(&bi, i64(i % 1000))
+		}
+	}
+	a, _ := oa.builder_finish(&ba)
+	defer oa.array_free(&a)
+	b, _ := oa.builder_finish(&bb)
+	defer oa.array_free(&b)
+	ai, _ := oa.builder_finish(&bi)
+	defer oa.array_free(&ai)
+
+	state: bs.Bench_Alloc_State
+	cnt := bs.Counting_Allocator_Data{
+		backing = context.allocator,
+		state   = &state,
+	}
+	calloc := bs.counting_allocator(&cnt)
+
+	// Stack-chunked compare selection should perform only 1 allocation (the Selection buffer itself)
+	sel := oa.compute_select_compare(&a, .Gt, 250.0, calloc)
+	testing.expect_value(t, state.alloc_count, u64(1))
+	oa.selection_refine_compare_inplace(&sel, &b, .Le, 700.0)
+	testing.expect_value(t, state.alloc_count, u64(1))
+
+	// Reference brute-force verification on sliced view as well
+	ref_sum := f64(0)
+	ref_vc := 0
+	ref_idx := make([dynamic]i32, context.allocator)
+	defer delete(ref_idx)
+	for i in 0..<n {
+		if oa.array_is_null(&a, i) { continue }
+		va := oa.array_get(&a, i, f64)
+		vb := oa.array_get(&b, i, f64)
+		if !math.is_nan(va) && va > 250.0 && vb <= 700.0 {
+			append(&ref_idx, i32(i))
+			ref_sum += va
+			ref_vc += 1
+		}
+	}
+	testing.expect_value(t, sel.length, len(ref_idx))
+	for i in 0..<sel.length {
+		testing.expect_value(t, sel.indices[i], ref_idx[i])
+	}
+	oa.selection_free(&sel)
+	testing.expect_value(t, state.trial_live_bytes, i64(0))
+
+	// i64 select + inplace refine
+	state = {}
+	sel_i := oa.compute_select_compare_i64(&ai, .Ge, 100, calloc)
+	testing.expect_value(t, state.alloc_count, u64(1))
+	oa.selection_refine_compare_i64_inplace(&sel_i, &ai, .Lt, 200)
+	testing.expect_value(t, state.alloc_count, u64(1))
+	for j in 0..<sel_i.length {
+		idx := int(sel_i.indices[j])
+		v := oa.array_get(&ai, idx, i64)
+		testing.expect(t, !oa.array_is_null(&ai, idx) && v >= 100 && v < 200)
+	}
+	oa.selection_free(&sel_i)
+	testing.expect_value(t, state.trial_live_bytes, i64(0))
+
+	// Zero-alloc fused compute_sel_2pred_sum and parallel variant
+	state = {}
+	sa := oa.array_slice(a, 17, n - 5)
+	sb := oa.array_slice(b, 17, n - 5)
+	s_sum, s_vc := oa.compute_sel_2pred_sum(&sa, .Gt, 250.0, &sb, .Le, 700.0, calloc)
+	testing.expect_value(t, state.alloc_count, u64(0))
+
+	p_sum, p_vc := oa.compute_sel_2pred_sum_parallel(&sa, .Gt, 250.0, &sb, .Le, 700.0)
+
+	exp_sum := f64(0)
+	exp_vc := 0
+	for i in 0..<sa.length {
+		if oa.array_is_null(&sa, i) { continue }
+		va := oa.array_get(&sa, i, f64)
+		vb := oa.array_get(&sb, i, f64)
+		if !math.is_nan(va) && va > 250.0 && vb <= 700.0 {
+			exp_sum += va
+			exp_vc += 1
+		}
+	}
+	testing.expect_value(t, s_vc, exp_vc)
+	testing.expect_value(t, p_vc, exp_vc)
+	testing.expect(t, math.abs(s_sum - exp_sum) <= 1e-6, "compute_sel_2pred_sum sum mismatch")
+	testing.expect(t, math.abs(p_sum - exp_sum) <= 1e-6, "compute_sel_2pred_sum_parallel sum mismatch")
+}
+
+@(test)
+test_morsel_u16_kernels_and_sel2pred_fastpath :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+
+	n :: 40_005 // > 2 * 16_384 with non-aligned tail
+	ba := oa.builder_make(f64, n)
+	defer oa.builder_destroy(&ba)
+	bb := oa.builder_make(f64, n)
+	defer oa.builder_destroy(&bb)
+	bi := oa.builder_make(i32, n)
+	defer oa.builder_destroy(&bi)
+
+	for i in 0..<n {
+		oa.builder_append(&ba, f64((i * 13 + 5) % 200) * 0.5)
+		oa.builder_append(&bb, f64((i * 7 + 11) % 200) * 0.5)
+		oa.builder_append(&bi, i32((i * 13 + 5) % 200))
+	}
+	a, _ := oa.builder_finish(&ba)
+	defer oa.array_free(&a)
+	b, _ := oa.builder_finish(&bb)
+	defer oa.array_free(&b)
+	ai, _ := oa.builder_finish(&bi)
+	defer oa.array_free(&ai)
+
+	// Direct u16 kernel verification across all Compare_Op variants, slice offsets, and tail < 8
+	sa := oa.array_slice(a, 13, n - 7)
+	sb := oa.array_slice(b, 13, n - 7)
+	scratch: [oa.MORSEL_MAX_ROWS]u16
+	ops := [6]oa.Compare_Op{.Gt, .Ge, .Lt, .Le, .Eq, .Ne}
+
+	for op in ops {
+		rlen :: 37 // not divisible by 4 or 8
+		rstart :: 21
+		k1 := oa.morsel_select_compare_f64_u16(&sa, op, 40.0, rstart, rlen, scratch[:])
+		k2 := oa.morsel_refine_compare_f64_u16(&sb, .Le, 60.0, rstart, scratch[:], k1)
+		got_sum := oa.morsel_sum_f64_u16(&sa, rstart, scratch[:], k2)
+
+		ref_sum := 0.0
+		ref_cnt := 0
+		for i in 0..<rlen {
+			va := oa.array_get(&sa, rstart + i, f64)
+			vb := oa.array_get(&sb, rstart + i, f64)
+			m := false
+			switch op {
+			case .Gt: m = va >  40.0
+			case .Ge: m = va >= 40.0
+			case .Lt: m = va <  40.0
+			case .Le: m = va <= 40.0
+			case .Eq: m = va == 40.0
+			case .Ne: m = va != 40.0
+			}
+			if m && vb <= 60.0 {
+				ref_sum += va
+				ref_cnt += 1
+			}
+		}
+		testing.expect_value(t, k2, ref_cnt)
+		testing.expect(t, math.abs(got_sum - ref_sum) <= 1e-6, "u16 kernel sum mismatch")
+	}
+
+	// Zero-match predicate check
+	k_zero := oa.morsel_select_compare_f64_u16(&sa, .Gt, 1e9, 5, 53, scratch[:])
+	testing.expect_value(t, k_zero, 0)
+	testing.expect_value(t, oa.morsel_sum_f64_u16(&sa, 5, scratch[:], 0), 0.0)
+
+	// Null-free f64 fast path in compute_sel_2pred_sum & parallel (0 heap allocations)
+	state: bs.Bench_Alloc_State
+	cnt := bs.Counting_Allocator_Data{
+		backing = context.allocator,
+		state   = &state,
+	}
+	calloc := bs.counting_allocator(&cnt)
+
+	s_sum, s_vc := oa.compute_sel_2pred_sum(&sa, .Gt, 35.0, &sb, .Le, 70.0, calloc)
+	testing.expect_value(t, state.alloc_count, u64(0))
+	testing.expect_value(t, state.bytes_allocated, u64(0))
+
+	p_sum, p_vc := oa.compute_sel_2pred_sum_parallel(&sa, .Gt, 35.0, &sb, .Le, 70.0, 4)
+
+	exp_sum := 0.0
+	exp_vc := 0
+	for i in 0..<sa.length {
+		va := oa.array_get(&sa, i, f64)
+		vb := oa.array_get(&sb, i, f64)
+		if va > 35.0 && vb <= 70.0 {
+			exp_sum += va
+			exp_vc += 1
+		}
+	}
+	testing.expect_value(t, s_vc, exp_vc)
+	testing.expect_value(t, p_vc, exp_vc)
+	testing.expect(t, math.abs(s_sum - exp_sum) <= 1e-6, "sel_2pred_sum fastpath mismatch")
+	testing.expect(t, math.abs(p_sum - exp_sum) <= 1e-6, "sel_2pred_sum_parallel fastpath mismatch")
+
+	// Non-f64 fallback path check
+	sai := oa.array_slice(ai, 13, n - 7)
+	i_sum, i_vc := oa.compute_sel_2pred_sum(&sai, .Gt, 70.0, &sb, .Le, 70.0, calloc)
+	testing.expect_value(t, state.alloc_count, u64(0))
+	exp_i_sum := 0.0
+	exp_i_vc := 0
+	for i in 0..<sai.length {
+		vi := f64(oa.array_get(&sai, i, i32))
+		vb := oa.array_get(&sb, i, f64)
+		if vi > 70.0 && vb <= 70.0 {
+			exp_i_sum += vi
+			exp_i_vc += 1
+		}
+	}
+	testing.expect_value(t, i_vc, exp_i_vc)
+	testing.expect(t, math.abs(i_sum - exp_i_sum) <= 1e-6, "sel_2pred_sum fallback mismatch")
 }
 
 @(private="file")
@@ -816,6 +1122,133 @@ test_radix_sort_u32_edge_cases :: proc(t: ^testing.T) {
 	verify_width(t, u64, []u64{0, 1, 0x01020304_05060708, 0x8000_0000_0000_0000, max(u64), 1})
 }
 
+@(test)
+test_compute_take_i32_indices_and_selection :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+
+	n :: 150_000
+	m :: 70_000
+
+	// Dense i32 source + sliced Int32_Type indices (parallel and serial)
+	ba := oa.builder_make(i32, n)
+	defer oa.builder_destroy(&ba)
+	for i in 0..<n { oa.builder_append(&ba, i32(i * 5 - 100)) }
+	arr, _ := oa.builder_finish(&ba)
+	defer oa.array_free(&arr)
+
+	bi32 := oa.builder_make(i32, m + 10)
+	defer oa.builder_destroy(&bi32)
+	for i in 0..<(m + 10) { oa.builder_append(&bi32, i32((u64(i) * 2654435761) % u64(n))) }
+	idx_raw, _ := oa.builder_finish(&bi32)
+	defer oa.array_free(&idx_raw)
+	idx_sl := oa.array_slice(idx_raw, 7, 7 + m)
+
+	take_seq, err_seq := oa.compute_take(&arr, &idx_sl)
+	testing.expect_value(t, err_seq, mem.Allocator_Error.None)
+	defer oa.array_free(&take_seq)
+
+	take_par, err_par := oa.compute_take_parallel(&arr, &idx_sl, 4)
+	testing.expect_value(t, err_par, mem.Allocator_Error.None)
+	defer oa.array_free(&take_par)
+
+	testing.expect_value(t, take_seq.length, m)
+	testing.expect_value(t, take_par.length, m)
+	for i in 0..<m {
+		exp := oa.array_get(&arr, int(oa.array_get(&idx_sl, i, i32)), i32)
+		testing.expect_value(t, oa.array_get(&take_seq, i, i32), exp)
+		testing.expect_value(t, oa.array_get(&take_par, i, i32), exp)
+	}
+
+	// Nullable f64 source + nullable Int32_Type indices
+	bf := oa.builder_make(f64, 20)
+	defer oa.builder_destroy(&bf)
+	for i in 0..<20 {
+		if i % 4 == 0 { oa.builder_append_null(&bf) } else { oa.builder_append(&bf, f64(i) * 1.5) }
+	}
+	farr, _ := oa.builder_finish(&bf)
+	defer oa.array_free(&farr)
+
+	bni := oa.builder_make(i32, 6)
+	defer oa.builder_destroy(&bni)
+	oa.builder_append(&bni, i32(1))
+	oa.builder_append_null(&bni)
+	oa.builder_append(&bni, i32(4))
+	oa.builder_append(&bni, i32(7))
+	ni, _ := oa.builder_finish(&bni)
+	defer oa.array_free(&ni)
+
+	nf_out, nf_err := oa.compute_take(&farr, &ni)
+	testing.expect_value(t, nf_err, mem.Allocator_Error.None)
+	defer oa.array_free(&nf_out)
+	testing.expect_value(t, nf_out.length, 4)
+	testing.expect_value(t, nf_out.null_count, 2)
+	testing.expect_value(t, oa.array_get(&nf_out, 0, f64), 1.5)
+	testing.expect(t, oa.array_is_null(&nf_out, 1))
+	testing.expect(t, oa.array_is_null(&nf_out, 2))
+	testing.expect_value(t, oa.array_get(&nf_out, 3, f64), 10.5)
+
+	// String_Type + Bool_Type with Int32_Type indices
+	sb := oa.string_builder_make(4)
+	defer oa.string_builder_destroy(&sb)
+	oa.string_builder_append(&sb, "zero")
+	oa.string_builder_append_null(&sb)
+	oa.string_builder_append(&sb, "two")
+	oa.string_builder_append(&sb, "three")
+	sarr, _ := oa.string_builder_finish(&sb)
+	defer oa.array_free(&sarr)
+
+	bb := oa.builder_make(bool, 4)
+	defer oa.builder_destroy(&bb)
+	oa.builder_append(&bb, true)
+	oa.builder_append_null(&bb)
+	oa.builder_append(&bb, false)
+	oa.builder_append(&bb, true)
+	barr, _ := oa.builder_finish(&bb)
+	defer oa.array_free(&barr)
+
+	bi4 := oa.builder_make(i32, 4)
+	defer oa.builder_destroy(&bi4)
+	oa.builder_append(&bi4, i32(3))
+	oa.builder_append(&bi4, i32(1))
+	oa.builder_append_null(&bi4)
+	oa.builder_append(&bi4, i32(0))
+	i4, _ := oa.builder_finish(&bi4)
+	defer oa.array_free(&i4)
+
+	st_out, st_err := oa.compute_take(&sarr, &i4)
+	testing.expect_value(t, st_err, mem.Allocator_Error.None)
+	defer oa.array_free(&st_out)
+	testing.expect_value(t, oa.array_get_string(&st_out, 0), "three")
+	testing.expect(t, oa.array_is_null(&st_out, 1))
+	testing.expect(t, oa.array_is_null(&st_out, 2))
+	testing.expect_value(t, oa.array_get_string(&st_out, 3), "zero")
+
+	bt_out, bt_err := oa.compute_take(&barr, &i4)
+	testing.expect_value(t, bt_err, mem.Allocator_Error.None)
+	defer oa.array_free(&bt_out)
+	testing.expect_value(t, oa.array_get(&bt_out, 0, bool), true)
+	testing.expect(t, oa.array_is_null(&bt_out, 1))
+	testing.expect(t, oa.array_is_null(&bt_out, 2))
+	testing.expect_value(t, oa.array_get(&bt_out, 3, bool), true)
+
+	// compute_take_selection wrapper check
+	sel := oa.compute_select_compare(&arr, .Lt, -75.0)
+	defer oa.selection_free(&sel)
+	sel_taken, sel_err := oa.compute_take_selection(&arr, &sel)
+	testing.expect_value(t, sel_err, mem.Allocator_Error.None)
+	defer oa.array_free(&sel_taken)
+	testing.expect_value(t, sel_taken.length, 5)
+	for i in 0..<5 {
+		testing.expect_value(t, oa.array_get(&sel_taken, i, i32), i32(i * 5 - 100))
+	}
+}
+
 @(private="file")
 _verify_mixed_batches :: proc(
 	t: ^testing.T,
@@ -895,14 +1328,63 @@ _verify_mixed_batches :: proc(
 }
 
 @(test)
-test_ipc_wide_multibatch_mixed_sliced_and_overwrite_truncation :: proc(t: ^testing.T) {
+test_ipc_vectored_write_wide_multibatch_and_partial_iovec :: proc(t: ^testing.T) {
 	track := setup_tracking(t)
 	defer check_no_leaks(t, &track)
 	old_alloc := context.allocator
 	context.allocator = mem.tracking_allocator(&track)
 	defer context.allocator = old_alloc
 
-	// Wide-schema (> 1024 buffers) across 2 batches in File & Stream
+	// 1. Partial writev advancement across iovec boundaries (including zero-length iovec)
+	{
+		b0 := []u8{1, 2, 3}
+		b1 := []u8{10, 11, 12, 13, 14, 15, 16, 17}
+		b2 := []u8{99}
+		b3 := []u8{20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38}
+		b4 := []u8{41, 42, 43, 44, 45, 46, 47}
+
+		expected := make([dynamic]u8, 0, 38)
+		defer delete(expected)
+		append(&expected, ..b0)
+		append(&expected, ..b1)
+		append(&expected, ..b2)
+		append(&expected, ..b3)
+		append(&expected, ..b4)
+
+		iovs := [6]oa._IPC_IOVec{
+			{iov_base = raw_data(b0), iov_len = oa._IPC_IOVec_Len(len(b0))},
+			{iov_base = raw_data(b1), iov_len = oa._IPC_IOVec_Len(len(b1))},
+			{iov_base = nil, iov_len = 0},
+			{iov_base = raw_data(b2), iov_len = oa._IPC_IOVec_Len(len(b2))},
+			{iov_base = raw_data(b3), iov_len = oa._IPC_IOVec_Len(len(b3))},
+			{iov_base = raw_data(b4), iov_len = oa._IPC_IOVec_Len(len(b4))},
+		}
+
+		rem := iovs[:]
+		rem = oa._ipc_advance_iovecs(rem, 0)
+		testing.expect_value(t, len(rem), 6)
+
+		steps := [?]int{1, 4, 6, 1, 10, 16}
+		collected := make([dynamic]u8, 0, 38)
+		defer delete(collected)
+
+		for step in steps {
+			need := step
+			for k := 0; k < len(rem) && need > 0; k += 1 {
+				seg_len := int(rem[k].iov_len)
+				if seg_len == 0 { continue }
+				take := min(need, seg_len)
+				append(&collected, ..(cast([^]u8)rem[k].iov_base)[:take])
+				need -= take
+			}
+			testing.expect_value(t, need, 0)
+			rem = oa._ipc_advance_iovecs(rem, step)
+		}
+		testing.expect_value(t, len(rem), 0)
+		testing.expect(t, bytes.equal(collected[:], expected[:]), "partial writev iovec advancement mismatch")
+	}
+
+	// 2. Wide-schema (> 1024 iovecs to exercise IOV_MAX batching) across 2 batches in File & Stream
 	{
 		wide_file   := ipc_test_temp_path("vw_wide", "arrow")
 		wide_stream := ipc_test_temp_path("vw_wide", "arrows")
@@ -1005,7 +1487,7 @@ test_ipc_wide_multibatch_mixed_sliced_and_overwrite_truncation :: proc(t: ^testi
 		}
 	}
 
-	// Mixed-type, empty-batch, nullable, sliced-array multi-batch + overwrite truncation
+	// 3. Mixed-type, empty-batch, nullable, sliced-array multi-batch + overwrite truncation
 	{
 		mixed_file   := ipc_test_temp_path("vw_mixed", "arrow")
 		mixed_stream := ipc_test_temp_path("vw_mixed", "arrows")
