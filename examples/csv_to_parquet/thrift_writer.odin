@@ -1,5 +1,5 @@
 // Thrift Compact Protocol encoder — enough to write Parquet footer metadata.
-package main
+package csv_to_parquet
 
 // Field types (same values as the decoder side)
 TW_BOOL_TRUE :: u8(1)

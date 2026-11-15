@@ -1,5 +1,5 @@
 // Streaming RFC 4180 CSV reader.
-package main
+package csv_to_parquet
 
 import "core:os"
 import oa "../../skadi"

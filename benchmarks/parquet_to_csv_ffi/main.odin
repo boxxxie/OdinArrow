@@ -1,4 +1,4 @@
-package main
+package parquet_to_csv_ffi
 
 import "core:fmt"
 import "core:os"

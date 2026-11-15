@@ -1,6 +1,6 @@
 // Parquet writer: PLAIN encoding, UNCOMPRESSED, all-string (BYTE_ARRAY) columns.
 // Supports multiple row groups for memory-bounded streaming writes.
-package main
+package csv_to_parquet
 
 import "core:os"
 import oa "../../skadi"

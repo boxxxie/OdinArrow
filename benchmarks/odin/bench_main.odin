@@ -1,4 +1,4 @@
-package main
+package bench_skadi
 
 import "core:fmt"
 import "core:mem"

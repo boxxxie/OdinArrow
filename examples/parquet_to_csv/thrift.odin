@@ -8,7 +8,7 @@
 // Lists:    1-byte header (high nibble = size 0-14, else 0xF → varint size)
 //           followed by element type in low nibble; then size elements
 
-package main
+package parquet_to_csv
 
 // Field types (Compact Protocol)
 THRIFT_BOOL_TRUE  :: u8(1)
