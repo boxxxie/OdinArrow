@@ -1,5 +1,6 @@
 SRC   := src
 TESTS := tests
+SPECS := specs
 BIN   := bin
 
 # Apache Arrow C++ paths — prefer system pkg-config, fall back to bundled PyArrow.
@@ -31,7 +32,7 @@ endif
 TEST_DATA ?= test_data.parquet
 ODIN_CHECK_FLAGS := -vet -strict-style -disallow-do -warnings-as-errors
 
-.PHONY: all check test test-cpp bench-odin bench-python bench bench-compare \
+.PHONY: all check test test-specs test-cpp bench-odin bench-python bench bench-compare \
         build-arrow-capi bench-arrow-cpp \
         build-parquet-capi parquet-odin parquet-ffi bench-parquet \
         csv-to-parquet-odin csv-to-parquet-ffi clean
@@ -55,8 +56,12 @@ check:
 	odin check programs/csv_to_parquet_odin $(ODIN_CHECK_FLAGS)
 	odin check programs/csv_to_parquet_ffi $(ODIN_CHECK_FLAGS)
 
+test-specs: $(BIN)
+	odin test $(SPECS) -out:$(BIN)/spec_runner $(ODIN_CHECK_FLAGS)
+
 test: $(BIN)
 	odin test $(TESTS) -out:$(BIN)/test_runner $(ODIN_CHECK_FLAGS)
+	odin test $(SPECS) -out:$(BIN)/spec_runner $(ODIN_CHECK_FLAGS)
 
 # ── Arrow C++ shared library (for Odin FFI) ───────────────────────────────────
 
