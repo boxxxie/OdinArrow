@@ -615,3 +615,96 @@ test_parquet_rejects_unbounded_dict_and_page_num_values :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+@(test)
+test_decode_rle_into_bit_widths_and_tails :: proc(t: ^testing.T) {
+	// bit_width = 1: 10 values (group 0 fast path + group 1 tail fallback)
+	bw1_data := [?]u8{5, 0b10110010, 0b00000011}
+	bw1_out: [10]int
+	p2c.decode_rle_into(bw1_data[:], 1, 10, bw1_out[:])
+	want1 := [10]int{0, 1, 0, 0, 1, 1, 0, 1, 1, 1}
+	testing.expect_value(t, bw1_out, want1)
+
+	// bit_width = 5: 18 values (u64 fast path + tail)
+	bw5_data := make([]u8, 1 + 3 * 5, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	bw5_data[0] = (3 << 1) | 1 // 3 groups = 24 slots
+	for i in 0 ..< 18 {
+		val := u64((i * 3 + 1) & 0x1F)
+		bit_pos := i * 5
+		for b in 0 ..< 5 {
+			if (val >> uint(b)) & 1 != 0 {
+				bw5_data[1 + (bit_pos + b) / 8] |= u8(1) << uint((bit_pos + b) % 8)
+			}
+		}
+	}
+	bw5_out: [18]int
+	p2c.decode_rle_into(bw5_data, 5, 18, bw5_out[:])
+	for i in 0 ..< 18 {
+		testing.expect_value(t, bw5_out[i], (i * 3 + 1) & 0x1F)
+	}
+
+	// bit_width = 11: 18 values (u128 fast path + group 1/2 tail fallback)
+	bw11_data := make([]u8, 1 + 3 * 11, context.temp_allocator)
+	bw11_data[0] = (3 << 1) | 1
+	for i in 0 ..< 18 {
+		val := u64((i * 137 + 5) & 0x7FF)
+		bit_pos := i * 11
+		for b in 0 ..< 11 {
+			if (val >> uint(b)) & 1 != 0 {
+				bw11_data[1 + (bit_pos + b) / 8] |= u8(1) << uint((bit_pos + b) % 8)
+			}
+		}
+	}
+	bw11_out: [18]int
+	p2c.decode_rle_into(bw11_data, 11, 18, bw11_out[:])
+	for i in 0 ..< 18 {
+		testing.expect_value(t, bw11_out[i], (i * 137 + 5) & 0x7FF)
+	}
+}
+
+@(test)
+test_csv_and_out_simd_16byte_boundaries :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	csv_in  := pq_temp_file("simd_bounds_in")
+	pq_mid  := pq_temp_file("simd_bounds_mid")
+	csv_out := pq_temp_file("simd_bounds_out")
+	defer {
+		_ = os.remove(csv_in)
+		_ = os.remove(pq_mid)
+		_ = os.remove(csv_out)
+	}
+
+	// Lengths 15, 16, 17, 31, 32, 33 with delimiters/quotes at lane 0, lane 15, and across refill.
+	s15 := "abcdefghijklmno"
+	s16 := "abcdefghijklmnop"
+	s17 := "abcdefghijklmnopq"
+	s31 := "0123456789abcdef0123456789abcde"
+	s32 := "0123456789abcdef0123456789abcdef"
+	s33 := "0123456789abcdef0123456789abcdefg"
+	q16 := "0123456789abcde,z"   // comma at lane 15
+	q17 := ",123456789abcdef01"  // comma at lane 0
+	q32 := "0123456789abcdef0123456789abc\"ef" // quote inside 32-byte field
+
+	content := fmt.tprintf(
+		"c1,c2,c3\n%s,%s,%s\n%s,%s,%s\n\"%s\",\"%s\",\"%s\"\n",
+		s15, s16, s17,
+		s31, s32, s33,
+		q16, q17, "0123456789abcdef0123456789abc\"\"ef",
+	)
+	_ = q32
+	testing.expect_value(t, os.write_entire_file(csv_in, transmute([]u8)content), nil)
+
+	// Small buf_size_override (16) forces CSV_Stream buffer refills mid-field.
+	rows, _, c_err := c2p.csv_to_parquet_stream(csv_in, pq_mid, 64 * 1024 * 1024, buf_size_override = 16)
+	testing.expect_value(t, c_err, nil)
+	testing.expect_value(t, rows, 3)
+
+	p_rows, _, p_err := p2c.parquet_to_csv_stream(pq_mid, csv_out, 64 * 1024 * 1024)
+	testing.expect_value(t, p_err, nil)
+	testing.expect_value(t, p_rows, i64(3))
+
+	out_bytes, r_err := os.read_entire_file(csv_out, context.temp_allocator)
+	testing.expect_value(t, r_err, nil)
+	testing.expect_value(t, string(out_bytes), content)
+}
