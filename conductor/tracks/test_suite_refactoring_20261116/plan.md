@@ -5,17 +5,17 @@
 ## Phase 1: Backport 15 Compatible Tests from Downstream MR Branches
 Backports the 11 as-is tests and 4 adapted/extracted tests from `56fbd38`, `9adeae8`, `855cc76`, and `9ad608a` onto a track branch from `master`, ensuring strict `-vet-style -disallow-do` compliance.
 
-- [ ] Task: Backport `56fbd38` & `9adeae8` Core Buffer, Encoding, Sort & Umbra Tests
-    - [ ] Port `test_buffer_make_uninit_alignment_and_lifecycle` from `56fbd38` into `tests/buffer_test.odin`
-    - [ ] Port `test_dict_nan_dedup_and_null_decode` from `56fbd38` into `tests/dict_test.odin`
-    - [ ] Port `test_rle_encode_decode_preserves_nulls` from `56fbd38` into `tests/rle_test.odin`
-    - [ ] Port `test_compute_sort_indices_temp_allocator_no_leak` from `56fbd38` into `tests/compute_test.odin`
-    - [ ] Port `test_umbra_long_tie_break_offsets_and_mixed_lengths` from `9adeae8` into `tests/umbra_test.odin` (without `import pipeline` and using `if ... else` instead of `? :`)
-- [ ] Task: Backport `9ad608a` Core Regressions & `855cc76` Parquet/CSV Internals Tests
-    - [ ] Port `test_compute_div_unsigned_null_divisor`, `test_compute_sum_simd_integers_and_null_mix`, `test_radix_sort_string_and_umbra_ties`, `test_compare_and_refine_f64_and_i64`, and `test_radix_sort_u32_edge_cases` (`+ _verify_radix_sort_stability`) from `9ad608a` into `tests/core_regressions_test.odin`
-    - [ ] Port adapted `test_builder_lazy_bitmap_and_reset` (`Primitive_Builder` section), `test_compute_filter_parallel_varlen` (without `string_builder_reserve_data`), and `test_ipc_wide_multibatch_mixed_sliced_and_overwrite_truncation` (Parts 2 & 3 of `test_ipc_vectored_write_wide_multibatch_and_partial_iovec`) from `9ad608a` into `tests/core_regressions_test.odin`, replacing all C-style `? :` ternaries with Odin `if ... else`
-    - [ ] Port `test_decode_rle_into_bit_widths_and_tails` and `test_csv_and_out_simd_16byte_boundaries` from `855cc76` into `tests/parquet_internals_test.odin`
-    - [ ] Run `make check && make test` and confirm all backported tests compile with 0 warnings and pass
+- [x] Task: Backport `56fbd38` & `9adeae8` Core Buffer, Encoding, Sort & Umbra Tests `58b066c`
+    - [x] Port `test_buffer_make_uninit_alignment_and_lifecycle` from `56fbd38` into `tests/buffer_test.odin`
+    - [x] Port `test_dict_nan_dedup_and_null_decode` from `56fbd38` into `tests/dict_test.odin`
+    - [x] Port `test_rle_encode_decode_preserves_nulls` from `56fbd38` into `tests/rle_test.odin`
+    - [x] Port `test_compute_sort_indices_temp_allocator_no_leak` from `56fbd38` into `tests/compute_test.odin`
+    - [x] Port `test_umbra_long_tie_break_offsets_and_mixed_lengths` from `9adeae8` into `tests/umbra_test.odin` (without `import pipeline` and using `if ... else` instead of `? :`)
+- [x] Task: Backport `9ad608a` Core Regressions & `855cc76` Parquet/CSV Internals Tests `71c017c`
+    - [x] Port `test_compute_div_unsigned_null_divisor`, `test_compute_sum_simd_integers_and_null_mix`, `test_radix_sort_string_and_umbra_ties`, `test_compare_and_refine_f64_and_i64`, and `test_radix_sort_u32_edge_cases` (`+ _verify_radix_sort_stability`) from `9ad608a` into `tests/core_regressions_test.odin`
+    - [x] Port adapted `test_builder_lazy_bitmap_and_reset` (`Primitive_Builder` section), `test_compute_filter_parallel_varlen` (without `string_builder_reserve_data`), and `test_ipc_wide_multibatch_mixed_sliced_and_overwrite_truncation` (Parts 2 & 3 of `test_ipc_vectored_write_wide_multibatch_and_partial_iovec`) from `9ad608a` into `tests/core_regressions_test.odin`, replacing all C-style `? :` ternaries with Odin `if ... else`
+    - [x] Port `test_decode_rle_into_bit_widths_and_tails` and `test_csv_and_out_simd_16byte_boundaries` from `855cc76` into `tests/parquet_internals_test.odin`
+    - [x] Run `make check && make test` and confirm all backported tests compile with 0 warnings and pass
 - [ ] Task: Conductor - User Manual Verification 'Phase 1: Backport 15 Compatible Tests from Downstream MR Branches' (Protocol in workflow.md)
 
 ---
