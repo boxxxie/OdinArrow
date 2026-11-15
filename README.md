@@ -1,5 +1,11 @@
 # OdinArrow
 
+[![CI](https://github.com/boxxxie/OdinArrow/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/OdinArrow/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](CHANGELOG.md)
+[![Odin](https://img.shields.io/badge/Odin-lang-3882D2.svg)](https://odin-lang.org/)
+[![License: Zlib](https://img.shields.io/badge/License-Zlib-lightgrey.svg)](LICENSE)
+[![Arrow IPC](https://img.shields.io/badge/Arrow%20IPC-Feather%20v2-orange.svg)](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc)
+
 A native [Apache Arrow](https://arrow.apache.org/) implementation in the
 [Odin](https://odin-lang.org/) language — columnar in-memory format, compute
 kernels, and the Arrow IPC format (Feather v2), with zero-overhead abstractions
