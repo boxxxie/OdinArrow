@@ -284,3 +284,112 @@ test_large_binary_roundtrip :: proc(t: ^testing.T) {
 	testing.expect(t, oa.array_is_null(&arr, 1))
 	testing.expect(t, mem.compare(oa.array_get_large_binary(&arr, 2), []u8{0x42}) == 0)
 }
+
+@(test)
+test_varlen_builders_reset_reuse_with_nulls :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+	context.allocator = mem.tracking_allocator(&track)
+
+	// Binary_Builder reset before finish, reuse with nulls, then reset after finish.
+	{
+		bb := oa.binary_builder_make(4)
+		defer oa.binary_builder_destroy(&bb)
+		oa.binary_builder_append(&bb, []u8{1, 2, 3})
+		oa.binary_builder_append_null(&bb)
+		oa.binary_builder_reset(&bb)
+		testing.expect_value(t, bb.length, 0)
+		testing.expect_value(t, bb.null_count, 0)
+
+		oa.binary_builder_append(&bb, []u8{0xAA})
+		oa.binary_builder_append_null(&bb)
+		oa.binary_builder_append(&bb, []u8{0xBB, 0xCC})
+		arr, err := oa.binary_builder_finish(&bb)
+		testing.expect_value(t, err, nil)
+		defer oa.array_free(&arr)
+		testing.expect_value(t, arr.length, 3)
+		testing.expect_value(t, arr.null_count, 1)
+		testing.expect(t, oa.array_is_valid(&arr, 0))
+		testing.expect(t, mem.compare(oa.array_get_binary(&arr, 0), []u8{0xAA}) == 0)
+		testing.expect(t, oa.array_is_null(&arr, 1))
+		testing.expect(t, oa.array_is_valid(&arr, 2))
+		testing.expect(t, mem.compare(oa.array_get_binary(&arr, 2), []u8{0xBB, 0xCC}) == 0)
+
+		oa.binary_builder_reset(&bb)
+		oa.binary_builder_append(&bb, []u8{0xDD})
+		arr2, err2 := oa.binary_builder_finish(&bb)
+		testing.expect_value(t, err2, nil)
+		defer oa.array_free(&arr2)
+		testing.expect_value(t, arr2.length, 1)
+		testing.expect_value(t, oa.array_null_count(&arr2), 0)
+		testing.expect(t, mem.compare(oa.array_get_binary(&arr2, 0), []u8{0xDD}) == 0)
+	}
+
+	// Large_String_Builder reset before finish, reuse with nulls, then reset after finish.
+	{
+		lsb := oa.large_string_builder_make(4)
+		defer oa.large_string_builder_destroy(&lsb)
+		oa.large_string_builder_append(&lsb, "discard_me")
+		oa.large_string_builder_append_null(&lsb)
+		oa.large_string_builder_reset(&lsb)
+		testing.expect_value(t, lsb.length, 0)
+		testing.expect_value(t, lsb.null_count, 0)
+
+		oa.large_string_builder_append_null(&lsb)
+		oa.large_string_builder_append(&lsb, "kept1")
+		oa.large_string_builder_append(&lsb, "")
+		oa.large_string_builder_append(&lsb, "kept2")
+		arr, err := oa.large_string_builder_finish(&lsb)
+		testing.expect_value(t, err, nil)
+		defer oa.array_free(&arr)
+		testing.expect_value(t, arr.length, 4)
+		testing.expect_value(t, oa.array_null_count(&arr), 1)
+		testing.expect(t, oa.array_is_null(&arr, 0))
+		testing.expect_value(t, oa.array_get_large_string(&arr, 1), "kept1")
+		testing.expect_value(t, oa.array_get_large_string(&arr, 2), "")
+		testing.expect_value(t, oa.array_get_large_string(&arr, 3), "kept2")
+
+		oa.large_string_builder_reset(&lsb)
+		oa.large_string_builder_append(&lsb, "after")
+		arr2, err2 := oa.large_string_builder_finish(&lsb)
+		testing.expect_value(t, err2, nil)
+		defer oa.array_free(&arr2)
+		testing.expect_value(t, arr2.length, 1)
+		testing.expect_value(t, oa.array_get_large_string(&arr2, 0), "after")
+	}
+
+	// Large_Binary_Builder reset before finish, reuse with nulls, then reset after finish.
+	{
+		lbb := oa.large_binary_builder_make(4)
+		defer oa.large_binary_builder_destroy(&lbb)
+		oa.large_binary_builder_append(&lbb, []u8{9, 9})
+		oa.large_binary_builder_append_null(&lbb)
+		oa.large_binary_builder_reset(&lbb)
+		testing.expect_value(t, lbb.length, 0)
+		testing.expect_value(t, lbb.null_count, 0)
+
+		oa.large_binary_builder_append(&lbb, []u8{0x11, 0x22})
+		oa.large_binary_builder_append_null(&lbb)
+		oa.large_binary_builder_append(&lbb, []u8{})
+		arr, err := oa.large_binary_builder_finish(&lbb)
+		testing.expect_value(t, err, nil)
+		defer oa.array_free(&arr)
+		testing.expect_value(t, arr.length, 3)
+		testing.expect_value(t, oa.array_null_count(&arr), 1)
+		testing.expect(t, mem.compare(oa.array_get_large_binary(&arr, 0), []u8{0x11, 0x22}) == 0)
+		testing.expect(t, oa.array_is_null(&arr, 1))
+		testing.expect_value(t, len(oa.array_get_large_binary(&arr, 2)), 0)
+
+		oa.large_binary_builder_reset(&lbb)
+		oa.large_binary_builder_append(&lbb, []u8{0x77})
+		arr2, err2 := oa.large_binary_builder_finish(&lbb)
+		testing.expect_value(t, err2, nil)
+		defer oa.array_free(&arr2)
+		testing.expect_value(t, arr2.length, 1)
+		testing.expect(t, mem.compare(oa.array_get_large_binary(&arr2, 0), []u8{0x77}) == 0)
+	}
+}

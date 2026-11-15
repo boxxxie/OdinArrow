@@ -159,3 +159,70 @@ test_table_column_null_access :: proc(t: ^testing.T) {
 	testing.expect(t, !oa.chunked_array_is_null(col, 0))
 	testing.expect(t, oa.chunked_array_is_null(col, 1))
 }
+
+@(test)
+test_table_column_at_valid_and_out_of_bounds :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+	context.allocator = mem.tracking_allocator(&track)
+
+	fields := []oa.Field{
+		oa.field_make("id",  oa.Int32_Type{}),
+		oa.field_make("val", oa.Float64_Type{}),
+	}
+	s, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
+	defer oa.schema_free(&s)
+
+	rb1, ok1 := oa.record_batch_make(&s, []oa.Array{
+		build_array([]i32{10, 20}),
+		build_array([]f64{1.5, 2.5}),
+	})
+	testing.expect(t, ok1)
+	defer oa.record_batch_free(&rb1)
+
+	rb2, ok2 := oa.record_batch_make(&s, []oa.Array{
+		build_array([]i32{30}),
+		build_array([]f64{3.5}),
+	})
+	testing.expect(t, ok2)
+	defer oa.record_batch_free(&rb2)
+
+	tbl, t_ok := oa.table_from_record_batches([]oa.Record_Batch{rb1, rb2})
+	testing.expect(t, t_ok)
+	defer oa.table_free(&tbl)
+
+	c0, ok_c0 := oa.table_column_at(&tbl, 0)
+	testing.expect(t, ok_c0)
+	if ok_c0 {
+		testing.expect_value(t, oa.chunked_array_get(c0, 0, i32), i32(10))
+		testing.expect_value(t, oa.chunked_array_get(c0, 2, i32), i32(30))
+	}
+
+	c1, ok_c1 := oa.table_column_at(&tbl, 1)
+	testing.expect(t, ok_c1)
+	if ok_c1 {
+		testing.expect_value(t, oa.chunked_array_get(c1, 1, f64), f64(2.5))
+		testing.expect_value(t, oa.chunked_array_get(c1, 2, f64), f64(3.5))
+	}
+
+	oob_neg, ok_neg := oa.table_column_at(&tbl, -1)
+	testing.expect(t, !ok_neg)
+	testing.expect(t, oob_neg == nil)
+
+	oob_end, ok_end := oa.table_column_at(&tbl, 2)
+	testing.expect(t, !ok_end)
+	testing.expect(t, oob_end == nil)
+
+	oob_far, ok_far := oa.table_column_at(&tbl, 999)
+	testing.expect(t, !ok_far)
+	testing.expect(t, oob_far == nil)
+
+	nil_col, ok_nil := oa.table_column_at(nil, 0)
+	testing.expect(t, !ok_nil)
+	testing.expect(t, nil_col == nil)
+}

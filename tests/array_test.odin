@@ -66,6 +66,36 @@ test_type_predicates :: proc(t: ^testing.T) {
 	testing.expect(t, !oa.type_is_bit_packed(oa.Int32_Type{}))
 }
 
+@(test)
+test_type_is_variable_length_all_variants :: proc(t: ^testing.T) {
+	Varlen_Case :: struct {
+		dt:   oa.DataType,
+		want: bool,
+	}
+	cases := []Varlen_Case{
+		{oa.Null_Type{},         false},
+		{oa.Bool_Type{},         false},
+		{oa.Int8_Type{},         false},
+		{oa.Int16_Type{},        false},
+		{oa.Int32_Type{},        false},
+		{oa.Int64_Type{},        false},
+		{oa.UInt8_Type{},        false},
+		{oa.UInt16_Type{},       false},
+		{oa.UInt32_Type{},       false},
+		{oa.UInt64_Type{},       false},
+		{oa.Float32_Type{},      false},
+		{oa.Float64_Type{},      false},
+		{oa.String_Type{},       true},
+		{oa.Binary_Type{},       true},
+		{oa.Large_String_Type{}, true},
+		{oa.Large_Binary_Type{}, true},
+	}
+	testing.expect_value(t, len(cases), 16)
+	for c in cases {
+		testing.expectf(t, oa.type_is_variable_length(c.dt) == c.want, "type_is_variable_length(%v) mismatch", c.dt)
+	}
+}
+
 // ── i32 roundtrip (no nulls) ──────────────────────────────────────────────────
 
 @(test)

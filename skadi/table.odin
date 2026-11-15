@@ -97,8 +97,9 @@ table_column :: proc(t: ^Table, name: string) -> (col: ^Chunked_Array, ok: bool)
 	return &t.columns[idx], true
 }
 
-table_column_at :: proc(t: ^Table, i: int) -> ^Chunked_Array {
-	return &t.columns[i]
+table_column_at :: proc(t: ^Table, i: int) -> (col: ^Chunked_Array, ok: bool) {
+	if t == nil || i < 0 || i >= len(t.columns) { return nil, false }
+	return &t.columns[i], true
 }
 
 // Get element i across all chunks of a ChunkedArray.
