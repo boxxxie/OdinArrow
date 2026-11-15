@@ -3,6 +3,7 @@ package skadi_tests
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import oa "../skadi"
@@ -1052,6 +1053,7 @@ test_csv_ragged_rows_rejected_no_leak :: proc(t: ^testing.T) {
 			_, _, err := c2p.csv_to_parquet_stream(csv_path, pq_path, 64 * 1024 * 1024)
 			_, is_csv_err := err.(c2p.CSV_To_Parquet_Invalid_CSV_Error)
 			testing.expect(t, is_csv_err, "ragged CSV row must return CSV_To_Parquet_Invalid_CSV_Error")
+			testing.expect(t, !os.exists(pq_path), "failed csv_to_parquet_stream must remove partial output file")
 		}
 	}
 }
@@ -1197,4 +1199,293 @@ test_parquet_int64_double_boolean_to_csv :: proc(t: ^testing.T) {
 	out_bytes, r_err := os.read_entire_file(csv_path, context.temp_allocator)
 	testing.expect_value(t, r_err, nil)
 	testing.expect_value(t, string(out_bytes), "id,val,flag\n1000000000000,3.5,true\n-42,-0.25,false\n")
+}
+
+@(test)
+test_parquet_float_dict_nullable_bool_and_precision :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	pq_path  := pq_temp_file("float_dict_bool")
+	csv_path := pq_temp_file("float_dict_bool_out")
+	defer {
+		_ = os.remove(pq_path)
+		_ = os.remove(csv_path)
+	}
+
+	write_page_raw :: proc(buf: ^[dynamic]u8, page_type, enc: i32, payload: []u8, num_vals: i32) -> (off, total: i64) {
+		off = i64(len(buf))
+		hdr := c2p.tw_make()
+		defer c2p.tw_destroy(&hdr)
+		p: i32 = 0
+		c2p.tw_field_i32(&hdr, 1, page_type, &p)
+		c2p.tw_field_i32(&hdr, 2, i32(len(payload)), &p)
+		c2p.tw_field_i32(&hdr, 3, i32(len(payload)), &p)
+		if page_type == p2c.PPAGE_DICT {
+			c2p.tw_field(&hdr, 7, c2p.TW_STRUCT, &p)
+			p2: i32 = 0
+			c2p.tw_field_i32(&hdr, 1, num_vals, &p2)
+			c2p.tw_field_i32(&hdr, 2, enc, &p2)
+			c2p.tw_stop(&hdr)
+		} else {
+			c2p.tw_field(&hdr, 5, c2p.TW_STRUCT, &p)
+			p2: i32 = 0
+			c2p.tw_field_i32(&hdr, 1, num_vals, &p2)
+			c2p.tw_field_i32(&hdr, 2, enc, &p2)
+			c2p.tw_field_i32(&hdr, 3, 3, &p2)
+			c2p.tw_field_i32(&hdr, 4, 3, &p2)
+			c2p.tw_stop(&hdr)
+		}
+		c2p.tw_stop(&hdr)
+		hb := c2p.tw_bytes(&hdr)
+		append(buf, ..hb)
+		append(buf, ..payload)
+		total = i64(len(hb) + len(payload))
+		return
+	}
+
+	buf := make([dynamic]u8, 0, 1024, context.temp_allocator)
+	append(&buf, "PAR1")
+
+	// 10 rows total: test nullable boolean (>8 values), dict i64, dict f32, dict f64 with high precision.
+	N :: 10
+	dict_i64_vals := [2]i64{9_007_199_254_740_993, -77}
+	di64_off, di64_sz := write_page_raw(&buf, p2c.PPAGE_DICT, 0, (cast([^]u8)&dict_i64_vals[0])[:16], 2)
+	// RLE indices for 10 rows: bit_width=1, RLE run of 10 zeros? Wait: alternate 0,1,... bit-packed: 2 groups (16 vals) -> hdr=(2<<1)|1=5, bytes 0b10101010, 0b00000010
+	rle_10_alt := [?]u8{1, 5, 0b10101010, 0b00000010}
+	i64_off, i64_sz := write_page_raw(&buf, p2c.PPAGE_DATA, 8, rle_10_alt[:], N)
+
+	dict_f32_vals := [2]f32{1234567.5, -0.125}
+	df32_off, df32_sz := write_page_raw(&buf, p2c.PPAGE_DICT, 0, (cast([^]u8)&dict_f32_vals[0])[:8], 2)
+	f32_off, f32_sz := write_page_raw(&buf, p2c.PPAGE_DATA, 8, rle_10_alt[:], N)
+
+	dict_f64_vals := [2]f64{1.2345678901234567, -9876543.210987654}
+	df64_off, df64_sz := write_page_raw(&buf, p2c.PPAGE_DICT, 0, (cast([^]u8)&dict_f64_vals[0])[:16], 2)
+	f64_off, f64_sz := write_page_raw(&buf, p2c.PPAGE_DATA, 8, rle_10_alt[:], N)
+
+	// Nullable PTYPE_BOOLEAN (10 rows, 9 valid + 1 null at index 4 -> 2 bytes of bool bits)
+	// def_levels: bit-packed 2 groups: 1,1,1,1,0,1,1,1 (0b11101111 = 0xEF) and 1,1 (0b00000011 = 0x03)
+	// valid bool bits (9 valid): true,false,true,false,true,false,true,false,true -> 0b01010101 (0x55), 0b00000001 (0x01)
+	bool_payload := [?]u8{
+		3, 0, 0, 0,             // def_len = 3
+		5, 0xEF, 0x03,          // RLE bit-packed def levels
+		0x55, 0x01,             // 9 PLAIN boolean bits
+	}
+	b_off, b_sz := write_page_raw(&buf, p2c.PPAGE_DATA, 0, bool_payload[:], N)
+
+	ft := c2p.tw_make()
+	defer c2p.tw_destroy(&ft)
+	{
+		prev: i32 = 0
+		c2p.tw_field_i32(&ft, 1, 2, &prev)
+		c2p.tw_field_list_begin(&ft, 2, c2p.TW_STRUCT, 5, &prev)
+		{
+			pr: i32 = 0
+			c2p.tw_field_string(&ft, 4, "schema", &pr)
+			c2p.tw_field_i32(&ft, 5, 4, &pr)
+			c2p.tw_stop(&ft)
+		}
+		cols := [?]struct {
+			name: string,
+			pt:   i32,
+			rep:  i32,
+		}{
+			{"di64", p2c.PTYPE_INT64, p2c.REP_REQUIRED},
+			{"df32", p2c.PTYPE_FLOAT, p2c.REP_REQUIRED},
+			{"df64", p2c.PTYPE_DOUBLE, p2c.REP_REQUIRED},
+			{"nb", p2c.PTYPE_BOOLEAN, p2c.REP_OPTIONAL},
+		}
+		for cd in cols {
+			pl: i32 = 0
+			c2p.tw_field_i32(&ft, 1, cd.pt, &pl)
+			c2p.tw_field_i32(&ft, 3, cd.rep, &pl)
+			c2p.tw_field_string(&ft, 4, cd.name, &pl)
+			c2p.tw_stop(&ft)
+		}
+		c2p.tw_field_i64(&ft, 3, N, &prev)
+		c2p.tw_field_list_begin(&ft, 4, c2p.TW_STRUCT, 1, &prev)
+		{
+			prg: i32 = 0
+			c2p.tw_field_list_begin(&ft, 1, c2p.TW_STRUCT, 4, &prg)
+			chunks := [?]struct {
+				name:     string,
+				pt:       i32,
+				off, sz:  i64,
+				dict_off: i64,
+				has_dict: bool,
+			}{
+				{"di64", p2c.PTYPE_INT64, i64_off, di64_sz + i64_sz, di64_off, true},
+				{"df32", p2c.PTYPE_FLOAT, f32_off, df32_sz + f32_sz, df32_off, true},
+				{"df64", p2c.PTYPE_DOUBLE, f64_off, df64_sz + f64_sz, df64_off, true},
+				{"nb", p2c.PTYPE_BOOLEAN, b_off, b_sz, 0, false},
+			}
+			total_rg_sz := i64(0)
+			for cc in chunks {
+				total_rg_sz += cc.sz
+				pcc: i32 = 0
+				c2p.tw_field_i64(&ft, 2, cc.off, &pcc)
+				c2p.tw_field(&ft, 3, c2p.TW_STRUCT, &pcc)
+				{
+					pcm: i32 = 0
+					c2p.tw_field_i32(&ft, 1, cc.pt, &pcm)
+					c2p.tw_field_list_begin(&ft, 2, c2p.TW_I32, 1, &pcm)
+					c2p.tw_i32(&ft, 8 if cc.has_dict else 0)
+					c2p.tw_field_list_begin(&ft, 3, c2p.TW_BINARY, 1, &pcm)
+					c2p.tw_varint(&ft, u64(len(cc.name)))
+					append(&ft.buf, ..transmute([]u8)cc.name)
+					c2p.tw_field_i32(&ft, 4, 0, &pcm)
+					c2p.tw_field_i64(&ft, 5, N, &pcm)
+					c2p.tw_field_i64(&ft, 6, cc.sz, &pcm)
+					c2p.tw_field_i64(&ft, 7, cc.sz, &pcm)
+					c2p.tw_field_i64(&ft, 9, cc.off, &pcm)
+					if cc.has_dict {
+						c2p.tw_field_i64(&ft, 11, cc.dict_off, &pcm)
+					}
+					c2p.tw_stop(&ft)
+				}
+				c2p.tw_stop(&ft)
+			}
+			c2p.tw_field_i64(&ft, 2, total_rg_sz, &prg)
+			c2p.tw_field_i64(&ft, 3, N, &prg)
+			c2p.tw_stop(&ft)
+		}
+		c2p.tw_stop(&ft)
+	}
+	ft_bytes := c2p.tw_bytes(&ft)
+	flen := i32(len(ft_bytes))
+	append(&buf, ..ft_bytes)
+	append(&buf, u8(flen), u8(flen >> 8), u8(flen >> 16), u8(flen >> 24))
+	append(&buf, "PAR1")
+	testing.expect_value(t, os.write_entire_file(pq_path, buf[:]), nil)
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer check_no_leaks(t, &track)
+	{
+		old_alloc := context.allocator
+		defer context.allocator = old_alloc
+		context.allocator = mem.tracking_allocator(&track)
+		num_rows, _, conv_err := p2c.parquet_to_csv_stream(pq_path, csv_path, 64 * 1024 * 1024)
+		testing.expect_value(t, conv_err, nil)
+		testing.expect_value(t, num_rows, i64(N))
+	}
+
+	out_bytes, r_err := os.read_entire_file(csv_path, context.temp_allocator)
+	testing.expect_value(t, r_err, nil)
+	out_str := string(out_bytes)
+	// Verify lossless f32/f64 precision and nullable boolean row 4 (null) vs row 5 (true).
+	testing.expect(t, strings.contains(out_str, "9007199254740993,1.2345675e+06,1.2345678901234567,true\n"))
+	testing.expect(t, strings.contains(out_str, "-77,-0.125,-9.876543210987654e+06,false\n"))
+	testing.expect(t, strings.contains(out_str, "9007199254740993,1.2345675e+06,1.2345678901234567,\n"))
+}
+
+@(test)
+test_parquet_unsupported_ptype_and_bad_boolean_dict :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	pq_path  := pq_temp_file("unsup_ptype")
+	csv_path := pq_temp_file("unsup_ptype_out")
+	defer {
+		_ = os.remove(pq_path)
+		_ = os.remove(csv_path)
+	}
+
+	// Unsupported physical type INT96 (3)
+	ft := c2p.tw_make()
+	defer c2p.tw_destroy(&ft)
+	{
+		prev: i32 = 0
+		c2p.tw_field_i32(&ft, 1, 2, &prev)
+		c2p.tw_field_list_begin(&ft, 2, c2p.TW_STRUCT, 2, &prev)
+		{
+			pr: i32 = 0
+			c2p.tw_field_string(&ft, 4, "schema", &pr)
+			c2p.tw_field_i32(&ft, 5, 1, &pr)
+			c2p.tw_stop(&ft)
+		}
+		{
+			pl: i32 = 0
+			c2p.tw_field_i32(&ft, 1, 3, &pl) // INT96
+			c2p.tw_field_i32(&ft, 3, p2c.REP_REQUIRED, &pl)
+			c2p.tw_field_string(&ft, 4, "ts96", &pl)
+			c2p.tw_stop(&ft)
+		}
+		c2p.tw_field_i64(&ft, 3, 1, &prev)
+		c2p.tw_field_list_begin(&ft, 4, c2p.TW_STRUCT, 1, &prev)
+		{
+			prg: i32 = 0
+			c2p.tw_field_list_begin(&ft, 1, c2p.TW_STRUCT, 1, &prg)
+			{
+				pcc: i32 = 0
+				c2p.tw_field_i64(&ft, 2, 4, &pcc)
+				c2p.tw_field(&ft, 3, c2p.TW_STRUCT, &pcc)
+				{
+					pcm: i32 = 0
+					c2p.tw_field_i32(&ft, 1, 3, &pcm)
+					c2p.tw_field_list_begin(&ft, 2, c2p.TW_I32, 1, &pcm)
+					c2p.tw_i32(&ft, 0)
+					c2p.tw_field_list_begin(&ft, 3, c2p.TW_BINARY, 1, &pcm)
+					c2p.tw_varint(&ft, 4)
+					append(&ft.buf, ..transmute([]u8)string("ts96"))
+					c2p.tw_field_i32(&ft, 4, 0, &pcm)
+					c2p.tw_field_i64(&ft, 5, 1, &pcm)
+					c2p.tw_field_i64(&ft, 6, 16, &pcm)
+					c2p.tw_field_i64(&ft, 7, 16, &pcm)
+					c2p.tw_field_i64(&ft, 9, 4, &pcm)
+					c2p.tw_stop(&ft)
+				}
+				c2p.tw_stop(&ft)
+			}
+			c2p.tw_field_i64(&ft, 2, 16, &prg)
+			c2p.tw_field_i64(&ft, 3, 1, &prg)
+			c2p.tw_stop(&ft)
+		}
+		c2p.tw_stop(&ft)
+	}
+	ft_bytes := c2p.tw_bytes(&ft)
+	flen := i32(len(ft_bytes))
+	buf := make([dynamic]u8, 0, 128, context.temp_allocator)
+	append(&buf, "PAR1")
+	append(&buf, ..ft_bytes)
+	append(&buf, u8(flen), u8(flen >> 8), u8(flen >> 16), u8(flen >> 24))
+	append(&buf, "PAR1")
+	testing.expect_value(t, os.write_entire_file(pq_path, buf[:]), nil)
+
+	_, _, err := p2c.parquet_to_csv_stream(pq_path, csv_path, 64 * 1024 * 1024)
+	u_err, is_unsup := err.(p2c.Parquet_To_CSV_Unsupported_Column_Error)
+	testing.expect(t, is_unsup, "INT96 must return Parquet_To_CSV_Unsupported_Column_Error")
+	if is_unsup {
+		testing.expect_value(t, u_err.ptype, i32(3))
+		testing.expect_value(t, string(u_err.name_buf[:u_err.name_len]), "ts96")
+	}
+
+	// Reject PTYPE_BOOLEAN dictionary page in _col_stream_load_dict
+	dict_pq := pq_temp_file("bool_dict_bad")
+	defer _ = os.remove(dict_pq)
+	hdr := c2p.tw_make()
+	defer c2p.tw_destroy(&hdr)
+	p: i32 = 0
+	c2p.tw_field_i32(&hdr, 1, p2c.PPAGE_DICT, &p)
+	c2p.tw_field_i32(&hdr, 2, 4, &p)
+	c2p.tw_field_i32(&hdr, 3, 4, &p)
+	c2p.tw_field(&hdr, 7, c2p.TW_STRUCT, &p)
+	{
+		p2: i32 = 0
+		c2p.tw_field_i32(&hdr, 1, 1, &p2)
+		c2p.tw_field_i32(&hdr, 2, 0, &p2)
+		c2p.tw_stop(&hdr)
+	}
+	c2p.tw_stop(&hdr)
+	dblob := make([dynamic]u8, 0, 64, context.temp_allocator)
+	append(&dblob, "PAR1")
+	append(&dblob, ..c2p.tw_bytes(&hdr))
+	append(&dblob, 0, 0, 0, 0)
+	testing.expect_value(t, os.write_entire_file(dict_pq, dblob[:]), nil)
+
+	bmeta := p2c.Column_Chunk_Meta{
+		ptype       = p2c.PTYPE_BOOLEAN,
+		num_values  = 1,
+		data_offset = 4,
+		dict_offset = 4,
+		has_dict    = true,
+	}
+	_, bok := p2c.col_stream_init(dict_pq, bmeta)
+	testing.expect(t, !bok, "PTYPE_BOOLEAN dictionary page must be rejected")
 }
