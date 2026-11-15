@@ -2,6 +2,7 @@
 // Supports multiple row groups for memory-bounded streaming writes.
 package csv_to_parquet
 
+import "core:io"
 import "core:os"
 import oa "../../skadi"
 
@@ -30,11 +31,65 @@ RG_Meta :: struct {
 }
 
 Parquet_Writer :: struct {
-	file:      ^os.File,
-	offset:    i64, // bytes written so far
-	n_cols:    int,
-	col_names: []string,
-	row_groups: [dynamic]RG_Meta,
+	file:          ^os.File,
+	offset:        i64, // bytes written so far
+	n_cols:        int,
+	col_names:     []string,
+	row_groups:    [dynamic]RG_Meta,
+	wbuf:          []u8,
+	wbuf_pos:      int,
+	write_err:     os.Error,
+	page_overflow: bool,
+}
+
+pw_flush :: proc(pw: ^Parquet_Writer) {
+	if pw.wbuf_pos == 0 || pw.write_err != nil {
+		pw.wbuf_pos = 0
+		return
+	}
+	written := 0
+	for written < pw.wbuf_pos {
+		n, err := os.write(pw.file, pw.wbuf[written:pw.wbuf_pos])
+		if err != nil {
+			pw.write_err = err
+			break
+		}
+		if n <= 0 {
+			pw.write_err = io.Error.Short_Write
+			break
+		}
+		written += n
+	}
+	pw.wbuf_pos = 0
+}
+
+pw_write_bytes :: proc(pw: ^Parquet_Writer, data: []u8) {
+	if len(data) == 0 || pw.write_err != nil { return }
+	src := data
+	for len(src) > 0 {
+		if len(pw.wbuf) == 0 {
+			n, err := os.write(pw.file, src)
+			if err != nil {
+				pw.write_err = err
+				return
+			}
+			if n <= 0 {
+				pw.write_err = io.Error.Short_Write
+				return
+			}
+			src = src[n:]
+			continue
+		}
+		avail := len(pw.wbuf) - pw.wbuf_pos
+		n := min(avail, len(src))
+		copy(pw.wbuf[pw.wbuf_pos:], src[:n])
+		pw.wbuf_pos += n
+		src = src[n:]
+		if pw.wbuf_pos == len(pw.wbuf) {
+			pw_flush(pw)
+			if pw.write_err != nil { return }
+		}
+	}
 }
 
 // pw_open writes the PAR1 magic and returns a writer ready for row groups.
@@ -43,9 +98,10 @@ pw_open :: proc(file: ^os.File, col_names: []string) -> Parquet_Writer {
 	pw.file      = file
 	pw.n_cols    = len(col_names)
 	pw.col_names = col_names
+	pw.wbuf      = make([]u8, 65536)
 
-	n, _ := os.write(file, transmute([]u8)string("PAR1"))
-	pw.offset = i64(n)
+	pw_write_bytes(&pw, transmute([]u8)string("PAR1"))
+	pw.offset = 4
 	return pw
 }
 
@@ -57,6 +113,7 @@ pw_write_row_group :: proc(pw: ^Parquet_Writer, cols: []oa.Array) {
 
 	for ci in 0..<pw.n_cols {
 		rg.cols[ci] = pw_write_column(pw, &cols[ci])
+		if pw.page_overflow || pw.write_err != nil { break }
 	}
 
 	append(&pw.row_groups, rg)
@@ -74,15 +131,27 @@ pw_write_column :: proc(pw: ^Parquet_Writer, arr: ^oa.Array) -> Col_Write_Meta {
 	for i in 0..<arr.length {
 		s := oa.array_get_string(arr, i)
 		n := len(s)
+		if n > int(max(i32)) {
+			pw.page_overflow = true
+			return meta
+		}
 		b4: [4]u8
 		b4[0] = u8(n);       b4[1] = u8(n >> 8)
 		b4[2] = u8(n >> 16); b4[3] = u8(n >> 24)
 		append(&val_buf, ..b4[:])
 		append(&val_buf, ..transmute([]u8)s)
+		if len(val_buf) > int(max(i32)) {
+			pw.page_overflow = true
+			return meta
+		}
 	}
 
 	comp_size := len(val_buf)
 	num_vals  := arr.length
+	if comp_size > int(max(i32)) || num_vals > int(max(i32)) {
+		pw.page_overflow = true
+		return meta
+	}
 
 	// Build DataPageHeader using Thrift compact encoding
 	hdr_tw := tw_make()
@@ -109,8 +178,8 @@ pw_write_column :: proc(pw: ^Parquet_Writer, arr: ^oa.Array) -> Col_Write_Meta {
 	hdr_bytes := tw_bytes(&hdr_tw)
 	total     := i64(len(hdr_bytes)) + i64(comp_size)
 
-	os.write(pw.file, hdr_bytes)
-	os.write(pw.file, val_buf[:])
+	pw_write_bytes(pw, hdr_bytes)
+	pw_write_bytes(pw, val_buf[:])
 	pw.offset += total
 
 	meta.uncomp_size = total
@@ -203,7 +272,7 @@ pw_finish :: proc(pw: ^Parquet_Writer) {
 	footer_bytes := tw_bytes(&footer_tw)
 	footer_len   := i32(len(footer_bytes))
 
-	os.write(pw.file, footer_bytes)
+	pw_write_bytes(pw, footer_bytes)
 
 	// Footer length (i32 LE) + trailing PAR1 magic
 	len_buf: [4]u8
@@ -211,11 +280,13 @@ pw_finish :: proc(pw: ^Parquet_Writer) {
 	len_buf[1] = u8(footer_len >> 8)
 	len_buf[2] = u8(footer_len >> 16)
 	len_buf[3] = u8(footer_len >> 24)
-	os.write(pw.file, len_buf[:])
-	os.write(pw.file, transmute([]u8)string("PAR1"))
+	pw_write_bytes(pw, len_buf[:])
+	pw_write_bytes(pw, transmute([]u8)string("PAR1"))
+	pw_flush(pw)
 }
 
 pw_destroy :: proc(pw: ^Parquet_Writer) {
+	delete(pw.wbuf)
 	for rg in pw.row_groups { delete(rg.cols) }
 	delete(pw.row_groups)
 }

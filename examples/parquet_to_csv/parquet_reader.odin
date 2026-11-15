@@ -1,5 +1,6 @@
 package parquet_to_csv
 
+import "base:intrinsics"
 import "core:os"
 import oa "../../skadi"
 
@@ -47,6 +48,27 @@ Page_Header :: struct {
 
 read_i32_le :: #force_inline proc "contextless" (data: []u8, pos: int) -> i32 {
 	return i32(data[pos]) | i32(data[pos+1])<<8 | i32(data[pos+2])<<16 | i32(data[pos+3])<<24
+}
+
+read_u32_le :: #force_inline proc "contextless" (data: []u8, pos: int) -> u32 {
+	return u32(data[pos]) | u32(data[pos+1])<<8 | u32(data[pos+2])<<16 | u32(data[pos+3])<<24
+}
+
+read_u64_le :: #force_inline proc "contextless" (data: []u8, pos: int) -> u64 {
+	return u64(data[pos])       | u64(data[pos+1])<<8  | u64(data[pos+2])<<16 | u64(data[pos+3])<<24 |
+	       u64(data[pos+4])<<32 | u64(data[pos+5])<<40 | u64(data[pos+6])<<48 | u64(data[pos+7])<<56
+}
+
+read_i64_le :: #force_inline proc "contextless" (data: []u8, pos: int) -> i64 {
+	return i64(read_u64_le(data, pos))
+}
+
+read_f32_le :: #force_inline proc "contextless" (data: []u8, pos: int) -> f32 {
+	return transmute(f32)read_u32_le(data, pos)
+}
+
+read_f64_le :: #force_inline proc "contextless" (data: []u8, pos: int) -> f64 {
+	return transmute(f64)read_u64_le(data, pos)
 }
 
 // ── footer parsing ────────────────────────────────────────────────────────────
@@ -358,6 +380,68 @@ decode_rle_into :: proc(data: []u8, bit_width: int, num_values: int, out: []int)
 			groups := int(hdr >> 1)
 			if groups <= 0 { break }
 			run_start := pos
+			when ODIN_ENDIAN == .Little {
+				if bit_width >= 1 && bit_width <= 8 {
+					for g in 0..<groups {
+						if idx >= num_values { break }
+						g_byte := run_start + g * bit_width
+						if idx + 8 <= num_values && g_byte + 8 <= len(data) {
+							w := intrinsics.unaligned_load((^u64)(&data[g_byte]))
+							for k in 0..<8 {
+								out[idx + k] = int((w >> uint(k * bit_width)) & mask)
+							}
+							idx += 8
+						} else {
+							for v_i in 0..<8 {
+								if idx >= num_values { break }
+								bit_pos := (g * 8 + v_i) * bit_width
+								byte_off := run_start + bit_pos / 8
+								bit_off  := uint(bit_pos % 8)
+								accum: u64 = 0
+								for b_i in 0..<8 {
+									if byte_off + b_i < len(data) {
+										accum |= u64(data[byte_off + b_i]) << uint(b_i * 8)
+									}
+								}
+								out[idx] = int((accum >> bit_off) & mask)
+								idx += 1
+							}
+						}
+					}
+					pos += groups * bit_width
+					continue
+				} else if bit_width >= 9 && bit_width <= 16 {
+					mask128 := u128(mask)
+					for g in 0..<groups {
+						if idx >= num_values { break }
+						g_byte := run_start + g * bit_width
+						if idx + 8 <= num_values && g_byte + 16 <= len(data) {
+							w := intrinsics.unaligned_load((^u128)(&data[g_byte]))
+							for k in 0..<8 {
+								out[idx + k] = int((w >> uint(k * bit_width)) & mask128)
+							}
+							idx += 8
+						} else {
+							for v_i in 0..<8 {
+								if idx >= num_values { break }
+								bit_pos := (g * 8 + v_i) * bit_width
+								byte_off := run_start + bit_pos / 8
+								bit_off  := uint(bit_pos % 8)
+								accum: u64 = 0
+								for b_i in 0..<8 {
+									if byte_off + b_i < len(data) {
+										accum |= u64(data[byte_off + b_i]) << uint(b_i * 8)
+									}
+								}
+								out[idx] = int((accum >> bit_off) & mask)
+								idx += 1
+							}
+						}
+					}
+					pos += groups * bit_width
+					continue
+				}
+			}
 			total_vals := groups * 8
 			for v_i in 0..<total_vals {
 				if idx >= num_values { break }
@@ -428,11 +512,14 @@ skip_def_levels :: proc "contextless" (data: []u8, pos: ^int, max_def_level: i32
 
 // ── Col_Stream: streaming page-by-page column reader ─────────────────────────
 //
-// Each Col_Stream owns its own file descriptor so concurrent column reads
-// don't interfere via shared file-pointer state.
+// `col_stream_init` opens an independent file descriptor for each Col_Stream so
+// concurrent column reads don't interfere via shared file-pointer state.
+// `col_stream_init_shared` shares a caller-owned `^os.File` handle and requires
+// sequential column reads.
 
 Col_Stream :: struct {
 	file:                  ^os.File,
+	owns_file:             bool,
 	file_size:             i64,
 	ptype:                 i32,
 	codec:                 i32,
@@ -452,6 +539,9 @@ Col_Stream :: struct {
 	// Dictionary (reloaded per row group if PPAGE_DICT encountered)
 	dict_strs:             []string,   // for string dict (zero-copy from dict_buf)
 	dict_i32s:             []i32,      // for INT32 dict
+	dict_i64s:             []i64,      // for INT64 dict
+	dict_f32s:             []f32,      // for FLOAT dict
+	dict_f64s:             []f64,      // for DOUBLE dict
 	dict_buf:              []u8,       // backing storage for dict string bytes
 	// Definition levels for nullable columns (max_def > 0)
 	def_buf:               []int,      // 1 = valid, 0 = null
@@ -463,6 +553,7 @@ Col_Stream :: struct {
 	page_rows_left:        int,
 	plain_data:            []u8,       // view into page_buf (PLAIN values)
 	plain_pos:             int,
+	plain_bit_pos:         int,        // bit cursor for PLAIN BOOLEAN pages
 	rle_idx_buf:           []int,      // decoded indices for current dict page
 	rle_idx_pos:           int,
 }
@@ -470,14 +561,21 @@ Col_Stream :: struct {
 _col_stream_load_dict :: proc(cs: ^Col_Stream, ph: Page_Header, probe: []u8, hdr_pos: int, page_start_off: i64) -> bool {
 	delete(cs.dict_buf)
 	delete(cs.dict_i32s)
+	delete(cs.dict_i64s)
+	delete(cs.dict_f32s)
+	delete(cs.dict_f64s)
 	delete(cs.dict_strs)
-	cs.dict_buf = nil
+	cs.dict_buf  = nil
 	cs.dict_i32s = nil
+	cs.dict_i64s = nil
+	cs.dict_f32s = nil
+	cs.dict_f64s = nil
 	cs.dict_strs = nil
 
 	dict_data_size := int(ph.comp)
 	n_vals := int(ph.num_values)
-	if cs.codec != 0 || ph.comp != ph.uncomp || dict_data_size < 0 || n_vals < 0 || n_vals > dict_data_size / 4 {
+	elem_min_bytes := 8 if (cs.ptype == PTYPE_INT64 || cs.ptype == PTYPE_DOUBLE) else 4
+	if cs.codec != 0 || ph.comp != ph.uncomp || dict_data_size < 0 || n_vals < 0 || n_vals > dict_data_size / elem_min_bytes {
 		return false
 	}
 	if page_start_off < 0 || hdr_pos < 0 {
@@ -509,18 +607,28 @@ _col_stream_load_dict :: proc(cs: ^Col_Stream, ph: Page_Header, probe: []u8, hdr
 		}
 	}
 
-	if cs.ptype == PTYPE_INT32 {
-		if n_vals > len(cs.dict_buf) / 4 {
-			return false
-		}
+	switch cs.ptype {
+	case PTYPE_INT32:
 		cs.dict_i32s = make([]i32, n_vals)
 		for i in 0 ..< n_vals {
-			cs.dict_i32s[i] = read_i32_le(cs.dict_buf, i*4)
+			cs.dict_i32s[i] = read_i32_le(cs.dict_buf, i * 4)
 		}
-	} else {
-		if n_vals > len(cs.dict_buf) / 4 {
-			return false
+	case PTYPE_INT64:
+		cs.dict_i64s = make([]i64, n_vals)
+		for i in 0 ..< n_vals {
+			cs.dict_i64s[i] = read_i64_le(cs.dict_buf, i * 8)
 		}
+	case PTYPE_FLOAT:
+		cs.dict_f32s = make([]f32, n_vals)
+		for i in 0 ..< n_vals {
+			cs.dict_f32s[i] = read_f32_le(cs.dict_buf, i * 4)
+		}
+	case PTYPE_DOUBLE:
+		cs.dict_f64s = make([]f64, n_vals)
+		for i in 0 ..< n_vals {
+			cs.dict_f64s[i] = read_f64_le(cs.dict_buf, i * 8)
+		}
+	case:
 		cs.dict_strs = make([]string, n_vals)
 		pos := 0
 		for i in 0 ..< n_vals {
@@ -540,20 +648,15 @@ _col_stream_load_dict :: proc(cs: ^Col_Stream, ph: Page_Header, probe: []u8, hdr
 	return true
 }
 
-col_stream_init :: proc(path: string, meta: Column_Chunk_Meta) -> (cs: Col_Stream, ok: bool) {
-	f, err := os.open(path)
-	if err != nil { return }
-	fsz, sz_err := os.file_size(f)
-	if sz_err != nil || fsz < 0 {
-		os.close(f)
-		return
-	}
-	if meta.num_values < 0 || meta.codec != 0 {
-		os.close(f)
+@(private="file")
+_col_stream_init_common :: proc(f: ^os.File, fsz: i64, owns_file: bool, meta: Column_Chunk_Meta) -> (cs: Col_Stream, ok: bool) {
+	if fsz < 0 || meta.num_values < 0 || meta.codec != 0 {
+		if owns_file && f != nil { os.close(f) }
 		return
 	}
 
 	cs.file         = f
+	cs.owns_file    = owns_file
 	cs.file_size    = fsz
 	cs.ptype        = meta.ptype
 	cs.codec        = meta.codec
@@ -565,7 +668,7 @@ col_stream_init :: proc(path: string, meta: Column_Chunk_Meta) -> (cs: Col_Strea
 	total := meta.num_values
 	for v in meta.extra_rg_num_values {
 		if v < 0 || v > max(i64) - total {
-			os.close(f)
+			if owns_file && f != nil { os.close(f) }
 			cs = {}
 			return
 		}
@@ -620,12 +723,31 @@ col_stream_init :: proc(path: string, meta: Column_Chunk_Meta) -> (cs: Col_Strea
 	return
 }
 
+col_stream_init :: proc(path: string, meta: Column_Chunk_Meta) -> (cs: Col_Stream, ok: bool) {
+	f, err := os.open(path)
+	if err != nil { return }
+	fsz, sz_err := os.file_size(f)
+	if sz_err != nil || fsz < 0 {
+		os.close(f)
+		return
+	}
+	return _col_stream_init_common(f, fsz, true, meta)
+}
+
+col_stream_init_shared :: proc(f: ^os.File, file_size: i64, meta: Column_Chunk_Meta) -> (cs: Col_Stream, ok: bool) {
+	if f == nil { return }
+	return _col_stream_init_common(f, file_size, false, meta)
+}
+
 col_stream_destroy :: proc(cs: ^Col_Stream) {
-	if cs.file != nil { os.close(cs.file) }
+	if cs.owns_file && cs.file != nil { os.close(cs.file) }
 	delete(cs.page_buf)
 	delete(cs.rle_idx_buf)
 	delete(cs.dict_strs)
 	delete(cs.dict_i32s)
+	delete(cs.dict_i64s)
+	delete(cs.dict_f32s)
+	delete(cs.dict_f64s)
 	delete(cs.dict_buf)
 	delete(cs.def_buf)
 	delete(cs.extra_rg_offsets)
@@ -778,11 +900,23 @@ col_stream_load_page :: proc(cs: ^Col_Stream) -> bool {
 		}
 		cs.rle_idx_pos = 0
 	} else {
-		if valid_count > (len(data) - pos) / 4 {
-			return false
+		rem := len(data) - pos
+		if cs.ptype == PTYPE_BOOLEAN {
+			if valid_count > rem * 8 {
+				return false
+			}
+		} else if cs.ptype == PTYPE_INT64 || cs.ptype == PTYPE_DOUBLE {
+			if valid_count > rem / 8 {
+				return false
+			}
+		} else {
+			if valid_count > rem / 4 {
+				return false
+			}
 		}
-		cs.plain_data = data[pos:]
-		cs.plain_pos  = 0
+		cs.plain_data    = data[pos:]
+		cs.plain_pos     = 0
+		cs.plain_bit_pos = 0
 	}
 	cs.page_rows_left = n
 	return true
@@ -817,8 +951,10 @@ col_stream_to_string_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 				oa.string_builder_append_null(&b)
 			}
 		} else {
+			if cs.plain_pos + 4 > len(cs.plain_data) { break }
 			slen := int(read_i32_le(cs.plain_data, cs.plain_pos))
 			cs.plain_pos += 4
+			if slen < 0 || cs.plain_pos + slen > len(cs.plain_data) { break }
 			oa.string_builder_append(&b, string(cs.plain_data[cs.plain_pos : cs.plain_pos + slen]))
 			cs.plain_pos += slen
 		}
@@ -863,6 +999,164 @@ col_stream_to_i32_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 			if cs.plain_pos + 4 > len(cs.plain_data) { break }
 			oa.builder_append(&b, read_i32_le(cs.plain_data, cs.plain_pos))
 			cs.plain_pos += 4
+		}
+		cs.page_rows_left -= 1
+		cs.rows_done      += 1
+		cs.rg_rows_done   += 1
+		count += 1
+	}
+	arr, _ := oa.builder_finish(&b)
+	return arr
+}
+
+// col_stream_to_i64_array reads up to n INT64 values into an OdinArrow Array.
+col_stream_to_i64_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
+	b := oa.builder_make(i64, n)
+	defer oa.builder_destroy(&b)
+	count := 0
+	for count < n && cs.rows_done < cs.total_rows {
+		if cs.page_rows_left == 0 {
+			if !col_stream_load_page(cs) { break }
+		}
+		is_null := false
+		if cs.max_def > 0 {
+			if cs.def_buf[cs.def_pos] < int(cs.max_def) {
+				is_null = true
+			}
+			cs.def_pos += 1
+		}
+
+		if is_null {
+			oa.builder_append_null(&b)
+		} else if cs.page_is_dict {
+			idx := cs.rle_idx_buf[cs.rle_idx_pos]
+			cs.rle_idx_pos += 1
+			if idx >= 0 && idx < len(cs.dict_i64s) {
+				oa.builder_append(&b, cs.dict_i64s[idx])
+			} else {
+				oa.builder_append_null(&b)
+			}
+		} else {
+			if cs.plain_pos + 8 > len(cs.plain_data) { break }
+			oa.builder_append(&b, read_i64_le(cs.plain_data, cs.plain_pos))
+			cs.plain_pos += 8
+		}
+		cs.page_rows_left -= 1
+		cs.rows_done      += 1
+		cs.rg_rows_done   += 1
+		count += 1
+	}
+	arr, _ := oa.builder_finish(&b)
+	return arr
+}
+
+// col_stream_to_f32_array reads up to n FLOAT values into an OdinArrow Array.
+col_stream_to_f32_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
+	b := oa.builder_make(f32, n)
+	defer oa.builder_destroy(&b)
+	count := 0
+	for count < n && cs.rows_done < cs.total_rows {
+		if cs.page_rows_left == 0 {
+			if !col_stream_load_page(cs) { break }
+		}
+		is_null := false
+		if cs.max_def > 0 {
+			if cs.def_buf[cs.def_pos] < int(cs.max_def) {
+				is_null = true
+			}
+			cs.def_pos += 1
+		}
+
+		if is_null {
+			oa.builder_append_null(&b)
+		} else if cs.page_is_dict {
+			idx := cs.rle_idx_buf[cs.rle_idx_pos]
+			cs.rle_idx_pos += 1
+			if idx >= 0 && idx < len(cs.dict_f32s) {
+				oa.builder_append(&b, cs.dict_f32s[idx])
+			} else {
+				oa.builder_append_null(&b)
+			}
+		} else {
+			if cs.plain_pos + 4 > len(cs.plain_data) { break }
+			oa.builder_append(&b, read_f32_le(cs.plain_data, cs.plain_pos))
+			cs.plain_pos += 4
+		}
+		cs.page_rows_left -= 1
+		cs.rows_done      += 1
+		cs.rg_rows_done   += 1
+		count += 1
+	}
+	arr, _ := oa.builder_finish(&b)
+	return arr
+}
+
+// col_stream_to_f64_array reads up to n DOUBLE values into an OdinArrow Array.
+col_stream_to_f64_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
+	b := oa.builder_make(f64, n)
+	defer oa.builder_destroy(&b)
+	count := 0
+	for count < n && cs.rows_done < cs.total_rows {
+		if cs.page_rows_left == 0 {
+			if !col_stream_load_page(cs) { break }
+		}
+		is_null := false
+		if cs.max_def > 0 {
+			if cs.def_buf[cs.def_pos] < int(cs.max_def) {
+				is_null = true
+			}
+			cs.def_pos += 1
+		}
+
+		if is_null {
+			oa.builder_append_null(&b)
+		} else if cs.page_is_dict {
+			idx := cs.rle_idx_buf[cs.rle_idx_pos]
+			cs.rle_idx_pos += 1
+			if idx >= 0 && idx < len(cs.dict_f64s) {
+				oa.builder_append(&b, cs.dict_f64s[idx])
+			} else {
+				oa.builder_append_null(&b)
+			}
+		} else {
+			if cs.plain_pos + 8 > len(cs.plain_data) { break }
+			oa.builder_append(&b, read_f64_le(cs.plain_data, cs.plain_pos))
+			cs.plain_pos += 8
+		}
+		cs.page_rows_left -= 1
+		cs.rows_done      += 1
+		cs.rg_rows_done   += 1
+		count += 1
+	}
+	arr, _ := oa.builder_finish(&b)
+	return arr
+}
+
+// col_stream_to_bool_array reads up to n PLAIN bit-packed BOOLEAN values into an OdinArrow Array.
+col_stream_to_bool_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
+	b := oa.builder_make(bool, n)
+	defer oa.builder_destroy(&b)
+	count := 0
+	for count < n && cs.rows_done < cs.total_rows {
+		if cs.page_rows_left == 0 {
+			if !col_stream_load_page(cs) { break }
+		}
+		is_null := false
+		if cs.max_def > 0 {
+			if cs.def_buf[cs.def_pos] < int(cs.max_def) {
+				is_null = true
+			}
+			cs.def_pos += 1
+		}
+
+		if is_null {
+			oa.builder_append_null(&b)
+		} else {
+			byte_i := cs.plain_pos + (cs.plain_bit_pos >> 3)
+			if byte_i >= len(cs.plain_data) { break }
+			bit := ((cs.plain_data[byte_i] >> uint(cs.plain_bit_pos & 7)) & 1) != 0
+			cs.plain_bit_pos += 1
+			oa.builder_append(&b, bit)
 		}
 		cs.page_rows_left -= 1
 		cs.rows_done      += 1

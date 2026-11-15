@@ -1028,3 +1028,173 @@ test_cli_csv_to_parquet_and_parquet_to_csv_flags_and_errors :: proc(t: ^testing.
 		testing.expectf(t, st_bad.exit_code != 0, "expected non-zero exit for %v, got %d", cmd, st_bad.exit_code)
 	}
 }
+
+@(test)
+test_csv_ragged_rows_rejected_no_leak :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	for case_idx in 0..<2 {
+		csv_path := pq_temp_file("ragged_short" if case_idx == 0 else "ragged_long")
+		pq_path  := pq_temp_file("ragged_short_out" if case_idx == 0 else "ragged_long_out")
+		defer {
+			_ = os.remove(csv_path)
+			_ = os.remove(pq_path)
+		}
+		content := "a,b,c\n1,2,3\n4,5\n" if case_idx == 0 else "a,b\n1,2\n3,4,5\n"
+		testing.expect_value(t, os.write_entire_file(csv_path, transmute([]u8)content), nil)
+
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer check_no_leaks(t, &track)
+		{
+			old_alloc := context.allocator
+			defer context.allocator = old_alloc
+			context.allocator = mem.tracking_allocator(&track)
+			_, _, err := c2p.csv_to_parquet_stream(csv_path, pq_path, 64 * 1024 * 1024)
+			_, is_csv_err := err.(c2p.CSV_To_Parquet_Invalid_CSV_Error)
+			testing.expect(t, is_csv_err, "ragged CSV row must return CSV_To_Parquet_Invalid_CSV_Error")
+		}
+	}
+}
+
+@(test)
+test_parquet_int64_double_boolean_to_csv :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	pq_path  := pq_temp_file("multi_types")
+	csv_path := pq_temp_file("multi_types_out")
+	defer {
+		_ = os.remove(pq_path)
+		_ = os.remove(csv_path)
+	}
+
+	write_plain_page :: proc(buf: ^[dynamic]u8, payload: []u8, num_vals: i32) -> (off, total: i64) {
+		off = i64(len(buf))
+		hdr := c2p.tw_make()
+		defer c2p.tw_destroy(&hdr)
+		p: i32 = 0
+		c2p.tw_field_i32(&hdr, 1, p2c.PPAGE_DATA, &p)
+		c2p.tw_field_i32(&hdr, 2, i32(len(payload)), &p)
+		c2p.tw_field_i32(&hdr, 3, i32(len(payload)), &p)
+		c2p.tw_field(&hdr, 5, c2p.TW_STRUCT, &p)
+		{
+			p2: i32 = 0
+			c2p.tw_field_i32(&hdr, 1, num_vals, &p2)
+			c2p.tw_field_i32(&hdr, 2, 0, &p2) // PLAIN
+			c2p.tw_field_i32(&hdr, 3, 3, &p2)
+			c2p.tw_field_i32(&hdr, 4, 3, &p2)
+			c2p.tw_stop(&hdr)
+		}
+		c2p.tw_stop(&hdr)
+		hb := c2p.tw_bytes(&hdr)
+		append(buf, ..hb)
+		append(buf, ..payload)
+		total = i64(len(hb) + len(payload))
+		return
+	}
+
+	buf := make([dynamic]u8, 0, 512, context.temp_allocator)
+	append(&buf, "PAR1")
+
+	v_i64 := [2]i64{1_000_000_000_000, -42}
+	i64_off, i64_sz := write_plain_page(&buf, (cast([^]u8)&v_i64[0])[:16], 2)
+
+	v_f64 := [2]f64{3.5, -0.25}
+	f64_off, f64_sz := write_plain_page(&buf, (cast([^]u8)&v_f64[0])[:16], 2)
+
+	v_bool := [1]u8{0b01} // [true, false]
+	b_off, b_sz := write_plain_page(&buf, v_bool[:], 2)
+
+	ft := c2p.tw_make()
+	defer c2p.tw_destroy(&ft)
+	{
+		prev: i32 = 0
+		c2p.tw_field_i32(&ft, 1, 2, &prev)
+		c2p.tw_field_list_begin(&ft, 2, c2p.TW_STRUCT, 4, &prev)
+		{
+			pr: i32 = 0
+			c2p.tw_field_string(&ft, 4, "schema", &pr)
+			c2p.tw_field_i32(&ft, 5, 3, &pr)
+			c2p.tw_stop(&ft)
+		}
+		col_defs := [?]struct {
+			name: string,
+			pt:   i32,
+		}{
+			{"id", p2c.PTYPE_INT64},
+			{"val", p2c.PTYPE_DOUBLE},
+			{"flag", p2c.PTYPE_BOOLEAN},
+		}
+		for cd in col_defs {
+			pl: i32 = 0
+			c2p.tw_field_i32(&ft, 1, cd.pt, &pl)
+			c2p.tw_field_i32(&ft, 3, p2c.REP_REQUIRED, &pl)
+			c2p.tw_field_string(&ft, 4, cd.name, &pl)
+			c2p.tw_stop(&ft)
+		}
+		c2p.tw_field_i64(&ft, 3, 2, &prev)
+		c2p.tw_field_list_begin(&ft, 4, c2p.TW_STRUCT, 1, &prev)
+		{
+			prg: i32 = 0
+			c2p.tw_field_list_begin(&ft, 1, c2p.TW_STRUCT, 3, &prg)
+			col_chunks := [?]struct {
+				name: string,
+				pt:   i32,
+				off:  i64,
+				sz:   i64,
+			}{
+				{"id", p2c.PTYPE_INT64, i64_off, i64_sz},
+				{"val", p2c.PTYPE_DOUBLE, f64_off, f64_sz},
+				{"flag", p2c.PTYPE_BOOLEAN, b_off, b_sz},
+			}
+			for cc in col_chunks {
+				pcc: i32 = 0
+				c2p.tw_field_i64(&ft, 2, cc.off, &pcc)
+				c2p.tw_field(&ft, 3, c2p.TW_STRUCT, &pcc)
+				{
+					pcm: i32 = 0
+					c2p.tw_field_i32(&ft, 1, cc.pt, &pcm)
+					c2p.tw_field_list_begin(&ft, 2, c2p.TW_I32, 1, &pcm)
+					c2p.tw_i32(&ft, 0)
+					c2p.tw_field_list_begin(&ft, 3, c2p.TW_BINARY, 1, &pcm)
+					c2p.tw_varint(&ft, u64(len(cc.name)))
+					append(&ft.buf, ..transmute([]u8)cc.name)
+					c2p.tw_field_i32(&ft, 4, 0, &pcm)
+					c2p.tw_field_i64(&ft, 5, 2, &pcm)
+					c2p.tw_field_i64(&ft, 6, cc.sz, &pcm)
+					c2p.tw_field_i64(&ft, 7, cc.sz, &pcm)
+					c2p.tw_field_i64(&ft, 9, cc.off, &pcm)
+					c2p.tw_stop(&ft)
+				}
+				c2p.tw_stop(&ft)
+			}
+			c2p.tw_field_i64(&ft, 2, i64_sz + f64_sz + b_sz, &prg)
+			c2p.tw_field_i64(&ft, 3, 2, &prg)
+			c2p.tw_stop(&ft)
+		}
+		c2p.tw_stop(&ft)
+	}
+	ft_bytes := c2p.tw_bytes(&ft)
+	flen := i32(len(ft_bytes))
+	footer_start := len(buf)
+	append(&buf, ..ft_bytes)
+	append(&buf, u8(flen), u8(flen >> 8), u8(flen >> 16), u8(flen >> 24))
+	append(&buf, "PAR1")
+	_ = footer_start
+
+	testing.expect_value(t, os.write_entire_file(pq_path, buf[:]), nil)
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer check_no_leaks(t, &track)
+	{
+		old_alloc := context.allocator
+		defer context.allocator = old_alloc
+		context.allocator = mem.tracking_allocator(&track)
+		num_rows, _, conv_err := p2c.parquet_to_csv_stream(pq_path, csv_path, 64 * 1024 * 1024)
+		testing.expect_value(t, conv_err, nil)
+		testing.expect_value(t, num_rows, i64(2))
+	}
+
+	out_bytes, r_err := os.read_entire_file(csv_path, context.temp_allocator)
+	testing.expect_value(t, r_err, nil)
+	testing.expect_value(t, string(out_bytes), "id,val,flag\n1000000000000,3.5,true\n-42,-0.25,false\n")
+}
