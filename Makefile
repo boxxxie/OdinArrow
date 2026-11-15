@@ -49,6 +49,8 @@ lib:
 
 check:
 	odin check $(SRC) -no-entry-point $(CHECK_FLAGS)
+	odin check $(SRC)/pipeline -no-entry-point $(CHECK_FLAGS)
+	odin check deps/sleipnir/actor -no-entry-point $(CHECK_FLAGS)
 	odin check $(TESTS) -no-entry-point $(CHECK_FLAGS)
 	odin check $(SPECS) -no-entry-point $(CHECK_FLAGS)
 	odin check tests_cpp -no-entry-point $(CHECK_FLAGS)
