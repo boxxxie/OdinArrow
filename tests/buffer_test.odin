@@ -252,3 +252,33 @@ test_buffer_make_uninit_alignment_and_lifecycle :: proc(t: ^testing.T) {
 		testing.expect(t, buf.data == nil, "buffer_free must clear data pointer")
 	}
 }
+
+// ── bitmap_copy_bits ──────────────────────────────────────────────────────────
+
+@(test)
+test_bitmap_copy_bits :: proc(t: ^testing.T) {
+	// Aligned 16-byte (128-bit) and partial-byte copy.
+	src := [16]u8{0xA5, 0x5A, 0xF0, 0x0F, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF1, 0x22, 0x33, 0x44, 0x55}
+	dst := [16]u8{}
+	oa.bitmap_copy_bits(raw_data(dst[:]), 0, raw_data(src[:]), 0, 100)
+	for i in 0..<100 {
+		testing.expect_value(t, oa.bitmap_get(raw_data(dst[:]), i), oa.bitmap_get(raw_data(src[:]), i))
+	}
+	for i in 100..<128 {
+		testing.expect(t, !oa.bitmap_get(raw_data(dst[:]), i), "bits beyond n_bits must remain untouched")
+	}
+
+	// Unaligned src & dst offsets across >64 bits, preserving neighbor bits.
+	dst2 := [24]u8{}
+	for i in 0..<len(dst2) { dst2[i] = 0xFF }
+	oa.bitmap_copy_bits(raw_data(dst2[:]), 5, raw_data(src[:]), 3, 93)
+	for i in 0..<5 {
+		testing.expect(t, oa.bitmap_get(raw_data(dst2[:]), i), "leading bits must be preserved")
+	}
+	for i in 0..<93 {
+		testing.expect_value(t, oa.bitmap_get(raw_data(dst2[:]), 5 + i), oa.bitmap_get(raw_data(src[:]), 3 + i))
+	}
+	for i in 98..<192 {
+		testing.expect(t, oa.bitmap_get(raw_data(dst2[:]), i), "trailing bits must be preserved")
+	}
+}

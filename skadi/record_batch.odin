@@ -23,6 +23,7 @@ Record_Batch :: struct {
 
 // Shallow-copies the columns slice (Arrays share their underlying buffers).
 // Returns ok=false if column count, lengths, or types do not match.
+@(require_results)
 record_batch_make :: proc(
 	schema:  ^Schema,
 	columns: []Array,

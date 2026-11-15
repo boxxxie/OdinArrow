@@ -16,25 +16,51 @@ import "core:mem"
 
 Buffer_Pool :: struct {
 	backing:   mem.Allocator,
-	free_list: map[int][dynamic]rawptr, // size -> stack of free user pointers
-	bases:     [dynamic]rawptr,         // every backing base pointer (for destroy)
+	free_list: map[_Pool_Key][dynamic]rawptr, // (size, align) -> stack of free user pointers
+	bases:     [dynamic]rawptr,              // every backing base pointer (for destroy)
+	hits:      u64,                          // blocks served from free_list or in-place resize
+	misses:    u64,                          // fresh blocks allocated from backing allocator
+}
+
+@(private="file")
+_Pool_Key :: struct {
+	size:  int,
+	align: int,
 }
 
 @(private="file")
 _Pool_Header :: struct {
-	size: int,    // user-requested size (bucket key)
-	base: rawptr, // backing allocation start
+	size:  int,    // bucket capacity in bytes
+	align: int,    // bucket alignment in bytes
+	base:  rawptr, // backing allocation start
 }
 
 @(private="file")
 _POOL_HDR :: size_of(_Pool_Header)
+
+@(private="file")
+_next_power_of_two :: proc "contextless" (x: int) -> int {
+	if x <= 1 { return 1 }
+	max_pow := 1 << uint(8 * size_of(int) - 2)
+	if x > max_pow { return x }
+	v := x - 1
+	v |= v >> 1
+	v |= v >> 2
+	v |= v >> 4
+	v |= v >> 8
+	v |= v >> 16
+	when size_of(int) == 8 {
+		v |= v >> 32
+	}
+	return v + 1
+}
 
 buffer_pool_init :: proc(pool: ^Buffer_Pool, backing := context.allocator) {
 	pool.backing = backing
 	// Bookkeeping always lives in the backing allocator, never context.allocator:
 	// callers commonly set context.allocator to this very pool, and routing the
 	// pool's own metadata through itself is reentrant (use-after-free).
-	pool.free_list = make(map[int][dynamic]rawptr, 16, backing)
+	pool.free_list = make(map[_Pool_Key][dynamic]rawptr, 16, backing)
 	pool.bases     = make([dynamic]rawptr, 0, 0, backing)
 }
 
@@ -99,47 +125,64 @@ _buffer_pool_proc :: proc(
 	return nil, .None
 }
 
-// Hand back a block of exactly `size` bytes (reused if one is free), with the
-// user pointer aligned to `alignment` and a header recording its size + base.
+@(private="file")
+LARGE_BUCKET_THRESHOLD :: 4 * 1024 * 1024 // 4 MB
+@(private="file")
+LARGE_BUCKET_STEP      :: 256 * 1024      // 256 KB
+
+// Bucketing policy: power-of-two up to 4 MB for fast small/medium reuse, then
+// 256 KB step alignment above 4 MB so large payloads (e.g., 11 MB or 20 MB) do
+// not round up 2x to the next power of two.
+@(private="file")
+_bucket_size :: proc "contextless" (size: int) -> int {
+	clamped := max(size, ARROW_ALIGNMENT)
+	if clamped <= LARGE_BUCKET_THRESHOLD {
+		return _next_power_of_two(clamped)
+	}
+	return align_up(clamped, LARGE_BUCKET_STEP)
+}
+
+// Hand back a block of at least `size` bytes (reused if one is free), with the
+// user pointer aligned to `effective_align` and bucketed by `(bucket_size, effective_align)`.
 @(private="file")
 _pool_get :: proc(pool: ^Buffer_Pool, size, alignment: int) -> (rawptr, mem.Allocator_Error) {
 	if size == 0 { return nil, .None }
-	req_align := uintptr(max(alignment, 1))
-	if stack, ok := pool.free_list[size]; ok && len(stack) > 0 {
-		for i := len(stack) - 1; i >= 0; i -= 1 {
-			if uintptr(stack[i]) % req_align == 0 {
-				user := stack[i]
-				unordered_remove(&pool.free_list[size], i)
-				return user, .None
-			}
-		}
+	effective_align := _next_power_of_two(max(alignment, align_of(_Pool_Header)))
+	bucket_size := _bucket_size(size)
+	key := _Pool_Key{size = bucket_size, align = effective_align}
+	if stack, ok := pool.free_list[key]; ok && len(stack) > 0 {
+		user := stack[len(stack) - 1]
+		pop(&pool.free_list[key])
+		pool.hits += 1
+		return user, .None
 	}
-	effective_align := max(alignment, align_of(_Pool_Header))
-	total := _POOL_HDR + effective_align + size
+	total := _POOL_HDR + effective_align + bucket_size
 	raw, err := mem.alloc_bytes_non_zeroed(total, effective_align, pool.backing)
 	if err != .None || raw == nil { return nil, .Out_Of_Memory }
 	base := raw_data(raw)
 	au   := uintptr(effective_align)
 	user := (uintptr(base) + uintptr(_POOL_HDR) + au - 1) & ~(au - 1)
 	header := (^_Pool_Header)(rawptr(user - uintptr(_POOL_HDR)))
-	header.size = size
-	header.base = base
+	header.size  = bucket_size
+	header.align = effective_align
+	header.base  = base
 	append(&pool.bases, base)
+	pool.misses += 1
 	return rawptr(user), .None
 }
 
 @(private="file")
 _pool_put :: proc(pool: ^Buffer_Pool, user: rawptr) {
 	header := (^_Pool_Header)(rawptr(uintptr(user) - uintptr(_POOL_HDR)))
-	sz := header.size
-	s, ok := pool.free_list[sz]
+	key := _Pool_Key{size = header.size, align = header.align}
+	s, ok := pool.free_list[key]
 	if !ok {
 		// New bucket — back its stack with the pool's backing allocator so
 		// appends never reenter the pool via context.allocator.
 		s = make([dynamic]rawptr, 0, 0, pool.backing)
 	}
 	append(&s, user)
-	pool.free_list[sz] = s
+	pool.free_list[key] = s
 }
 
 @(private="file")
@@ -161,6 +204,7 @@ _pool_resize :: proc(pool: ^Buffer_Pool, old_memory: rawptr, old_size, new_size,
 		if zeroed && new_size > old_size {
 			mem.zero(rawptr(uintptr(old_memory) + uintptr(old_size)), new_size - old_size)
 		}
+		pool.hits += 1
 		return old_memory, .None
 	}
 	// Grow: take a bigger block, copy the live bytes, recycle the old one.

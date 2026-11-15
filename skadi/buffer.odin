@@ -18,6 +18,7 @@ align_up :: #force_inline proc "contextless" (n, alignment: int) -> int {
 
 // Allocate a zero-initialized, ARROW_ALIGNMENT-aligned buffer of `size` bytes.
 // Capacity is always a multiple of ARROW_ALIGNMENT so bitmaps can be cast to u64[].
+@(require_results)
 buffer_make :: proc(size: int, allocator := context.allocator) -> (buf: Buffer, err: mem.Allocator_Error) {
 	capacity := max(align_up(size, ARROW_ALIGNMENT), ARROW_ALIGNMENT)
 	raw := mem.alloc(capacity, ARROW_ALIGNMENT, allocator) or_return
@@ -34,6 +35,7 @@ buffer_make :: proc(size: int, allocator := context.allocator) -> (buf: Buffer, 
 // Like buffer_make but leaves the bytes uninitialized. Only safe when the
 // caller fully overwrites every logical element (e.g. element-wise kernels that
 // write dst[i] for all i). Avoids a redundant zeroing pass over large buffers.
+@(require_results)
 buffer_make_uninit :: proc(size: int, allocator := context.allocator) -> (buf: Buffer, err: mem.Allocator_Error) {
 	capacity := max(align_up(size, ARROW_ALIGNMENT), ARROW_ALIGNMENT)
 	raw := mem.alloc_bytes_non_zeroed(capacity, ARROW_ALIGNMENT, allocator) or_return
@@ -50,7 +52,7 @@ buffer_make_uninit :: proc(size: int, allocator := context.allocator) -> (buf: B
 // (allocator.procedure == nil means the Buffer does not own its memory).
 buffer_free :: proc(buf: ^Buffer) {
 	if buf.data != nil && buf.allocator.procedure != nil {
-		mem.free(rawptr(buf.data), buf.allocator)
+		mem.free_with_size(rawptr(buf.data), buf.capacity, buf.allocator)
 	}
 	buf^ = {}
 }

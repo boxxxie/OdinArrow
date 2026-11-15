@@ -204,7 +204,7 @@ rle_try_get :: proc(a: ^RLE_Array($T), i: int) -> (val: T, valid: bool) {
 // Expand the REE column back into a plain Arrow Array (the escape hatch when a
 // dense representation is actually required).
 rle_decode :: proc(a: ^RLE_Array($T), allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
-	data_buf := buffer_make(a.length * size_of(T), allocator) or_return
+	data_buf := buffer_make_uninit(a.length * size_of(T), allocator) or_return
 	bitmap_buf: Buffer
 	if a.null_count > 0 {
 		bm, bm_err := buffer_make(bitmap_byte_count(a.length), allocator)

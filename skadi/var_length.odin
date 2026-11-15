@@ -1,5 +1,7 @@
 package skadi
 
+import "base:intrinsics"
+import "base:runtime"
 import "core:mem"
 
 // ── String_Builder ────────────────────────────────────────────────────────────
@@ -14,86 +16,270 @@ import "core:mem"
 // through the dynamic-array runtime. finish() then hands those buffers straight
 // to the Array (zero-copy). `offsets` always holds length+1 entries with
 // offsets[0] == 0.
-String_Builder :: struct {
-	data:       [^]u8,   // utf8 bytes
+_Var_Builder :: struct($Offset: typeid) {
+	data:       [^]u8,    // raw payload bytes
 	data_len:   int,
 	data_cap:   int,
-	offsets:    [^]i32,  // length+1 valid entries; offsets[0] == 0
-	off_cap:    int,     // capacity in i32 elements
-	bitmap:     [^]u8,   // validity (all-zero = all valid); written lazily
+	offsets:    [^]Offset, // length+1 valid entries; offsets[0] == 0
+	off_cap:    int,      // capacity in Offset elements
+	bitmap:     [^]u8,    // validity (0xFF-filled on first null); allocated lazily
 	bm_cap:     int,
 	null_count: int,
 	length:     int,
 	allocator:  mem.Allocator,
 }
 
-string_builder_make :: proc(initial_cap := 64, allocator := context.allocator) -> String_Builder {
+String_Builder       :: struct { using raw: _Var_Builder(i32) }
+Binary_Builder       :: struct { using raw: _Var_Builder(i32) }
+Large_String_Builder :: struct { using raw: _Var_Builder(i64) }
+Large_Binary_Builder :: struct { using raw: _Var_Builder(i64) }
+
+// ── String_Builder ────────────────────────────────────────────────────────────
+//
+// Produces Arrow UTF-8 (i32-offset) arrays.
+// Buffer layout: [validity_bitmap, i32_offsets, utf8_bytes]
+
+string_builder_make :: proc(initial_cap := 64, allocator := context.allocator, initial_data_cap := -1) -> String_Builder {
+	return String_Builder{ raw = _vb_make(i32, initial_cap, initial_data_cap, allocator) }
+}
+
+string_builder_reserve_data :: #force_inline proc(b: ^String_Builder, total_bytes: int) {
+	if total_bytes > b.data_cap { _vb_grow_data(&b.raw, total_bytes) }
+}
+
+string_builder_append :: #force_inline proc(b: ^String_Builder, s: string) {
+	_vb_append(&b.raw, transmute([]u8)s)
+}
+
+string_builder_append_null :: #force_inline proc(b: ^String_Builder) {
+	_vb_append_null(&b.raw)
+}
+
+// Zero-copy: hands the data/offsets/validity buffers directly to the Array and
+// leaves the builder empty (re-grows from nil on the next append).
+@(require_results)
+string_builder_finish :: proc(b: ^String_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
+	return _vb_finish(&b.raw, String_Type{}, allocator)
+}
+
+string_builder_reset :: proc(b: ^String_Builder) {
+	_vb_reset(&b.raw)
+}
+
+string_builder_destroy :: proc(b: ^String_Builder) {
+	_vb_destroy(&b.raw)
+}
+
+// ── Binary_Builder ────────────────────────────────────────────────────────────
+// Identical to String_Builder except produces Binary_Type arrays.
+
+binary_builder_make :: proc(initial_cap := 64, allocator := context.allocator, initial_data_cap := -1) -> Binary_Builder {
+	return Binary_Builder{ raw = _vb_make(i32, initial_cap, initial_data_cap, allocator) }
+}
+
+binary_builder_reserve_data :: #force_inline proc(b: ^Binary_Builder, total_bytes: int) {
+	if total_bytes > b.data_cap { _vb_grow_data(&b.raw, total_bytes) }
+}
+
+binary_builder_append :: #force_inline proc(b: ^Binary_Builder, bytes: []u8) {
+	_vb_append(&b.raw, bytes)
+}
+
+binary_builder_append_null :: #force_inline proc(b: ^Binary_Builder) {
+	_vb_append_null(&b.raw)
+}
+
+binary_builder_reset :: proc(b: ^Binary_Builder) {
+	_vb_reset(&b.raw)
+}
+
+@(require_results)
+binary_builder_finish :: proc(b: ^Binary_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
+	return _vb_finish(&b.raw, Binary_Type{}, allocator)
+}
+
+binary_builder_destroy :: proc(b: ^Binary_Builder) {
+	_vb_destroy(&b.raw)
+}
+
+// ── Large_String_Builder ──────────────────────────────────────────────────────
+// Produces Arrow LargeUtf8 (i64-offset) arrays, lifting the 2 GiB total-bytes limit.
+// Buffer layout: [validity_bitmap, i64_offsets, utf8_bytes]
+
+large_string_builder_make :: proc(initial_cap := 64, allocator := context.allocator, initial_data_cap := -1) -> Large_String_Builder {
+	return Large_String_Builder{ raw = _vb_make(i64, initial_cap, initial_data_cap, allocator) }
+}
+
+large_string_builder_reserve_data :: #force_inline proc(b: ^Large_String_Builder, total_bytes: int) {
+	if total_bytes > b.data_cap { _vb_grow_data(&b.raw, total_bytes) }
+}
+
+large_string_builder_append :: #force_inline proc(b: ^Large_String_Builder, s: string) {
+	_vb_append(&b.raw, transmute([]u8)s)
+}
+
+large_string_builder_append_null :: #force_inline proc(b: ^Large_String_Builder) {
+	_vb_append_null(&b.raw)
+}
+
+@(require_results)
+large_string_builder_finish :: proc(b: ^Large_String_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
+	return _vb_finish(&b.raw, Large_String_Type{}, allocator)
+}
+
+large_string_builder_reset :: proc(b: ^Large_String_Builder) {
+	_vb_reset(&b.raw)
+}
+
+large_string_builder_destroy :: proc(b: ^Large_String_Builder) {
+	_vb_destroy(&b.raw)
+}
+
+// ── Large_Binary_Builder ──────────────────────────────────────────────────────
+// Identical to Large_String_Builder except produces Large_Binary_Type arrays.
+
+large_binary_builder_make :: proc(initial_cap := 64, allocator := context.allocator, initial_data_cap := -1) -> Large_Binary_Builder {
+	return Large_Binary_Builder{ raw = _vb_make(i64, initial_cap, initial_data_cap, allocator) }
+}
+
+large_binary_builder_reserve_data :: #force_inline proc(b: ^Large_Binary_Builder, total_bytes: int) {
+	if total_bytes > b.data_cap { _vb_grow_data(&b.raw, total_bytes) }
+}
+
+large_binary_builder_append :: #force_inline proc(b: ^Large_Binary_Builder, bytes: []u8) {
+	_vb_append(&b.raw, bytes)
+}
+
+large_binary_builder_append_null :: #force_inline proc(b: ^Large_Binary_Builder) {
+	_vb_append_null(&b.raw)
+}
+
+large_binary_builder_reset :: proc(b: ^Large_Binary_Builder) {
+	_vb_reset(&b.raw)
+}
+
+@(require_results)
+large_binary_builder_finish :: proc(b: ^Large_Binary_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
+	return _vb_finish(&b.raw, Large_Binary_Type{}, allocator)
+}
+
+large_binary_builder_destroy :: proc(b: ^Large_Binary_Builder) {
+	_vb_destroy(&b.raw)
+}
+
+// ── shared parametric implementation ──────────────────────────────────────────
+
+_vb_make :: proc($Offset: typeid, initial_cap: int, initial_data_cap: int, allocator: mem.Allocator) -> _Var_Builder(Offset) {
 	init_cap := max(initial_cap, 1)
-	data_cap := init_cap * 8
-	off_cap  := init_cap + 1
-	bm       := bitmap_byte_count(init_cap)
-	// data and offsets are fully written before the array is read → leave
-	// uninitialised; the validity bitmap must start zeroed.
-	data_bytes, _ := mem.alloc_bytes_non_zeroed(data_cap,               ARROW_ALIGNMENT, allocator)
-	off_bytes,  _ := mem.alloc_bytes_non_zeroed(off_cap * size_of(i32), ARROW_ALIGNMENT, allocator)
-	bm_raw,     _ := mem.alloc(bm,                                      ARROW_ALIGNMENT, allocator)
-	b := String_Builder{
-		data      = raw_data(data_bytes),             data_cap = data_cap,
-		offsets   = cast([^]i32)raw_data(off_bytes),  off_cap  = off_cap,
-		bitmap    = cast([^]u8)bm_raw,    bm_cap   = bm,
+	assert(init_cap <= max(int) / 8, "_vb_make: capacity overflow")
+	data_cap := initial_data_cap if initial_data_cap >= 0 else init_cap * 8
+	when Offset == i32 {
+		data_cap = min(data_cap, int(max(i32)))
+	}
+	off_cap := init_cap + 1
+	assert(off_cap <= max(int) / size_of(Offset), "_vb_make: offsets capacity overflow")
+	data_ptr: [^]u8
+	if data_cap > 0 {
+		data_bytes, data_err := mem.alloc_bytes_non_zeroed(data_cap, ARROW_ALIGNMENT, allocator)
+		assert(data_err == .None, "_vb_make: data allocation failed")
+		data_ptr = raw_data(data_bytes)
+	}
+	off_bytes, off_err := mem.alloc_bytes_non_zeroed(off_cap * size_of(Offset), ARROW_ALIGNMENT, allocator)
+	assert(off_err == .None, "_vb_make: offsets allocation failed")
+	b := _Var_Builder(Offset){
+		data      = data_ptr,
+		data_cap  = data_cap,
+		offsets   = cast([^]Offset)raw_data(off_bytes),
+		off_cap   = off_cap,
 		allocator = allocator,
 	}
 	b.offsets[0] = 0
 	return b
 }
 
-string_builder_append :: #force_inline proc(b: ^String_Builder, s: string) {
-	n := len(s)
-	if b.data_len + n > b.data_cap { _sb_grow_data(b, b.data_len + n) }
-	if b.length + 1 >= b.off_cap   { _sb_grow_offsets(b) }
-	// Builder buffer and the input string never alias → memcpy, not memmove.
-	if n > 0 { mem.copy_non_overlapping(rawptr(&b.data[b.data_len]), rawptr(raw_data(s)), n) }
-	b.data_len += n
-	b.offsets[b.length + 1] = i32(b.data_len)
-	if b.null_count > 0 {
-		byte_i := b.length >> 3
-		if byte_i >= b.bm_cap { _sb_grow_bitmap(b, byte_i + 1) }
-		b.bitmap[byte_i] |= 1 << u8(b.length & 7)
+_vb_append :: #force_inline proc(b: ^_Var_Builder($Offset), bytes: []u8) {
+	n := len(bytes)
+	when ODIN_DEBUG {
+		when Offset == i32 {
+			assert(n <= int(max(i32)) - b.data_len, "var_length builder: data exceeds i32 offset limit")
+		} else {
+			assert(n <= max(int) - b.data_len, "var_length builder: data length overflow")
+		}
 	}
+	if n > b.data_cap - b.data_len { _vb_grow_data(b, b.data_len + n) }
+	if b.length + 1 >= b.off_cap   { _vb_grow_offsets(b) }
+	if n > 0 { mem.copy_non_overlapping(rawptr(&b.data[b.data_len]), rawptr(raw_data(bytes)), n) }
+	b.data_len += n
+	b.offsets[b.length + 1] = Offset(b.data_len)
 	b.length += 1
 }
 
-string_builder_append_null :: #force_inline proc(b: ^String_Builder) {
-	if b.length + 1 >= b.off_cap { _sb_grow_offsets(b) }
+_vb_append_null :: #force_inline proc(b: ^_Var_Builder($Offset)) {
+	if b.length + 1 >= b.off_cap { _vb_grow_offsets(b) }
 	byte_i := b.length >> 3
-	if byte_i >= b.bm_cap { _sb_grow_bitmap(b, byte_i + 1) }
-	if b.null_count == 0 { bitmap_set_all(b.bitmap, b.length) }
-	// Null bit stays 0 (pre-zeroed); offset repeats the previous value.
-	b.offsets[b.length + 1] = i32(b.data_len)
+	if byte_i >= b.bm_cap {
+		_vb_grow_bitmap(b, max(bitmap_byte_count(b.off_cap), byte_i + 1))
+	}
+	b.bitmap[byte_i] &= ~(1 << u8(b.length & 7))
+	b.offsets[b.length + 1] = Offset(b.data_len)
 	b.null_count += 1
 	b.length += 1
 }
 
-// Zero-copy: hands the data/offsets/validity buffers directly to the Array and
-// leaves the builder empty (re-grows from nil on the next append).
-string_builder_finish :: proc(b: ^String_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
+_vb_finish :: proc(b: ^_Var_Builder($Offset), data_type: DataType, allocator: mem.Allocator) -> (arr: Array, err: mem.Allocator_Error) {
+	if b.offsets == nil {
+		off_bytes, off_err := mem.alloc(ARROW_ALIGNMENT, ARROW_ALIGNMENT, b.allocator)
+		if off_err != .None {
+			return {}, off_err
+		}
+		b.offsets = cast([^]Offset)off_bytes
+		b.off_cap = ARROW_ALIGNMENT / size_of(Offset)
+		b.offsets[0] = 0
+	}
+	if b.data == nil {
+		data_bytes, data_err := mem.alloc_bytes_non_zeroed(ARROW_ALIGNMENT, ARROW_ALIGNMENT, b.allocator)
+		if data_err != .None {
+			return {}, data_err
+		}
+		b.data = raw_data(data_bytes)
+		b.data_cap = ARROW_ALIGNMENT
+	}
 	bitmap_buf: Buffer
 	if b.null_count > 0 {
-		bitmap_buf = Buffer{ data = b.bitmap, size = bitmap_byte_count(b.length), capacity = b.bm_cap, allocator = b.allocator }
-		b.bitmap = nil; b.bm_cap = 0
+		bm_size := bitmap_byte_count(b.length)
+		if b.bm_cap < bm_size {
+			_vb_grow_bitmap(b, bm_size)
+		}
+		active_bytes := (b.length + 7) / 8
+		rem := uint(b.length) & 7
+		if rem != 0 && active_bytes > 0 {
+			b.bitmap[active_bytes - 1] &= u8((1 << rem) - 1)
+		}
+		if bm_size > active_bytes {
+			mem.zero(rawptr(b.bitmap[active_bytes:]), bm_size - active_bytes)
+		}
+		bitmap_buf = Buffer{ data = b.bitmap, size = bm_size, capacity = b.bm_cap, allocator = b.allocator }
+		b.bitmap = nil
+		b.bm_cap = 0
+	} else if b.bitmap != nil {
+		mem.free_with_size(rawptr(b.bitmap), b.bm_cap, b.allocator)
+		b.bitmap = nil
+		b.bm_cap = 0
 	}
 	off_buf := Buffer{
 		data      = cast([^]u8)b.offsets,
-		size      = (b.length + 1) * size_of(i32),
-		capacity  = b.off_cap * size_of(i32),
+		size      = (b.length + 1) * size_of(Offset),
+		capacity  = b.off_cap * size_of(Offset),
 		allocator = b.allocator,
 	}
-	b.offsets = nil; b.off_cap = 0
+	b.offsets = nil
+	b.off_cap = 0
 	data_buf := Buffer{ data = b.data, size = b.data_len, capacity = b.data_cap, allocator = b.allocator }
-	b.data = nil; b.data_cap = 0
+	b.data = nil
+	b.data_cap = 0
 
 	arr = Array{
-		type       = String_Type{},
+		type       = data_type,
 		length     = b.length,
 		null_count = b.null_count,
 		offset     = 0,
@@ -102,268 +288,90 @@ string_builder_finish :: proc(b: ^String_Builder, allocator := context.allocator
 	b.length     = 0
 	b.data_len   = 0
 	b.null_count = 0
-	b.bm_cap     = 0
 	_ = allocator
 	return
 }
 
-string_builder_reset :: proc(b: ^String_Builder) {
+_vb_reset :: proc(b: ^_Var_Builder($Offset)) {
+	if b.bitmap != nil && b.null_count > 0 { mem.set(rawptr(b.bitmap), 0xFF, b.bm_cap) }
 	b.data_len   = 0
 	b.null_count = 0
 	b.length     = 0
-	if b.bitmap  != nil { mem.zero(rawptr(b.bitmap), b.bm_cap) }
 	if b.offsets != nil { b.offsets[0] = 0 }
 }
 
-string_builder_destroy :: proc(b: ^String_Builder) {
-	if b.data    != nil { mem.free(rawptr(b.data),    b.allocator) }
-	if b.offsets != nil { mem.free(rawptr(b.offsets), b.allocator) }
-	if b.bitmap  != nil { mem.free(rawptr(b.bitmap),  b.allocator) }
+_vb_destroy :: proc(b: ^_Var_Builder($Offset)) {
+	if b.data    != nil { mem.free_with_size(rawptr(b.data),    b.data_cap,                b.allocator) }
+	if b.offsets != nil { mem.free_with_size(rawptr(b.offsets), b.off_cap * size_of(Offset), b.allocator) }
+	if b.bitmap  != nil { mem.free_with_size(rawptr(b.bitmap),  b.bm_cap,                  b.allocator) }
 	b^ = {}
 }
 
-// ── String_Builder growth helpers ──────────────────────────────────────────────
-
-_sb_grow_data :: proc(b: ^String_Builder, needed: int) {
-	new_cap := max(b.data_cap * 2, needed, 16)
-	new_raw, _ := mem.resize(rawptr(b.data), b.data_cap, new_cap, ARROW_ALIGNMENT, b.allocator)
+_vb_grow_data :: proc(b: ^_Var_Builder($Offset), needed: int) {
+	when Offset == i32 {
+		assert(needed >= b.data_len && needed <= int(max(i32)), "var_length builder: data exceeds i32 offset limit")
+	} else {
+		assert(needed >= b.data_len, "var_length builder: data length overflow")
+	}
+	doubled := b.data_cap * 2 if b.data_cap <= max(int) / 2 else max(int)
+	new_cap := max(doubled, needed, ARROW_ALIGNMENT)
+	when Offset == i32 {
+		new_cap = min(new_cap, int(max(i32)))
+	}
+	if b.data_len == 0 {
+		if b.data != nil {
+			mem.free_with_size(rawptr(b.data), b.data_cap, b.allocator)
+		}
+		raw, err := mem.alloc_bytes_non_zeroed(new_cap, ARROW_ALIGNMENT, b.allocator)
+		assert(err == .None, "_vb_grow_data: allocation failed")
+		b.data     = raw_data(raw)
+		b.data_cap = new_cap
+		return
+	}
+	new_raw, err := mem.resize_non_zeroed(rawptr(b.data), b.data_cap, new_cap, ARROW_ALIGNMENT, b.allocator)
+	assert(err == .None, "_vb_grow_data: allocation failed")
 	b.data     = cast([^]u8)new_raw
 	b.data_cap = new_cap
 }
 
-_sb_grow_offsets :: proc(b: ^String_Builder) {
-	new_cap := max(b.off_cap * 2, 16)  // elements
-	new_raw, _ := mem.resize(rawptr(b.offsets), b.off_cap * size_of(i32), new_cap * size_of(i32), ARROW_ALIGNMENT, b.allocator)
-	if b.off_cap == 0 { (cast([^]i32)new_raw)[0] = 0 }  // re-establish offsets[0] after a consuming finish
-	b.offsets = cast([^]i32)new_raw
+_vb_grow_offsets :: proc(b: ^_Var_Builder($Offset)) {
+	assert(b.off_cap <= max(int) / 2, "var_length builder: offsets capacity overflow")
+	new_cap := max(b.off_cap * 2, 16)
+	assert(new_cap <= max(int) / size_of(Offset), "var_length builder: offsets byte overflow")
+	live_bytes := (b.length + 1) * size_of(Offset) if b.off_cap > 0 else 0
+	new_raw, err := mem.resize_non_zeroed(rawptr(b.offsets), live_bytes, new_cap * size_of(Offset), ARROW_ALIGNMENT, b.allocator)
+	assert(err == .None, "_vb_grow_offsets: allocation failed")
+	if b.off_cap == 0 { (cast([^]Offset)new_raw)[0] = 0 }
+	b.offsets = cast([^]Offset)new_raw
 	b.off_cap = new_cap
 }
 
-_sb_grow_bitmap :: proc(b: ^String_Builder, needed: int) {
-	new_cap := align_up(max(b.bm_cap * 2, needed), ARROW_ALIGNMENT)
-	new_raw, _ := mem.resize(rawptr(b.bitmap), b.bm_cap, new_cap, ARROW_ALIGNMENT, b.allocator)
+_vb_grow_bitmap :: proc(b: ^_Var_Builder($Offset), needed: int) {
+	assert(needed <= max(int) - ARROW_ALIGNMENT, "var_length builder: bitmap needed overflow")
+	doubled := b.bm_cap * 2 if b.bm_cap <= max(int) / 2 else max(int) - ARROW_ALIGNMENT
+	new_cap := align_up(max(doubled, needed), ARROW_ALIGNMENT)
+	new_raw, err := mem.resize_non_zeroed(rawptr(b.bitmap), b.bm_cap, new_cap, ARROW_ALIGNMENT, b.allocator)
+	assert(err == .None, "_vb_grow_bitmap: allocation failed")
 	if new_cap > b.bm_cap {
-		mem.zero(rawptr((cast([^]u8)new_raw)[b.bm_cap:]), new_cap - b.bm_cap)
+		mem.set(rawptr((cast([^]u8)new_raw)[b.bm_cap:]), 0xFF, new_cap - b.bm_cap)
 	}
 	b.bitmap = cast([^]u8)new_raw
 	b.bm_cap = new_cap
 }
 
-// ── Binary_Builder ────────────────────────────────────────────────────────────
-// Identical to String_Builder except produces Binary_Type arrays (no UTF-8 assertion).
-
-Binary_Builder :: struct {
-	offsets:    [dynamic]i32,
-	data:       [dynamic]u8,
-	bitmap:     [dynamic]u8,
-	null_count: int,
-	length:     int,
-}
-
-binary_builder_make :: proc(initial_cap := 64, allocator := context.allocator) -> Binary_Builder {
-	b := Binary_Builder{
-		offsets = make([dynamic]i32, 0, initial_cap + 1, allocator),
-		data    = make([dynamic]u8,  0, initial_cap * 8, allocator),
-		bitmap  = make([dynamic]u8,  0, (initial_cap + 7) / 8, allocator),
-	}
-	append(&b.offsets, i32(0))
-	return b
-}
-
-binary_builder_append :: proc(b: ^Binary_Builder, bytes: []u8) {
-	i      := b.length
-	byte_i := i >> 3
-	if byte_i >= len(b.bitmap) {
-		append(&b.bitmap, u8(0))
-	}
-	b.bitmap[byte_i] |= 1 << u8(i & 7)
-	append(&b.data, ..bytes)
-	append(&b.offsets, i32(len(b.data)))
-	b.length += 1
-}
-
-binary_builder_append_null :: proc(b: ^Binary_Builder) {
-	i      := b.length
-	byte_i := i >> 3
-	if byte_i >= len(b.bitmap) {
-		append(&b.bitmap, u8(0))
-	}
-	append(&b.offsets, b.offsets[len(b.offsets) - 1])
-	b.null_count += 1
-	b.length += 1
-}
-
-binary_builder_reset :: proc(b: ^Binary_Builder) {
-	clear(&b.offsets)
-	clear(&b.data)
-	clear(&b.bitmap)
-	append(&b.offsets, i32(0))
-	b.null_count = 0
-	b.length     = 0
-}
-
-binary_builder_finish :: proc(b: ^Binary_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
-	arr, err = _var_finish(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Binary_Type{}, allocator)
-	if err == nil {
-		binary_builder_reset(b)
-	}
-	return
-}
-
-binary_builder_destroy :: proc(b: ^Binary_Builder) {
-	delete(b.offsets)
-	delete(b.data)
-	delete(b.bitmap)
-	b^ = {}
-}
-
-// ── Large_String_Builder ──────────────────────────────────────────────────────
-//
-// Produces Arrow LargeUtf8 (i64-offset) arrays — identical to String_Builder
-// except the offsets buffer holds i64 values, lifting the 2 GiB total-bytes
-// limit that i32 offsets impose.
-// Buffer layout: [validity_bitmap, i64_offsets, utf8_bytes]
-
-Large_String_Builder :: struct {
-	offsets:    [dynamic]i64,
-	data:       [dynamic]u8,
-	bitmap:     [dynamic]u8,
-	null_count: int,
-	length:     int,
-}
-
-large_string_builder_make :: proc(initial_cap := 64, allocator := context.allocator) -> Large_String_Builder {
-	bm_bytes := bitmap_byte_count(max(initial_cap, 1))
-	b := Large_String_Builder{
-		offsets = make([dynamic]i64, 0, initial_cap + 1, allocator),
-		data    = make([dynamic]u8,  0, initial_cap * 8, allocator),
-		bitmap  = make([dynamic]u8,  bm_bytes, bm_bytes, allocator),
-	}
-	append(&b.offsets, i64(0))
-	return b
-}
-
-large_string_builder_append :: proc(b: ^Large_String_Builder, s: string) {
-	i := b.length
-	if b.null_count > 0 {
-		byte_i := i >> 3
-		if byte_i >= len(b.bitmap) { resize(&b.bitmap, byte_i + 1) }
-		b.bitmap[byte_i] |= 1 << u8(i & 7)
-	}
-	append(&b.data, ..transmute([]u8)s)
-	append(&b.offsets, i64(len(b.data)))
-	b.length += 1
-}
-
-large_string_builder_append_null :: proc(b: ^Large_String_Builder) {
-	i      := b.length
-	byte_i := i >> 3
-	if byte_i >= len(b.bitmap) { resize(&b.bitmap, byte_i + 1) }
-	if b.null_count == 0 { bitmap_set_all(raw_data(b.bitmap[:]), i) }
-	// Null bit stays 0 (pre-zeroed).
-	append(&b.offsets, b.offsets[len(b.offsets) - 1])
-	b.null_count += 1
-	b.length += 1
-}
-
-large_string_builder_finish :: proc(b: ^Large_String_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
-	arr, err = _var_finish_i64(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Large_String_Type{}, allocator)
-	if err == nil {
-		large_string_builder_reset(b)
-	}
-	return
-}
-
-large_string_builder_reset :: proc(b: ^Large_String_Builder) {
-	clear(&b.offsets)
-	clear(&b.data)
-	clear(&b.bitmap)
-	append(&b.offsets, i64(0))
-	b.null_count = 0
-	b.length     = 0
-}
-
-large_string_builder_destroy :: proc(b: ^Large_String_Builder) {
-	delete(b.offsets)
-	delete(b.data)
-	delete(b.bitmap)
-	b^ = {}
-}
-
-// ── Large_Binary_Builder ──────────────────────────────────────────────────────
-// Identical to Large_String_Builder but produces Large_Binary_Type arrays (no
-// UTF-8 assumption).
-
-Large_Binary_Builder :: struct {
-	offsets:    [dynamic]i64,
-	data:       [dynamic]u8,
-	bitmap:     [dynamic]u8,
-	null_count: int,
-	length:     int,
-}
-
-large_binary_builder_make :: proc(initial_cap := 64, allocator := context.allocator) -> Large_Binary_Builder {
-	bm_bytes := bitmap_byte_count(max(initial_cap, 1))
-	b := Large_Binary_Builder{
-		offsets = make([dynamic]i64, 0, initial_cap + 1, allocator),
-		data    = make([dynamic]u8,  0, initial_cap * 8, allocator),
-		bitmap  = make([dynamic]u8,  bm_bytes, bm_bytes, allocator),
-	}
-	append(&b.offsets, i64(0))
-	return b
-}
-
-large_binary_builder_append :: proc(b: ^Large_Binary_Builder, bytes: []u8) {
-	i := b.length
-	if b.null_count > 0 {
-		byte_i := i >> 3
-		if byte_i >= len(b.bitmap) { resize(&b.bitmap, byte_i + 1) }
-		b.bitmap[byte_i] |= 1 << u8(i & 7)
-	}
-	append(&b.data, ..bytes)
-	append(&b.offsets, i64(len(b.data)))
-	b.length += 1
-}
-
-large_binary_builder_append_null :: proc(b: ^Large_Binary_Builder) {
-	i      := b.length
-	byte_i := i >> 3
-	if byte_i >= len(b.bitmap) { resize(&b.bitmap, byte_i + 1) }
-	if b.null_count == 0 { bitmap_set_all(raw_data(b.bitmap[:]), i) }
-	append(&b.offsets, b.offsets[len(b.offsets) - 1])
-	b.null_count += 1
-	b.length += 1
-}
-
-large_binary_builder_reset :: proc(b: ^Large_Binary_Builder) {
-	clear(&b.offsets)
-	clear(&b.data)
-	clear(&b.bitmap)
-	append(&b.offsets, i64(0))
-	b.null_count = 0
-	b.length     = 0
-}
-
-large_binary_builder_finish :: proc(b: ^Large_Binary_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
-	arr, err = _var_finish_i64(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Large_Binary_Type{}, allocator)
-	if err == nil {
-		large_binary_builder_reset(b)
-	}
-	return
-}
-
-large_binary_builder_destroy :: proc(b: ^Large_Binary_Builder) {
-	delete(b.offsets)
-	delete(b.data)
-	delete(b.bitmap)
-	b^ = {}
-}
-
 // ── Array accessors ───────────────────────────────────────────────────────────
 
+@(private="file")
+_vb_bounds_fail :: proc "contextless" (msg: string) -> ! {
+	context = runtime.default_context()
+	panic(msg)
+}
+
 // Zero-copy string view. Valid only while the Array is alive. Does NOT copy.
-array_get_string :: proc(arr: ^Array, i: int) -> string {
-	assert(i >= 0 && i < arr.length, "array_get_string: out of bounds")
+array_get_string :: #force_inline proc "contextless" (arr: ^Array, i: int) -> string {
+	when ODIN_DEBUG {
+		if i < 0 || i >= arr.length { _vb_bounds_fail("array_get_string: out of bounds") }
+	}
 	offsets := cast([^]i32)arr.buffers[1].data
 	idx     := arr.offset + i
 	start   := int(offsets[idx])
@@ -373,8 +381,10 @@ array_get_string :: proc(arr: ^Array, i: int) -> string {
 }
 
 // Zero-copy binary slice. Valid only while the Array is alive. Does NOT copy.
-array_get_binary :: proc(arr: ^Array, i: int) -> []u8 {
-	assert(i >= 0 && i < arr.length, "array_get_binary: out of bounds")
+array_get_binary :: #force_inline proc "contextless" (arr: ^Array, i: int) -> []u8 {
+	when ODIN_DEBUG {
+		if i < 0 || i >= arr.length { _vb_bounds_fail("array_get_binary: out of bounds") }
+	}
 	offsets := cast([^]i32)arr.buffers[1].data
 	idx     := arr.offset + i
 	start   := int(offsets[idx])
@@ -384,8 +394,10 @@ array_get_binary :: proc(arr: ^Array, i: int) -> []u8 {
 }
 
 // Zero-copy string view into a LargeUtf8 (i64-offset) array. Does NOT copy.
-array_get_large_string :: proc(arr: ^Array, i: int) -> string {
-	assert(i >= 0 && i < arr.length, "array_get_large_string: out of bounds")
+array_get_large_string :: #force_inline proc "contextless" (arr: ^Array, i: int) -> string {
+	when ODIN_DEBUG {
+		if i < 0 || i >= arr.length { _vb_bounds_fail("array_get_large_string: out of bounds") }
+	}
 	offsets := cast([^]i64)arr.buffers[1].data
 	idx     := arr.offset + i
 	start   := int(offsets[idx])
@@ -395,8 +407,10 @@ array_get_large_string :: proc(arr: ^Array, i: int) -> string {
 }
 
 // Zero-copy binary slice from a LargeBinary (i64-offset) array. Does NOT copy.
-array_get_large_binary :: proc(arr: ^Array, i: int) -> []u8 {
-	assert(i >= 0 && i < arr.length, "array_get_large_binary: out of bounds")
+array_get_large_binary :: #force_inline proc "contextless" (arr: ^Array, i: int) -> []u8 {
+	when ODIN_DEBUG {
+		if i < 0 || i >= arr.length { _vb_bounds_fail("array_get_large_binary: out of bounds") }
+	}
 	offsets := cast([^]i64)arr.buffers[1].data
 	idx     := arr.offset + i
 	start   := int(offsets[idx])
@@ -405,116 +419,104 @@ array_get_large_binary :: proc(arr: ^Array, i: int) -> []u8 {
 	return arr.buffers[2].data[start:end]
 }
 
-// ── shared finish impl ────────────────────────────────────────────────────────
-
-_var_finish :: proc(
-	offsets:    []i32,
-	data_bytes: []u8,
-	bitmap:     []u8,
-	null_count: int,
-	length:     int,
-	data_type:  DataType,
-	allocator:  mem.Allocator,
-) -> (arr: Array, err: mem.Allocator_Error) {
-	// Validity bitmap
-	bitmap_buf: Buffer
-	if null_count > 0 {
-		n_bm := bitmap_byte_count(length)
-		bitmap_buf = buffer_make(n_bm, allocator) or_return
-		src_n := (length + 7) / 8
-		if src_n > 0 && len(bitmap) > 0 {
-			copy_n := min(src_n, len(bitmap))
-			mem.copy(rawptr(bitmap_buf.data), rawptr(raw_data(bitmap)), copy_n)
-		}
-	}
-
-	// Offsets buffer: (length + 1) i32 values
-	off_bytes := (length + 1) * size_of(i32)
-	off_buf, err2 := buffer_make(off_bytes, allocator)
-	if err2 != nil {
-		buffer_free(&bitmap_buf)
-		err = err2
-		return
-	}
-	if len(offsets) > 0 {
-		mem.copy(rawptr(off_buf.data), rawptr(raw_data(offsets)), len(offsets) * size_of(i32))
-	}
-
-	// Data buffer
-	data_buf, err3 := buffer_make(len(data_bytes), allocator)
-	if err3 != nil {
-		buffer_free(&bitmap_buf)
-		buffer_free(&off_buf)
-		err = err3
-		return
-	}
-	if len(data_bytes) > 0 {
-		mem.copy(rawptr(data_buf.data), rawptr(raw_data(data_bytes)), len(data_bytes))
-	}
-
-	arr = Array{
-		type       = data_type,
-		length     = length,
-		null_count = null_count,
-		offset     = 0,
-		buffers    = {bitmap_buf, off_buf, data_buf},
-	}
-	return
+// Hoisted zero-overhead view over a String_Type array for tight inner loops.
+String_Array_View :: struct {
+	offsets:     [^]i32,
+	data:        [^]u8,
+	null_bitmap: [^]u8,
+	offset:      int,
+	length:      int,
+	null_count:  int,
 }
 
-// Shared finish for the i64-offset (Large*) variants. Mirrors _var_finish but
-// the offsets buffer holds (length + 1) i64 values.
-_var_finish_i64 :: proc(
-	offsets:    []i64,
-	data_bytes: []u8,
-	bitmap:     []u8,
-	null_count: int,
-	length:     int,
-	data_type:  DataType,
-	allocator:  mem.Allocator,
-) -> (arr: Array, err: mem.Allocator_Error) {
-	// Validity bitmap
-	bitmap_buf: Buffer
-	if null_count > 0 {
-		n_bm := bitmap_byte_count(length)
-		bitmap_buf = buffer_make(n_bm, allocator) or_return
-		src_n := (length + 7) / 8
-		if src_n > 0 && len(bitmap) > 0 {
-			copy_n := min(src_n, len(bitmap))
-			mem.copy(rawptr(bitmap_buf.data), rawptr(raw_data(bitmap)), copy_n)
+array_string_view :: #force_inline proc "contextless" (arr: ^Array) -> String_Array_View {
+	has_bm := arr.null_count != 0 && arr.buffers[0].data != nil
+	return String_Array_View{
+		offsets     = cast([^]i32)arr.buffers[1].data,
+		data        = arr.buffers[2].data,
+		null_bitmap = arr.buffers[0].data if has_bm else nil,
+		offset      = arr.offset,
+		length      = arr.length,
+		null_count  = arr.null_count,
+	}
+}
+
+string_view_is_null :: #force_inline proc "contextless" (v: ^String_Array_View, i: int) -> bool {
+	return v.null_bitmap != nil && !bitmap_get(v.null_bitmap, v.offset + i)
+}
+
+string_view_len :: #force_inline proc "contextless" (v: ^String_Array_View, i: int) -> int {
+	idx := v.offset + i
+	return int(v.offsets[idx + 1] - v.offsets[idx])
+}
+
+string_view_get :: #force_inline proc "contextless" (v: ^String_Array_View, i: int) -> string {
+	idx   := v.offset + i
+	start := int(v.offsets[idx])
+	end   := int(v.offsets[idx + 1])
+	return transmute(string)v.data[start:end]
+}
+
+// Sum byte lengths of all valid elements using 64-bit word-wise validity scanning.
+string_view_sum_lengths :: proc "contextless" (v: ^String_Array_View) -> i64 {
+	n := v.length
+	if n <= 0 { return 0 }
+	if v.null_bitmap == nil || v.null_count == 0 {
+		return i64(v.offsets[v.offset + n] - v.offsets[v.offset])
+	}
+	total: i64 = 0
+	if v.offset == 0 {
+		words := cast([^]u64)v.null_bitmap
+		n_words := n / 64
+		for w_idx in 0..<n_words {
+			w := intrinsics.unaligned_load(&words[w_idx])
+			base := w_idx * 64
+			if w == ~u64(0) {
+				total += i64(v.offsets[base + 64] - v.offsets[base])
+			} else if w != 0 {
+				for bits := w; bits != 0; bits &= bits - 1 {
+					bit := int(intrinsics.count_trailing_zeros(bits))
+					idx := base + bit
+					total += i64(v.offsets[idx + 1] - v.offsets[idx])
+				}
+			}
+		}
+		for i := n_words * 64; i < n; i += 1 {
+			if bitmap_get(v.null_bitmap, i) {
+				total += i64(v.offsets[i + 1] - v.offsets[i])
+			}
+		}
+		return total
+	}
+	for i in 0..<n {
+		if bitmap_get(v.null_bitmap, v.offset + i) {
+			idx := v.offset + i
+			total += i64(v.offsets[idx + 1] - v.offsets[idx])
 		}
 	}
+	return total
+}
 
-	// Offsets buffer: (length + 1) i64 values
-	off_bytes := (length + 1) * size_of(i64)
-	off_buf, err2 := buffer_make(off_bytes, allocator)
-	if err2 != nil {
+// Allocate the three buffers for a known-size i32-offset variable-length array
+// (`String_Type` or `Binary_Type`). When `null_count == 0`, no validity bitmap is
+// allocated (`bitmap_buf.data == nil`).
+_varlen_alloc_buffers :: proc(
+	out_len, total_bytes, null_count: int,
+	allocator: mem.Allocator,
+) -> (bitmap_buf, off_buf, data_buf: Buffer, err: mem.Allocator_Error) {
+	if null_count > 0 {
+		bitmap_buf = buffer_make(bitmap_byte_count(out_len), allocator) or_return
+	}
+	off_buf, err = buffer_make_uninit((out_len + 1) * size_of(i32), allocator)
+	if err != nil {
 		buffer_free(&bitmap_buf)
-		err = err2
-		return
+		return {}, {}, {}, err
 	}
-	if len(offsets) > 0 {
-		mem.copy(rawptr(off_buf.data), rawptr(raw_data(offsets)), len(offsets) * size_of(i64))
-	}
-
-	// Data buffer
-	data_buf, err3 := buffer_make(len(data_bytes), allocator)
-	if err3 != nil {
+	data_buf, err = buffer_make_uninit(total_bytes, allocator)
+	if err != nil {
 		buffer_free(&bitmap_buf)
 		buffer_free(&off_buf)
-		err = err3
-		return
+		return {}, {}, {}, err
 	}
-	if len(data_bytes) > 0 {
-		mem.copy(rawptr(data_buf.data), rawptr(raw_data(data_bytes)), len(data_bytes))
-	}
-
-	arr = Array{
-		type       = data_type,
-		length     = length,
-		null_count = null_count,
-		offset     = 0,
-		buffers    = {bitmap_buf, off_buf, data_buf},
-	}
-	return
+	return bitmap_buf, off_buf, data_buf, .None
 }

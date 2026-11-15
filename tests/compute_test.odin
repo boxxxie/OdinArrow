@@ -901,6 +901,30 @@ test_agg_where_compare_i64_on_float_columns :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_compute_arithmetic_type_mismatch_error :: proc(t: ^testing.T) {
+	b1 := oa.builder_make(i32, 4)
+	defer oa.builder_destroy(&b1)
+	b2 := oa.builder_make(i64, 4)
+	defer oa.builder_destroy(&b2)
+	for i in 0..<4 {
+		oa.builder_append(&b1, i32(i))
+		oa.builder_append(&b2, i64(i))
+	}
+	a1, _ := oa.builder_finish(&b1)
+	defer oa.array_free(&a1)
+	a2, _ := oa.builder_finish(&b2)
+	defer oa.array_free(&a2)
+
+	res, err := oa.compute_arithmetic(&a1, &a2, .Add)
+	defer oa.array_free(&res)
+	testing.expect_value(t, err, mem.Allocator_Error.Invalid_Argument)
+
+	res_nil, err_nil := oa.compute_arithmetic(nil, &a2, .Add)
+	defer oa.array_free(&res_nil)
+	testing.expect_value(t, err_nil, mem.Allocator_Error.Invalid_Argument)
+}
+
+@(test)
 test_compute_sort_indices_temp_allocator_no_leak :: proc(t: ^testing.T) {
 	N :: 2048
 	b := oa.builder_make(i32, N)

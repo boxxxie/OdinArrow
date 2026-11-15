@@ -11,6 +11,7 @@ package skadi
 //   Footer length (i32 LE)
 //   "ARROW1"      (6 bytes)
 
+import "base:runtime"
 import "core:mem"
 import "core:os"
 
@@ -345,7 +346,7 @@ _ipc_write_schema_subtree :: proc(b: ^FBB, schema: ^Schema) -> int {
 
 // Returns the encoded schema message bytes (ready to write as IPC metadata).
 _ipc_encode_schema :: proc(schema: ^Schema, allocator := context.allocator) -> []u8 {
-	b := _fbb_make(256, context.allocator)
+	b := _fbb_make(256, allocator)
 	defer _fbb_destroy(&b)
 
 	schema_off := _ipc_write_schema_subtree(&b, schema)
@@ -550,7 +551,7 @@ _ipc_encode_record_batch :: proc(
 	body_length := running_off
 	total_bufs := len(buf_offsets)
 
-	b := _fbb_make(256, context.allocator)
+	b := _fbb_make(256, allocator)
 	defer _fbb_destroy(&b)
 
 	// ── nodes vector: FieldNode struct = {length:i64, null_count:i64} (16 bytes)
@@ -605,7 +606,7 @@ _align_i64 :: #force_inline proc "contextless" (v: ^i64, align: i64) {
 IPC_Block :: struct { offset: i64, meta_len: i32, body_len: i64 }
 
 _ipc_encode_footer :: proc(schema: ^Schema, blocks: []IPC_Block, allocator := context.allocator) -> []u8 {
-	b := _fbb_make(512, context.allocator)
+	b := _fbb_make(512, allocator)
 	defer _fbb_destroy(&b)
 
 	// schema sub-tree (shared encoder, keeps Field layout in lock-step).
@@ -637,37 +638,144 @@ _ipc_encode_footer :: proc(schema: ^Schema, blocks: []IPC_Block, allocator := co
 	return _fbb_finish(&b, ft, allocator)
 }
 
+// ── Vectored writer ───────────────────────────────────────────────────────────
+
+_IPC_IOV_MAX    :: 1024
+_IPC_INLINE_CAP :: 8192
+
+@(private="file", rodata)
+_ipc_zero_pad := [8]u8{}
+
+@(private="file", rodata)
+_ipc_magic_head_bytes := [8]u8{'A', 'R', 'R', 'O', 'W', '1', 0, 0}
+
+@(private="file", rodata)
+_ipc_magic_tail_bytes := [6]u8{'A', 'R', 'R', 'O', 'W', '1'}
+
+@(private="file")
+_IPC_Vectored_Writer :: struct {
+	f:          ^os.File,
+	iovs:       [_IPC_IOV_MAX]_IPC_IOVec,
+	iov_count:  int,
+	inline_buf: [_IPC_INLINE_CAP]u8,
+	inline_pos: int,
+	file_pos:   i64,
+}
+
+_ipc_advance_iovecs :: proc "contextless" (iovs: []_IPC_IOVec, written: int) -> []_IPC_IOVec {
+	if written <= 0 { return iovs }
+	rem := uint(written)
+	idx := 0
+	for idx < len(iovs) && rem >= uint(iovs[idx].iov_len) {
+		rem -= uint(iovs[idx].iov_len)
+		idx += 1
+	}
+	if idx < len(iovs) && rem > 0 {
+		iovs[idx].iov_base = rawptr(uintptr(iovs[idx].iov_base) + uintptr(rem))
+		iovs[idx].iov_len -= _IPC_IOVec_Len(rem)
+	}
+	return iovs[idx:]
+}
+
+@(private="file")
+_ipc_vw_flush :: proc(w: ^_IPC_Vectored_Writer) -> bool {
+	if w.iov_count == 0 { return true }
+	written, ok := _ipc_writev_all(w.f, w.iovs[:w.iov_count])
+	if !ok { return false }
+	w.file_pos += written
+	w.iov_count = 0
+	w.inline_pos = 0
+	return true
+}
+
+// Queue a byte slice whose backing memory remains valid until the next flush.
+@(private="file")
+_ipc_vw_write :: proc(w: ^_IPC_Vectored_Writer, data: []u8) -> bool {
+	if len(data) == 0 { return true }
+	if w.iov_count > 0 {
+		prev := &w.iovs[w.iov_count - 1]
+		prev_end := uintptr(prev.iov_base) + uintptr(prev.iov_len)
+		if prev_end == uintptr(raw_data(data)) &&
+			uint(prev.iov_len) <= uint(max(i32)) &&
+			uint(len(data)) <= uint(max(i32)) - uint(prev.iov_len) {
+			prev.iov_len += _IPC_IOVec_Len(len(data))
+			return true
+		}
+	}
+	if w.iov_count >= _IPC_IOV_MAX {
+		if !_ipc_vw_flush(w) { return false }
+	}
+	w.iovs[w.iov_count] = _IPC_IOVec{
+		iov_base = raw_data(data),
+		iov_len  = _IPC_IOVec_Len(len(data)),
+	}
+	w.iov_count += 1
+	return true
+}
+
+// Stage short-lived scalar framing tokens into the writer's inline buffer.
+@(private="file")
+_ipc_vw_write_inline :: proc(w: ^_IPC_Vectored_Writer, data: []u8) -> bool {
+	if len(data) == 0 { return true }
+	if len(data) > _IPC_INLINE_CAP { return false }
+	if w.inline_pos + len(data) > _IPC_INLINE_CAP || w.iov_count >= _IPC_IOV_MAX {
+		if !_ipc_vw_flush(w) { return false }
+	}
+	dst := w.inline_buf[w.inline_pos : w.inline_pos + len(data)]
+	copy(dst, data)
+	w.inline_pos += len(data)
+	return _ipc_vw_write(w, dst)
+}
+
+@(private="file")
+_ipc_vw_u32 :: proc(w: ^_IPC_Vectored_Writer, v: u32) -> bool {
+	b: [4]u8 = {u8(v), u8(v >> 8), u8(v >> 16), u8(v >> 24)}
+	return _ipc_vw_write_inline(w, b[:])
+}
+
+@(private="file")
+_ipc_vw_i32 :: proc(w: ^_IPC_Vectored_Writer, v: i32) -> bool {
+	return _ipc_vw_u32(w, u32(v))
+}
+
 // ── Public writer ─────────────────────────────────────────────────────────────
 
 // Write all batches to an Arrow IPC file.
 ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -> bool {
-	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+
+	f, err := os.open(path, {.Write, .Create}, os.Permissions_Default_File)
 	if err != nil { return false }
-	defer os.close(f)
+	write_ok := false
+	defer {
+		if !write_ok { _ = os.truncate(f, 0) }
+		os.close(f)
+	}
+
+	w: _IPC_Vectored_Writer = ---
+	w.f = f
+	w.iov_count = 0
+	w.inline_pos = 0
+	w.file_pos = 0
 
 	// Header magic
-	if !_ipc_write_all(f, transmute([]u8)string(IPC_MAGIC_HEAD)) { return false }
+	if !_ipc_vw_write(&w, _ipc_magic_head_bytes[:]) { return false }
 	offset := i64(8)
 
 	// Schema message
-	schema_meta := _ipc_encode_schema(schema)
-	defer delete(schema_meta)
-	if _, ok := _ipc_write_message(f, schema_meta, nil, &offset); !ok { return false }
+	schema_meta := _ipc_encode_schema(schema, context.temp_allocator)
+	if _, ok := _ipc_write_message(&w, schema_meta, nil, &offset); !ok { return false }
 
 	// Record batch messages + block tracking
-	blocks := make([dynamic]IPC_Block, 0, len(batches))
-	defer delete(blocks)
+	blocks := make([dynamic]IPC_Block, 0, len(batches), context.temp_allocator)
 
 	for i in 0..<len(batches) {
-		body_descs := make([dynamic]IPC_Body_Buffer, 0, 32)
-		defer delete(body_descs)
-		scratch_bufs := make([dynamic][]u8, 0, 4)
-		defer { for s in scratch_bufs { delete(s) }; delete(scratch_bufs) }
-		rb_meta := _ipc_encode_record_batch(&batches[i], &body_descs, &scratch_bufs)
-		defer delete(rb_meta)
+		body_descs := make([dynamic]IPC_Body_Buffer, 0, 32, context.temp_allocator)
+		scratch_bufs := make([dynamic][]u8, 0, 4, context.temp_allocator)
+		rb_meta := _ipc_encode_record_batch(&batches[i], &body_descs, &scratch_bufs, context.temp_allocator)
 
 		blk_start := offset
-		body_len, msg_ok := _ipc_write_message(f, rb_meta, body_descs[:], &offset)
+		body_len, msg_ok := _ipc_write_message(&w, rb_meta, body_descs[:], &offset)
 		if !msg_ok { return false }
 		meta_pad   := (8 - (len(rb_meta) % 8)) % 8
 		meta_total := i32(8 + len(rb_meta) + meta_pad)
@@ -675,31 +783,32 @@ ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -
 	}
 
 	// EOS marker
-	if !_ipc_write_u32(f, 0xFFFF_FFFF) { return false }
-	if !_ipc_write_u32(f, 0)           { return false }
+	if !_ipc_vw_u32(&w, 0xFFFF_FFFF) { return false }
+	if !_ipc_vw_u32(&w, 0)           { return false }
 	offset += 8
 
 	// Footer
-	footer := _ipc_encode_footer(schema, blocks[:])
-	defer delete(footer)
-	if !_ipc_write_all(f, footer) { return false }
-	if !_ipc_write_i32(f, i32(len(footer))) { return false }
+	footer := _ipc_encode_footer(schema, blocks[:], context.temp_allocator)
+	if !_ipc_vw_write(&w, footer) { return false }
+	if !_ipc_vw_i32(&w, i32(len(footer))) { return false }
 
 	// Tail magic
-	if !_ipc_write_all(f, transmute([]u8)string(IPC_MAGIC_TAIL)) { return false }
+	if !_ipc_vw_write(&w, _ipc_magic_tail_bytes[:]) { return false }
+	if !_ipc_vw_flush(&w) { return false }
+	_ = os.truncate(f, w.file_pos)
+	write_ok = true
 	return true
 }
 
 // Write one encapsulated IPC message.  Returns (body_length, ok).
-_ipc_write_message :: proc(f: ^os.File, meta: []u8, body_descs: []IPC_Body_Buffer, offset: ^i64) -> (body_len: i64, ok: bool) {
-	zeros: [8]u8
+_ipc_write_message :: proc(w: ^_IPC_Vectored_Writer, meta: []u8, body_descs: []IPC_Body_Buffer, offset: ^i64) -> (body_len: i64, ok: bool) {
 	pad := i64((8 - (len(meta) % 8)) % 8)
 	meta_size := i32(i64(len(meta)) + pad)
 
-	if !_ipc_write_i32(f, IPC_CONTINUATION) { return 0, false }
-	if !_ipc_write_i32(f, meta_size)        { return 0, false }
-	if !_ipc_write_all(f, meta)            { return 0, false }
-	if pad > 0 && !_ipc_write_all(f, zeros[:pad]) { return 0, false }
+	if !_ipc_vw_i32(w, IPC_CONTINUATION) { return 0, false }
+	if !_ipc_vw_i32(w, meta_size)        { return 0, false }
+	if !_ipc_vw_write(w, meta)            { return 0, false }
+	if pad > 0 && !_ipc_vw_write(w, _ipc_zero_pad[:pad]) { return 0, false }
 	offset^ += 8 + i64(meta_size)
 
 	if body_descs == nil { return 0, true }
@@ -707,34 +816,15 @@ _ipc_write_message :: proc(f: ^os.File, meta: []u8, body_descs: []IPC_Body_Buffe
 	body_start := offset^
 	for desc in body_descs {
 		if desc.data != nil && desc.length > 0 {
-			if !_ipc_write_all(f, desc.data[:desc.length]) { return 0, false }
+			if !_ipc_vw_write(w, desc.data[:desc.length]) { return 0, false }
 		}
 		// Pad to 8-byte alignment
 		padded := (desc.length + 7) & ~i64(7)
 		bpad := padded - desc.length
-		if bpad > 0 && !_ipc_write_all(f, zeros[:bpad]) { return 0, false }
+		if bpad > 0 && !_ipc_vw_write(w, _ipc_zero_pad[:bpad]) { return 0, false }
 		offset^ += padded
 	}
 	return offset^ - body_start, true
-}
-
-_ipc_write_all :: proc(f: ^os.File, buf: []u8) -> bool {
-	written := 0
-	for written < len(buf) {
-		n, err := os.write(f, buf[written:])
-		if err != nil || n <= 0 { return false }
-		written += n
-	}
-	return true
-}
-
-_ipc_write_u32 :: proc(f: ^os.File, v: u32) -> bool {
-	b: [4]u8 = {u8(v), u8(v >> 8), u8(v >> 16), u8(v >> 24)}
-	return _ipc_write_all(f, b[:])
-}
-
-_ipc_write_i32 :: proc(f: ^os.File, v: i32) -> bool {
-	return _ipc_write_u32(f, u32(v))
 }
 
 // ── Public reader ─────────────────────────────────────────────────────────────
@@ -749,6 +839,7 @@ _ipc_write_i32 :: proc(f: ^os.File, v: i32) -> bool {
 // later page access SIGBUSes (A5). Pass use_mmap=false in hostile/shared-storage
 // environments to read the file into a private heap buffer instead (a copy, but
 // truncation-safe). `validate` runs the structural + offset integrity checks.
+@(require_results)
 ipc_read_file :: proc(path: string, allocator := context.allocator, validate := true, use_mmap := true) -> (schema: ^Schema, batches: []Record_Batch, ok: bool) {
 	data: []u8
 	release: proc(_: []u8)
@@ -875,32 +966,43 @@ ipc_read_file :: proc(path: string, allocator := context.allocator, validate := 
 
 // Write a schema + batches as an Arrow IPC stream.
 ipc_write_stream :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -> bool {
-	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
-	if err != nil { return false }
-	defer os.close(f)
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
+	f, err := os.open(path, {.Write, .Create}, os.Permissions_Default_File)
+	if err != nil { return false }
+	write_ok := false
+	defer {
+		if !write_ok { _ = os.truncate(f, 0) }
+		os.close(f)
+	}
+
+	w: _IPC_Vectored_Writer = ---
+	w.f = f
+	w.iov_count = 0
+	w.inline_pos = 0
+	w.file_pos = 0
 	offset := i64(0)
 
-	schema_meta := _ipc_encode_schema(schema)
-	defer delete(schema_meta)
-	if _, ok := _ipc_write_message(f, schema_meta, nil, &offset); !ok { return false }
+	schema_meta := _ipc_encode_schema(schema, context.temp_allocator)
+	if _, ok := _ipc_write_message(&w, schema_meta, nil, &offset); !ok { return false }
 
 	for i in 0..<len(batches) {
-		body_descs := make([dynamic]IPC_Body_Buffer, 0, 32)
-		defer delete(body_descs)
-		scratch_bufs := make([dynamic][]u8, 0, 4)
-		defer { for s in scratch_bufs { delete(s) }; delete(scratch_bufs) }
-		rb_meta := _ipc_encode_record_batch(&batches[i], &body_descs, &scratch_bufs)
-		defer delete(rb_meta)
-		if _, ok := _ipc_write_message(f, rb_meta, body_descs[:], &offset); !ok { return false }
+		body_descs := make([dynamic]IPC_Body_Buffer, 0, 32, context.temp_allocator)
+		scratch_bufs := make([dynamic][]u8, 0, 4, context.temp_allocator)
+		rb_meta := _ipc_encode_record_batch(&batches[i], &body_descs, &scratch_bufs, context.temp_allocator)
+		if _, ok := _ipc_write_message(&w, rb_meta, body_descs[:], &offset); !ok { return false }
 	}
 
 	// End-of-stream: continuation marker followed by a zero metadata length.
-	if !_ipc_write_u32(f, 0xFFFF_FFFF) { return false }
-	if !_ipc_write_u32(f, 0)           { return false }
+	if !_ipc_vw_u32(&w, 0xFFFF_FFFF) { return false }
+	if !_ipc_vw_u32(&w, 0)           { return false }
+	if !_ipc_vw_flush(&w)            { return false }
+	_ = os.truncate(f, w.file_pos)
+	write_ok = true
 	return true
 }
 
+@(require_results)
 ipc_read_stream :: proc(path: string, allocator := context.allocator, validate := true, use_mmap := true) -> (schema: ^Schema, batches: []Record_Batch, ok: bool) {
 	data: []u8
 	release: proc(_: []u8)

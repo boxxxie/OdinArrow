@@ -1,5 +1,6 @@
 package skadi_tests
 
+import "core:mem"
 import "core:testing"
 import oa "../skadi"
 
@@ -115,4 +116,108 @@ test_buffer_pool_strings :: proc(t: ^testing.T) {
 	testing.expect_value(t, a.length, 3)
 	testing.expect_value(t, oa.array_get_string(&a, 0), "alpha")
 	testing.expect_value(t, oa.array_get_string(&a, 2), "gamma")
+}
+
+@(test)
+test_buffer_pool_alignment_bucketing :: proc(t: ^testing.T) {
+	pool: oa.Buffer_Pool
+	oa.buffer_pool_init(&pool)
+	defer oa.buffer_pool_destroy(&pool)
+	alloc := oa.buffer_pool_allocator(&pool)
+
+	p8, err8 := mem.alloc(128, 1, alloc)
+	testing.expect_value(t, err8, mem.Allocator_Error.None)
+	mem.free(p8, alloc)
+
+	p64, err64 := mem.alloc(128, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err64, mem.Allocator_Error.None)
+	testing.expect(t, p64 != p8, "64-byte aligned alloc must not reuse 8-byte aligned bucket")
+	testing.expect(t, uintptr(p64) % oa.ARROW_ALIGNMENT == 0, "64-byte block must be aligned")
+	mem.free(p64, alloc)
+
+	p128, err128 := mem.alloc(128, 128, alloc)
+	testing.expect_value(t, err128, mem.Allocator_Error.None)
+	testing.expect(t, p128 != p64, "128-byte aligned alloc must not reuse 64-byte aligned bucket")
+	testing.expect(t, uintptr(p128) % 128 == 0, "128-byte block must be 128-byte aligned")
+	mem.free(p128, alloc)
+
+	p128_reused, err128_2 := mem.alloc(128, 128, alloc)
+	testing.expect_value(t, err128_2, mem.Allocator_Error.None)
+	testing.expect(t, p128_reused == p128, "second 128-byte alloc should reuse the 128-byte bucket")
+	mem.free(p128_reused, alloc)
+}
+
+@(test)
+test_buffer_pool_hit_miss_telemetry :: proc(t: ^testing.T) {
+	pool: oa.Buffer_Pool
+	oa.buffer_pool_init(&pool)
+	defer oa.buffer_pool_destroy(&pool)
+	alloc := oa.buffer_pool_allocator(&pool)
+
+	p1, err1 := mem.alloc(100, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err1, mem.Allocator_Error.None)
+	testing.expect_value(t, pool.misses, u64(1))
+	testing.expect_value(t, pool.hits, u64(0))
+
+	// Fits within bucket_size=128 -> in-place resize counts as a hit.
+	p1_inplace, err2 := mem.resize(p1, 100, 120, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err2, mem.Allocator_Error.None)
+	testing.expect(t, p1_inplace == p1)
+	testing.expect_value(t, pool.hits, u64(1))
+	testing.expect_value(t, pool.misses, u64(1))
+
+	// Grow beyond bucket_size=128 -> miss for new 256B block; old 128B block goes to free_list.
+	p1_grown, err3 := mem.resize(p1_inplace, 120, 200, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err3, mem.Allocator_Error.None)
+	testing.expect_value(t, pool.misses, u64(2))
+	testing.expect_value(t, pool.hits, u64(1))
+
+	// Allocating 100B again should pop the recycled 128B block -> hit.
+	p2, err4 := mem.alloc(100, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err4, mem.Allocator_Error.None)
+	testing.expect(t, p2 == p1, "should reuse recycled 128B bucket block")
+	testing.expect_value(t, pool.hits, u64(2))
+	testing.expect_value(t, pool.misses, u64(2))
+
+	mem.free(p1_grown, alloc)
+	mem.free(p2, alloc)
+}
+
+@(test)
+test_buffer_pool_large_256kb_bucketing :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+
+	pool: oa.Buffer_Pool
+	oa.buffer_pool_init(&pool)
+	defer oa.buffer_pool_destroy(&pool)
+	alloc := oa.buffer_pool_allocator(&pool)
+
+	sz1 :: 4*1024*1024 + 1
+	sz2 :: 4*1024*1024 + 200*1024 // same 256 KB-aligned bucket (4 MB + 256 KB)
+	p1, err1 := mem.alloc(sz1, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err1, mem.Allocator_Error.None)
+	mem.free(p1, alloc)
+
+	p2, err2 := mem.alloc(sz2, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err2, mem.Allocator_Error.None)
+	testing.expect(t, p2 == p1, "4MB+1 and 4MB+200KB should share the 256KB-aligned bucket")
+	testing.expect_value(t, pool.hits, u64(1))
+	testing.expect_value(t, pool.misses, u64(1))
+	mem.free(p2, alloc)
+
+	p3, err3 := mem.alloc(10_000_000, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err3, mem.Allocator_Error.None)
+	mem.free(p3, alloc)
+
+	p4, err4 := mem.alloc(10_050_000, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err4, mem.Allocator_Error.None)
+	testing.expect(t, p4 == p3, "10M and 10.05M should reuse same 256KB bucket without jumping to 16MB")
+	testing.expect_value(t, pool.hits, u64(2))
+	mem.free(p4, alloc)
 }

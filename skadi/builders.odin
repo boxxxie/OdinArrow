@@ -11,7 +11,7 @@ import "core:mem"
 Primitive_Builder :: struct($T: typeid) {
 	data:       [^]T,   // raw value buffer
 	cap:        int,
-	bitmap:     [^]u8,  // validity bitmap (all-zero = all valid); sized lazily
+	bitmap:     [^]u8,  // validity bitmap (0xFF-filled on first null); allocated lazily
 	bm_cap:     int,
 	null_count: int,
 	length:     int,
@@ -21,16 +21,14 @@ Primitive_Builder :: struct($T: typeid) {
 // Allocate a new builder with preallocated capacity.
 builder_make :: proc($T: typeid, initial_cap := 64, allocator := context.allocator) -> Primitive_Builder(T) {
 	init_cap := max(initial_cap, 1)
-	bm       := bitmap_byte_count(init_cap)
+	assert(init_cap <= max(int) / max(size_of(T), 1), "builder_make: capacity overflow")
 	// Values are fully overwritten before the array is read, so the data buffer
-	// is left uninitialised; the bitmap must start zeroed (lazy valid bits).
-	data_bytes, _ := mem.alloc_bytes_non_zeroed(init_cap * size_of(T), ARROW_ALIGNMENT, allocator)
-	bm_raw,     _ := mem.alloc(bm, ARROW_ALIGNMENT, allocator)
+	// is left uninitialised; the bitmap is allocated lazily on the first null.
+	data_bytes, data_err := mem.alloc_bytes_non_zeroed(init_cap * size_of(T), ARROW_ALIGNMENT, allocator)
+	assert(data_err == .None, "builder_make: data allocation failed")
 	return Primitive_Builder(T){
 		data      = cast([^]T)raw_data(data_bytes),
 		cap       = init_cap,
-		bitmap    = cast([^]u8)bm_raw,
-		bm_cap    = bm,
 		allocator = allocator,
 	}
 }
@@ -39,11 +37,6 @@ builder_make :: proc($T: typeid, initial_cap := 64, allocator := context.allocat
 builder_append :: #force_inline proc(b: ^Primitive_Builder($T), val: T) {
 	if b.length >= b.cap { _builder_grow_data(b) }
 	b.data[b.length] = val
-	if b.null_count > 0 {
-		byte_i := b.length >> 3
-		if byte_i >= b.bm_cap { _builder_grow_bitmap(b, byte_i + 1) }
-		b.bitmap[byte_i] |= 1 << u8(b.length & 7)
-	}
 	b.length += 1
 }
 
@@ -51,12 +44,10 @@ builder_append :: #force_inline proc(b: ^Primitive_Builder($T), val: T) {
 builder_append_null :: #force_inline proc(b: ^Primitive_Builder($T)) {
 	if b.length >= b.cap { _builder_grow_data(b) }
 	byte_i := b.length >> 3
-	if byte_i >= b.bm_cap { _builder_grow_bitmap(b, byte_i + 1) }
-	if b.null_count == 0 {
-		// First null: retroactively mark all previous elements valid.
-		bitmap_set_all(b.bitmap, b.length)
+	if byte_i >= b.bm_cap {
+		_builder_grow_bitmap(b, max(bitmap_byte_count(b.cap), byte_i + 1))
 	}
-	// Null bit stays 0 (bitmap zeroed on alloc/grow).
+	b.bitmap[byte_i] &= ~(1 << u8(b.length & 7))
 	zero: T
 	b.data[b.length] = zero
 	b.null_count += 1
@@ -70,6 +61,7 @@ builder_append_null :: #force_inline proc(b: ^Primitive_Builder($T)) {
 // and the builder is left empty so it can be safely destroyed or reused (the
 // next append re-grows from nil).  Bool still packs its 1-byte-per-value buffer
 // into a bitmap, which requires a fresh allocation.
+@(require_results)
 builder_finish :: proc(
 	b:         ^Primitive_Builder($T),
 	allocator := context.allocator,
@@ -77,12 +69,28 @@ builder_finish :: proc(
 	// Validity bitmap — only materialised when there are nulls; transferred.
 	bitmap_buf: Buffer
 	if b.null_count > 0 {
+		bm_size := bitmap_byte_count(b.length)
+		if b.bm_cap < bm_size {
+			_builder_grow_bitmap(b, bm_size)
+		}
+		active_bytes := (b.length + 7) / 8
+		rem := uint(b.length) & 7
+		if rem != 0 && active_bytes > 0 {
+			b.bitmap[active_bytes - 1] &= u8((1 << rem) - 1)
+		}
+		if bm_size > active_bytes {
+			mem.zero(rawptr(b.bitmap[active_bytes:]), bm_size - active_bytes)
+		}
 		bitmap_buf = Buffer{
 			data      = b.bitmap,
-			size      = bitmap_byte_count(b.length),
+			size      = bm_size,
 			capacity  = b.bm_cap,
 			allocator = b.allocator,
 		}
+		b.bitmap = nil
+		b.bm_cap = 0
+	} else if b.bitmap != nil {
+		mem.free_with_size(rawptr(b.bitmap), b.bm_cap, b.allocator)
 		b.bitmap = nil
 		b.bm_cap = 0
 	}
@@ -99,7 +107,7 @@ builder_finish :: proc(
 		}
 		data_buf = buf
 		if b.data != nil {
-			mem.free(rawptr(b.data), b.allocator)
+			mem.free_with_size(rawptr(b.data), b.cap * size_of(T), b.allocator)
 			b.data = nil
 			b.cap  = 0
 		}
@@ -129,31 +137,38 @@ builder_finish :: proc(
 }
 
 builder_reset :: proc(b: ^Primitive_Builder($T)) {
-	if b.bitmap != nil { mem.zero(rawptr(b.bitmap), b.bm_cap) }
+	if b.bitmap != nil { mem.set(rawptr(b.bitmap), 0xFF, b.bm_cap) }
 	b.null_count = 0
 	b.length     = 0
 }
 
 builder_destroy :: proc(b: ^Primitive_Builder($T)) {
-	if b.data   != nil { mem.free(rawptr(b.data),   b.allocator) }
-	if b.bitmap != nil { mem.free(rawptr(b.bitmap), b.allocator) }
+	if b.data   != nil { mem.free_with_size(rawptr(b.data),   b.cap * size_of(T), b.allocator) }
+	if b.bitmap != nil { mem.free_with_size(rawptr(b.bitmap), b.bm_cap,           b.allocator) }
 	b^ = {}
 }
 
 // ── growth helpers ────────────────────────────────────────────────────────────
 
 _builder_grow_data :: proc(b: ^Primitive_Builder($T)) {
+	assert(b.cap <= max(int) / 2, "Primitive_Builder: capacity overflow")
 	new_cap := max(b.cap * 2, 16)
-	new_raw, _ := mem.resize(rawptr(b.data), b.cap * size_of(T), new_cap * size_of(T), ARROW_ALIGNMENT, b.allocator)
+	elem_sz := max(size_of(T), 1)
+	assert(new_cap <= max(int) / elem_sz, "Primitive_Builder: byte size overflow")
+	new_raw, err := mem.resize_non_zeroed(rawptr(b.data), b.length * size_of(T), new_cap * size_of(T), ARROW_ALIGNMENT, b.allocator)
+	assert(err == .None, "_builder_grow_data: allocation failed")
 	b.data = cast([^]T)new_raw
 	b.cap  = new_cap
 }
 
 _builder_grow_bitmap :: proc(b: ^Primitive_Builder($T), needed: int) {
-	new_cap := align_up(max(b.bm_cap * 2, needed), ARROW_ALIGNMENT)
-	new_raw, _ := mem.resize(rawptr(b.bitmap), b.bm_cap, new_cap, ARROW_ALIGNMENT, b.allocator)
+	assert(needed <= max(int) - ARROW_ALIGNMENT, "Primitive_Builder: bitmap needed overflow")
+	doubled := b.bm_cap * 2 if b.bm_cap <= max(int) / 2 else max(int) - ARROW_ALIGNMENT
+	new_cap := align_up(max(doubled, needed), ARROW_ALIGNMENT)
+	new_raw, err := mem.resize_non_zeroed(rawptr(b.bitmap), b.bm_cap, new_cap, ARROW_ALIGNMENT, b.allocator)
+	assert(err == .None, "_builder_grow_bitmap: allocation failed")
 	if new_cap > b.bm_cap {
-		mem.zero(rawptr((cast([^]u8)new_raw)[b.bm_cap:]), new_cap - b.bm_cap)
+		mem.set(rawptr((cast([^]u8)new_raw)[b.bm_cap:]), 0xFF, new_cap - b.bm_cap)
 	}
 	b.bitmap = cast([^]u8)new_raw
 	b.bm_cap = new_cap

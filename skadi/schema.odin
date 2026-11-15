@@ -19,6 +19,7 @@ field_make :: proc(name: string, type: DataType, nullable := true) -> Field {
 }
 
 // Deep-copies field names so the schema owns its strings.
+@(require_results)
 schema_make :: proc(fields: []Field, allocator := context.allocator) -> (s: Schema, err: mem.Allocator_Error) {
 	fs := make([]Field, len(fields), allocator) or_return
 	for i in 0..<len(fields) {
