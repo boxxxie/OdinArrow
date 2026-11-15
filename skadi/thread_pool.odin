@@ -69,7 +69,7 @@ _pool_init :: proc() {
 @(private)
 _pool_worker :: proc(w: ^_Pool_Worker) {
 	p := w.pool
-	last_gen: u64 = 0
+	last_gen := u64(0)
 	for {
 		sync.mutex_lock(&p.mutex)
 		for p.gen == last_gen && !p.shutdown {
@@ -87,6 +87,7 @@ _pool_worker :: proc(w: ^_Pool_Worker) {
 
 		if w.id < jn {
 			job(ctx, w.id)
+			free_all(context.temp_allocator)
 			sync.mutex_lock(&p.mutex)
 			p.completed += 1
 			if p.completed == jn {

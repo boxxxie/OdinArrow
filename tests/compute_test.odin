@@ -1,5 +1,6 @@
 package skadi_tests
 
+import "core:os"
 import "core:testing"
 import oa "../skadi"
 
@@ -665,18 +666,176 @@ test_agg_with_nulls_sliced :: proc(t: ^testing.T) {
 	arr, _ := oa.builder_finish(&b)
 	defer oa.array_free(&arr)
 
-	check :: proc(t: ^testing.T, a: ^oa.Array) {
+	check :: proc(tc: ^testing.T, a: ^oa.Array) {
 		ref_sum := 0.0; ref_valid := 0
 		for i in 0..<a.length {
 			if !oa.array_is_null(a, i) { ref_sum += oa.array_get(a, i, f64); ref_valid += 1 }
 		}
 		sum, vc := oa.compute_sum(a)
-		testing.expect_value(t, vc, ref_valid)
-		testing.expect(t, approx_eq(sum, ref_sum, 1e-6))
+		testing.expect_value(tc, vc, ref_valid)
+		testing.expect(tc, approx_eq(sum, ref_sum, 1e-6))
 	}
 
 	s_aligned := oa.array_slice(arr, 8, 180)   // offset 8  → bulk path
 	check(t, &s_aligned)
 	s_unaligned := oa.array_slice(arr, 3, 175)  // offset 3  → fallback path
 	check(t, &s_unaligned)
+}
+
+@(test)
+test_compute_unaligned_sliced_f64_simd :: proc(t: ^testing.T) {
+	b := oa.builder_make(f64, 40)
+	defer oa.builder_destroy(&b)
+	for i in 0..<40 {
+		oa.builder_append(&b, f64(i))
+	}
+	arr, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, nil)
+	defer oa.array_free(&arr)
+
+	// Sliced with offset = 1, length = 35 (null-free)
+	sl := oa.array_slice(arr, 1, 36)
+	testing.expect_value(t, sl.offset, 1)
+	testing.expect_value(t, sl.length, 35)
+
+	// compute_sum on unaligned f64 slice (#simd[4]f64)
+	sum, count := oa.compute_sum(&sl)
+	testing.expect_value(t, count, 35)
+	// sum of 1..35 is 35 * 36 / 2 = 630.0
+	testing.expect(t, approx_eq(sum, 630.0, 1e-6), "unaligned sliced sum mismatch")
+
+	// compute_compare on unaligned f64 slice (#simd[8]f64)
+	mask, cmp_err := oa.compute_compare(&sl, .Gt, 20.0)
+	testing.expect_value(t, cmp_err, nil)
+	defer oa.array_free(&mask)
+	testing.expect_value(t, mask.length, 35)
+	for i in 0..<35 {
+		val := oa.array_get(&sl, i, f64)
+		expected := val > 20.0
+		testing.expect_value(t, oa.array_get(&mask, i, bool), expected)
+	}
+}
+
+@(test)
+test_compute_large_ipc_nt_store_alignment :: proc(t: ^testing.T) {
+	n := 2 * 1024 * 1024
+	b := oa.builder_make(i32, n)
+	defer oa.builder_destroy(&b)
+	for i in 0..<n {
+		oa.builder_append(&b, i32(i % 1000))
+	}
+	arr, b_err := oa.builder_finish(&b)
+	testing.expect_value(t, b_err, nil)
+
+	fields := []oa.Field{oa.field_make("val", oa.Int32_Type{})}
+	sc, s_err := oa.schema_make(fields)
+	testing.expect_value(t, s_err, nil)
+	defer oa.schema_free(&sc)
+
+	rb, rb_ok := oa.record_batch_make(&sc, []oa.Array{arr})
+	testing.expect(t, rb_ok)
+	if !rb_ok {
+		oa.array_free(&arr)
+		return
+	}
+	defer oa.record_batch_free(&rb)
+
+	path_str := ipc_test_temp_path("large_nt", "arrow")
+	defer {
+		os.remove(path_str)
+		delete(path_str)
+	}
+
+	wrote := oa.ipc_write_file(path_str, &sc, []oa.Record_Batch{rb})
+	testing.expect(t, wrote)
+
+	sc_read, batches, ok := oa.ipc_read_file(path_str, use_mmap = false)
+	testing.expect(t, ok)
+	defer {
+		if sc_read != nil {
+			oa.schema_free(sc_read)
+			free(sc_read)
+		}
+		for bx in batches {
+			bc := bx
+			oa.record_batch_free(&bc)
+		}
+		delete(batches)
+	}
+	testing.expect_value(t, len(batches), 1)
+	if !ok || len(batches) == 0 {
+		return
+	}
+	col := oa.record_batch_column_at(&batches[0], 0)
+
+	// Cast i32 to i64 triggers _cast_impl with n * size_of(i64) = 16 MiB >= 8 MiB NT store
+	cast_res, c_err := oa.compute_cast(col, oa.Int64_Type{})
+	testing.expect_value(t, c_err, nil)
+	defer oa.array_free(&cast_res)
+	testing.expect_value(t, cast_res.length, n)
+	if cast_res.length == n {
+		testing.expect_value(t, oa.array_get(&cast_res, 0, i64), i64(0))
+		testing.expect_value(t, oa.array_get(&cast_res, n - 1, i64), i64((n - 1) % 1000))
+	}
+}
+
+@(test)
+test_cast_sliced_offset_8_masks_validity_trailing_bits :: proc(t: ^testing.T) {
+	// Force validity bitmap to be allocated and set bits 1..15 valid, bit 0 null
+	b2 := oa.builder_make(i32, 16)
+	defer oa.builder_destroy(&b2)
+	oa.builder_append_null(&b2)
+	for i in 1..<16 {
+		oa.builder_append(&b2, i32(i))
+	}
+	arr2, b2_err := oa.builder_finish(&b2)
+	testing.expect_value(t, b2_err, nil)
+	defer oa.array_free(&arr2)
+
+	sl := oa.array_slice(arr2, 8, 11) // offset = 8 (byte-aligned), length = 3
+	cast_res, c_err := oa.compute_cast(&sl, oa.Float64_Type{})
+	testing.expect_value(t, c_err, nil)
+	defer oa.array_free(&cast_res)
+
+	testing.expect(t, cast_res.buffers[0].data != nil, "validity bitmap must be preserved")
+	if cast_res.buffers[0].data != nil {
+		// Only bits 0, 1, 2 should be set (0b0000_0111 = 0x07), trailing bits 3..7 must be 0
+		testing.expect_value(t, cast_res.buffers[0].data[0], u8(0x07))
+	}
+}
+
+@(test)
+test_agg_where_compare_i64_on_float_columns :: proc(t: ^testing.T) {
+	b := oa.builder_make(f64, 4)
+	defer oa.builder_destroy(&b)
+	// 2^53 = 9007199254740992.0 (exact in f64), 2^53 + 2 = 9007199254740994.0 (exact in f64)
+	oa.builder_append(&b, 9007199254740992.0)
+	oa.builder_append(&b, 9007199254740994.0)
+	oa.builder_append(&b, -5.0)
+	oa.builder_append_null(&b)
+	arr, b_err := oa.builder_finish(&b)
+	testing.expect_value(t, b_err, nil)
+	defer oa.array_free(&arr)
+
+	// Compare f64 column against i64(2^53 + 1): only 2^53 + 2 is > 2^53 + 1
+	agg := oa.compute_agg_where_compare_i64(&arr, &arr, .Gt, i64(9_007_199_254_740_993))
+	testing.expect(t, agg.valid)
+	testing.expect_value(t, agg.count, 1)
+	testing.expect_value(t, agg.min_val, 9007199254740994.0)
+	testing.expect_value(t, agg.max_val, 9007199254740994.0)
+
+	// f32 column check
+	bf := oa.builder_make(f32, 3)
+	defer oa.builder_destroy(&bf)
+	oa.builder_append(&bf, f32(10.0))
+	oa.builder_append(&bf, f32(20.0))
+	oa.builder_append(&bf, f32(30.0))
+	arrf, bf_err := oa.builder_finish(&bf)
+	testing.expect_value(t, bf_err, nil)
+	defer oa.array_free(&arrf)
+
+	aggf := oa.compute_agg_where_compare_i64(&arrf, &arrf, .Ge, i64(20))
+	testing.expect(t, aggf.valid)
+	testing.expect_value(t, aggf.count, 2)
+	testing.expect_value(t, aggf.sum, 50.0)
 }

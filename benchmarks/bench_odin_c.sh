@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single-threaded head-to-head: OdinArrow vs Apache Arrow C++.
+# Single-threaded head-to-head: Skadi vs Apache Arrow C++.
 #
 # Builds and runs the paired benchmarks in benchmarks/odin_c (Odin) and
 # benchmarks/cpp/bench_odin_c.cpp (C++), both emitting `key=nanoseconds` lines
@@ -18,7 +18,7 @@ ARROW_IDIR="$(python3 -c "import pyarrow; print(pyarrow.get_include())")"
 ARROW_LDIR="$(python3 -c "import pyarrow; print(pyarrow.get_library_dirs()[0])")"
 ARROW_VER="2400"
 
-echo "Building OdinArrow benchmark binary..."
+echo "Building Skadi benchmark binary..."
 odin build "$ROOT/benchmarks/odin_c" -out:"$ROOT/bin/bench_odin_c_odin" -o:speed
 
 echo "Building Arrow C++ benchmark binary..."
@@ -30,7 +30,7 @@ g++ -std=c++20 -O3 -I"$ARROW_IDIR" \
     -Wl,-rpath,"$ARROW_LDIR" \
     -o "$ROOT/bin/bench_odin_c_cpp"
 
-echo "Running OdinArrow benchmarks (single-threaded)..."
+echo "Running Skadi benchmarks (single-threaded)..."
 ODIN_OUT=$("$ROOT/bin/bench_odin_c_odin")
 
 echo "Running Arrow C++ benchmarks (single-threaded)..."
@@ -99,7 +99,7 @@ ratio() {
 }
 
 echo ""
-echo "## OdinArrow vs Apache Arrow C++ (single-threaded) Benchmark Results"
+echo "## Skadi vs Apache Arrow C++ (single-threaded) Benchmark Results"
 echo ""
 printf "| %-37s | %12s | %13s | %9s |\n" \
     "Benchmark" "Odin (ms)" "ArrowC++ (ms)" "C++/Odin"
@@ -124,6 +124,6 @@ for i in "${!KEYS[@]}"; do
 done
 
 echo ""
-echo "_C++/Odin: Arrow C++ time divided by OdinArrow time._"
-echo "_Values > 1x mean OdinArrow is faster; < 1x mean it is slower._"
+echo "_C++/Odin: Arrow C++ time divided by Skadi time._"
+echo "_Values > 1x mean Skadi is faster; < 1x mean it is slower._"
 echo "_Both sides single-threaded (serial kernels) for per-core comparison._"

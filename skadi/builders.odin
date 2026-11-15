@@ -20,15 +20,15 @@ Primitive_Builder :: struct($T: typeid) {
 
 // Allocate a new builder with preallocated capacity.
 builder_make :: proc($T: typeid, initial_cap := 64, allocator := context.allocator) -> Primitive_Builder(T) {
-	cap := max(initial_cap, 1)
-	bm  := bitmap_byte_count(cap)
+	init_cap := max(initial_cap, 1)
+	bm       := bitmap_byte_count(init_cap)
 	// Values are fully overwritten before the array is read, so the data buffer
 	// is left uninitialised; the bitmap must start zeroed (lazy valid bits).
-	data_bytes, _ := mem.alloc_bytes_non_zeroed(cap * size_of(T), ARROW_ALIGNMENT, allocator)
+	data_bytes, _ := mem.alloc_bytes_non_zeroed(init_cap * size_of(T), ARROW_ALIGNMENT, allocator)
 	bm_raw,     _ := mem.alloc(bm, ARROW_ALIGNMENT, allocator)
 	return Primitive_Builder(T){
 		data      = cast([^]T)raw_data(data_bytes),
-		cap       = cap,
+		cap       = init_cap,
 		bitmap    = cast([^]u8)bm_raw,
 		bm_cap    = bm,
 		allocator = allocator,
@@ -98,6 +98,11 @@ builder_finish :: proc(
 			if b.data[i] { buf.data[i >> 3] |= 1 << u8(i & 7) }
 		}
 		data_buf = buf
+		if b.data != nil {
+			mem.free(rawptr(b.data), b.allocator)
+			b.data = nil
+			b.cap  = 0
+		}
 	} else {
 		// Transfer ownership of the value buffer directly — no copy.
 		data_buf = Buffer{
@@ -117,11 +122,14 @@ builder_finish :: proc(
 		offset     = 0,
 		buffers    = {bitmap_buf, data_buf, {}},
 	}
+	b.length     = 0
+	b.null_count = 0
+	b.bm_cap     = 0
 	return
 }
 
 builder_reset :: proc(b: ^Primitive_Builder($T)) {
-	mem.zero(rawptr(b.bitmap), b.bm_cap)
+	if b.bitmap != nil { mem.zero(rawptr(b.bitmap), b.bm_cap) }
 	b.null_count = 0
 	b.length     = 0
 }
@@ -142,7 +150,7 @@ _builder_grow_data :: proc(b: ^Primitive_Builder($T)) {
 }
 
 _builder_grow_bitmap :: proc(b: ^Primitive_Builder($T), needed: int) {
-	new_cap := max(b.bm_cap * 2, needed, 8)
+	new_cap := align_up(max(b.bm_cap * 2, needed), ARROW_ALIGNMENT)
 	new_raw, _ := mem.resize(rawptr(b.bitmap), b.bm_cap, new_cap, ARROW_ALIGNMENT, b.allocator)
 	if new_cap > b.bm_cap {
 		mem.zero(rawptr((cast([^]u8)new_raw)[b.bm_cap:]), new_cap - b.bm_cap)

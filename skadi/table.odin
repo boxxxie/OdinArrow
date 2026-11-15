@@ -22,7 +22,7 @@ Table :: struct {
 }
 
 // Build a Table by stacking Record_Batches. All batches must share the same
-// schema (field count and types must match). Chunk Arrays are borrowed.
+// schema (field count, names, and types must match). Chunk Arrays are borrowed.
 table_from_record_batches :: proc(
 	batches: []Record_Batch,
 	allocator := context.allocator,
@@ -30,9 +30,19 @@ table_from_record_batches :: proc(
 	if len(batches) == 0 { return {}, false }
 
 	schema := batches[0].schema
+	if schema == nil { return {}, false }
 	n_cols := len(schema.fields)
+	if len(batches[0].columns) != n_cols { return {}, false }
 	for i in 1..<len(batches) {
+		if batches[i].schema == nil { return {}, false }
 		if len(batches[i].schema.fields) != n_cols { return {}, false }
+		if len(batches[i].columns) != n_cols { return {}, false }
+		for c in 0..<n_cols {
+			if batches[i].schema.fields[c].type != schema.fields[c].type ||
+			   batches[i].schema.fields[c].name != schema.fields[c].name {
+				return {}, false
+			}
+		}
 	}
 
 	columns, err := make([]Chunked_Array, n_cols, allocator)
@@ -40,7 +50,13 @@ table_from_record_batches :: proc(
 
 	for col_i in 0..<n_cols {
 		chunks, cerr := make([]Array, len(batches), allocator)
-		if cerr != nil { return {}, false }
+		if cerr != nil {
+			for j in 0..<col_i {
+				delete(columns[j].chunks, allocator)
+			}
+			delete(columns, allocator)
+			return {}, false
+		}
 		total := 0
 		for bi in 0..<len(batches) {
 			chunks[bi] = batches[bi].columns[col_i]

@@ -6,3 +6,6 @@ Learn/
 __pycache__/
 *.pyc
 .tmp/
+*.bin
+*.so
+benchmarks/__pycache__/

@@ -138,8 +138,8 @@ main :: proc() {
 	if avail < 8 * 1024 * 1024 { avail = 8 * 1024 * 1024 }
 
 	bytes_per_row := i64(0)
-	for j in 0..<n_cols {
-		m := metas[j]
+	for i in 0..<n_cols {
+		m := metas[i]
 		if m.ptype == PTYPE_INT32 {
 			bytes_per_row += 4
 		} else if m.has_dict {

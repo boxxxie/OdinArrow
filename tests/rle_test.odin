@@ -71,3 +71,35 @@ test_rle_encode_matches_plain :: proc(t: ^testing.T) {
 	testing.expect(t, approx_eq(oa.rle_sum(&a), ref_sum, 1e-6))
 	testing.expect(t, oa.rle_encoded_bytes(&a) < N * size_of(i32), "encoded form is smaller")
 }
+
+@(test)
+test_rle_try_get_with_nulls :: proc(t: ^testing.T) {
+	b := oa.rle_builder_make(i32)
+	defer oa.rle_builder_destroy(&b)
+	oa.rle_append(&b, 42)
+	oa.rle_append(&b, 42)
+	oa.rle_append_null(&b)
+	oa.rle_append_null(&b)
+	oa.rle_append(&b, 99)
+
+	a := oa.rle_builder_finish(&b)
+	defer oa.rle_free(&a)
+
+	testing.expect(t, !oa.rle_is_null(&a, 0))
+	testing.expect(t, oa.rle_is_null(&a, 2))
+	testing.expect(t, oa.rle_is_null(&a, 3))
+	testing.expect(t, !oa.rle_is_null(&a, 4))
+
+	v0, ok0 := oa.rle_try_get(&a, 0)
+	testing.expect(t, ok0)
+	testing.expect_value(t, v0, i32(42))
+	testing.expect_value(t, oa.rle_get(&a, 1), i32(42))
+
+	v2, ok2 := oa.rle_try_get(&a, 2)
+	testing.expect(t, !ok2)
+	testing.expect_value(t, v2, i32(0))
+
+	v4, ok4 := oa.rle_try_get(&a, 4)
+	testing.expect(t, ok4)
+	testing.expect_value(t, v4, i32(99))
+}

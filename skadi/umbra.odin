@@ -1,5 +1,6 @@
 package skadi
 
+import "base:runtime"
 import "core:mem"
 import "core:strings"
 
@@ -138,6 +139,7 @@ umbra_count_eq :: proc(a: ^Umbra_Array, needle: string) -> int {
 // Stable ascending sort; returns an Int64 index array (feeds compute_take-style
 // gathers). Uses umbra_compare, so the prefix fast path carries most of the work.
 umbra_sort_indices :: proc(a: ^Umbra_Array, allocator := context.allocator) -> Array {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	n := a.length
 	idx := make([]i64, max(n, 1), context.temp_allocator)
 	for i in 0..<n { idx[i] = i64(i) }

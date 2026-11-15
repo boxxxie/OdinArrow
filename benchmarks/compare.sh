@@ -88,7 +88,7 @@ ratio() {
 }
 
 echo ""
-echo "## OdinArrow (threaded) vs PyArrow vs Apache Arrow C++ Benchmark Results"
+echo "## Skadi (threaded) vs PyArrow vs Apache Arrow C++ Benchmark Results"
 echo ""
 printf "| %-30s | %12s | %10s | %13s | %8s | %8s |\n" \
     "Benchmark" "OdinMT (ms)" "Python (ms)" "ArrowC++ (ms)" "Py/Odin" "C++/Odin"

@@ -1,5 +1,6 @@
 package skadi
 
+import "base:runtime"
 import "core:mem"
 import "core:os"
 
@@ -199,12 +200,15 @@ _Filter_Task :: struct {
 // compute_filter supports except String/Binary (their offset buffers would
 // need rebasing on merge — those fall back to the serial kernel).
 compute_filter_parallel :: proc(arr, mask: ^Array, num_threads := 0, allocator := context.allocator) -> (result: Array, err: mem.Allocator_Error) {
+	assert(arr.length == mask.length, "filter mask length must match array length")
+	_, is_bool := mask.type.(Bool_Type)
+	assert(is_bool, "filter mask must be boolean")
 	nt := _resolve_threads(num_threads, arr.length)
 	#partial switch _ in arr.type {
-	case String_Type, Binary_Type:
+	case String_Type, Binary_Type, Large_String_Type, Large_Binary_Type, Null_Type, Bool_Type:
 		return compute_filter(arr, mask, allocator)
 	}
-	if arr.length < PARALLEL_MIN_LENGTH || nt <= 1 {
+	if arr.length < PARALLEL_MIN_LENGTH || nt <= 1 || (arr.offset & 7 != 0) || (mask.offset & 7 != 0) {
 		return compute_filter(arr, mask, allocator)
 	}
 
@@ -215,19 +219,20 @@ compute_filter_parallel :: proc(arr, mask: ^Array, num_threads := 0, allocator :
 	// validity-byte boundary — that keeps the null-aware bulk aggregation path
 	// (which needs offset % 8 == 0) active inside every worker.
 	chunk := (((arr.length + nt - 1) / nt) + 7) &~ 7
+	worker_alloc := runtime.heap_allocator()
 	for i in 0..<nt {
 		from := min(i * chunk, arr.length)
 		to   := min(from + chunk, arr.length)
 		tasks[i].slice      = array_slice(arr^, from, to)
 		tasks[i].mask_slice = array_slice(mask^, from, to)
-		tasks[i].allocator  = allocator
+		tasks[i].allocator  = worker_alloc
 	}
 	_pool_run(nt, _filter_job, raw_data(tasks))
 	for i in 0..<nt {
 		if tasks[i].err != nil { err = tasks[i].err }
 	}
 	defer for &t in tasks {
-		array_free(&t.result)
+		array_free(&t.result, worker_alloc)
 	}
 	if err != nil { return }
 

@@ -44,7 +44,10 @@ jobs:
         run: make test
 
       - name: Verify package documentation generation
-        run: odin doc skadi > /dev/null
+        run: |
+          odin doc skadi > /dev/null
+          if [ -d skadi/pipeline ]; then odin doc skadi/pipeline > /dev/null; fi
+          if [ -d deps/sleipnir/actor ]; then odin doc deps/sleipnir/actor > /dev/null; fi
 
       - name: Run quickstart example & verify PyArrow IPC interop
         run: |

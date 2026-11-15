@@ -28,10 +28,10 @@ String_Builder :: struct {
 }
 
 string_builder_make :: proc(initial_cap := 64, allocator := context.allocator) -> String_Builder {
-	cap      := max(initial_cap, 1)
-	data_cap := cap * 8
-	off_cap  := cap + 1
-	bm       := bitmap_byte_count(cap)
+	init_cap := max(initial_cap, 1)
+	data_cap := init_cap * 8
+	off_cap  := init_cap + 1
+	bm       := bitmap_byte_count(init_cap)
 	// data and offsets are fully written before the array is read → leave
 	// uninitialised; the validity bitmap must start zeroed.
 	data_bytes, _ := mem.alloc_bytes_non_zeroed(data_cap,               ARROW_ALIGNMENT, allocator)
@@ -99,6 +99,10 @@ string_builder_finish :: proc(b: ^String_Builder, allocator := context.allocator
 		offset     = 0,
 		buffers    = {bitmap_buf, off_buf, data_buf},
 	}
+	b.length     = 0
+	b.data_len   = 0
+	b.null_count = 0
+	b.bm_cap     = 0
 	_ = allocator
 	return
 }
@@ -136,7 +140,7 @@ _sb_grow_offsets :: proc(b: ^String_Builder) {
 }
 
 _sb_grow_bitmap :: proc(b: ^String_Builder, needed: int) {
-	new_cap := max(b.bm_cap * 2, needed, 8)
+	new_cap := align_up(max(b.bm_cap * 2, needed), ARROW_ALIGNMENT)
 	new_raw, _ := mem.resize(rawptr(b.bitmap), b.bm_cap, new_cap, ARROW_ALIGNMENT, b.allocator)
 	if new_cap > b.bm_cap {
 		mem.zero(rawptr((cast([^]u8)new_raw)[b.bm_cap:]), new_cap - b.bm_cap)
@@ -189,8 +193,21 @@ binary_builder_append_null :: proc(b: ^Binary_Builder) {
 	b.length += 1
 }
 
+binary_builder_reset :: proc(b: ^Binary_Builder) {
+	clear(&b.offsets)
+	clear(&b.data)
+	clear(&b.bitmap)
+	append(&b.offsets, i32(0))
+	b.null_count = 0
+	b.length     = 0
+}
+
 binary_builder_finish :: proc(b: ^Binary_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
-	return _var_finish(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Binary_Type{}, allocator)
+	arr, err = _var_finish(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Binary_Type{}, allocator)
+	if err == nil {
+		binary_builder_reset(b)
+	}
+	return
 }
 
 binary_builder_destroy :: proc(b: ^Binary_Builder) {
@@ -250,7 +267,11 @@ large_string_builder_append_null :: proc(b: ^Large_String_Builder) {
 }
 
 large_string_builder_finish :: proc(b: ^Large_String_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
-	return _var_finish_i64(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Large_String_Type{}, allocator)
+	arr, err = _var_finish_i64(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Large_String_Type{}, allocator)
+	if err == nil {
+		large_string_builder_reset(b)
+	}
+	return
 }
 
 large_string_builder_reset :: proc(b: ^Large_String_Builder) {
@@ -314,8 +335,21 @@ large_binary_builder_append_null :: proc(b: ^Large_Binary_Builder) {
 	b.length += 1
 }
 
+large_binary_builder_reset :: proc(b: ^Large_Binary_Builder) {
+	clear(&b.offsets)
+	clear(&b.data)
+	clear(&b.bitmap)
+	append(&b.offsets, i64(0))
+	b.null_count = 0
+	b.length     = 0
+}
+
 large_binary_builder_finish :: proc(b: ^Large_Binary_Builder, allocator := context.allocator) -> (arr: Array, err: mem.Allocator_Error) {
-	return _var_finish_i64(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Large_Binary_Type{}, allocator)
+	arr, err = _var_finish_i64(b.offsets[:], b.data[:], b.bitmap[:], b.null_count, b.length, Large_Binary_Type{}, allocator)
+	if err == nil {
+		large_binary_builder_reset(b)
+	}
+	return
 }
 
 large_binary_builder_destroy :: proc(b: ^Large_Binary_Builder) {
@@ -345,6 +379,7 @@ array_get_binary :: proc(arr: ^Array, i: int) -> []u8 {
 	idx     := arr.offset + i
 	start   := int(offsets[idx])
 	end     := int(offsets[idx + 1])
+	if start == end { return nil }
 	return arr.buffers[2].data[start:end]
 }
 
@@ -366,6 +401,7 @@ array_get_large_binary :: proc(arr: ^Array, i: int) -> []u8 {
 	idx     := arr.offset + i
 	start   := int(offsets[idx])
 	end     := int(offsets[idx + 1])
+	if start == end { return nil }
 	return arr.buffers[2].data[start:end]
 }
 
