@@ -12,23 +12,28 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$ROOT/bin"
 
-# Apache Arrow C++ paths — resolved from the bundled PyArrow installation
-# (mirrors the Makefile).
-ARROW_IDIR="$(python3 -c "import pyarrow; print(pyarrow.get_include())")"
-ARROW_LDIR="$(python3 -c "import pyarrow; print(pyarrow.get_library_dirs()[0])")"
-ARROW_VER="2400"
-
 echo "Building Skadi benchmark binary..."
-odin build "$ROOT/benchmarks/odin_c" -out:"$ROOT/bin/bench_odin_c_odin" -o:speed
+odin build "$ROOT/benchmarks/odin_c" -out:"$ROOT/bin/bench_odin_c_odin" -o:speed -microarch:native
 
 echo "Building Arrow C++ benchmark binary..."
-g++ -std=c++20 -O3 -I"$ARROW_IDIR" \
-    "$ROOT/benchmarks/cpp/bench_odin_c.cpp" \
-    -L"$ARROW_LDIR" \
-    -l:libarrow.so.$ARROW_VER \
-    -l:libarrow_compute.so.$ARROW_VER \
-    -Wl,-rpath,"$ARROW_LDIR" \
-    -o "$ROOT/bin/bench_odin_c_cpp"
+if pkg-config --exists arrow arrow-compute 2>/dev/null; then
+    g++ -std=c++20 -O3 $(pkg-config --cflags arrow arrow-compute) \
+        "$ROOT/benchmarks/cpp/bench_odin_c.cpp" \
+        $(pkg-config --libs arrow arrow-compute) \
+        -o "$ROOT/bin/bench_odin_c_cpp"
+else
+    # Apache Arrow C++ paths — fallback to bundled PyArrow installation.
+    ARROW_IDIR="$(python3 -c "import pyarrow; print(pyarrow.get_include())")"
+    ARROW_LDIR="$(python3 -c "import pyarrow; print(pyarrow.get_library_dirs()[0])")"
+    ARROW_VER="${ARROW_VER:-2400}"
+    g++ -std=c++20 -O3 -I"$ARROW_IDIR" \
+        "$ROOT/benchmarks/cpp/bench_odin_c.cpp" \
+        -L"$ARROW_LDIR" \
+        -l:libarrow.so."$ARROW_VER" \
+        -l:libarrow_compute.so."$ARROW_VER" \
+        -Wl,-rpath,"$ARROW_LDIR" \
+        -o "$ROOT/bin/bench_odin_c_cpp"
+fi
 
 echo "Running Skadi benchmarks (single-threaded)..."
 ODIN_OUT=$("$ROOT/bin/bench_odin_c_odin")
