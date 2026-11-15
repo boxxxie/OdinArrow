@@ -11,6 +11,8 @@ import "base:intrinsics"
 //   min/max : 8-way scalar unroll so LLVM emits vpminsd/vpmaxsd ymm (AVX2)
 //   min+max : single pass combined; ~2× faster than two separate passes
 
+_SIMD_TARGET_FEATURE :: "avx2" when ODIN_ARCH == .amd64 else ""
+
 // ── f64 sum ───────────────────────────────────────────────────────────────────
 
 _sum_f64_simd :: #force_inline proc "contextless" (data: [^]f64, n: int) -> f64 {
@@ -102,7 +104,7 @@ _max_i32_simd :: #force_inline proc "contextless" (data: [^]i32, n: int) -> i32 
 // 2013+). To support older hardware later, gate this behind a runtime CPUID
 // check (e.g. core:sys/info or an `intrinsics` feature probe) and fall back to an
 // SSE4.1 (pminsd) or scalar variant — i.e. runtime dispatch like Arrow does.
-@(enable_target_feature = "avx2")
+@(enable_target_feature = _SIMD_TARGET_FEATURE)
 _min_max_i32_simd :: proc "contextless" (data: [^]i32, n: int) -> (lo: i32, hi: i32) {
 	V  :: #simd[8]i32
 	vp := cast([^]V)data

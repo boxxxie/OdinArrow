@@ -2,23 +2,33 @@ SRC   := src
 TESTS := tests
 BIN   := bin
 
-# Apache Arrow C++ paths — resolved from the bundled PyArrow installation.
+# Apache Arrow C++ paths — prefer system pkg-config, fall back to bundled PyArrow.
+HAS_PKG_ARROW := $(shell pkg-config --exists arrow arrow-compute 2>/dev/null && echo 1 || echo 0)
+ifeq ($(HAS_PKG_ARROW),1)
+ARROW_IDIR       := $(shell pkg-config --variable=includedir arrow 2>/dev/null)
+ARROW_LDIR       := $(shell pkg-config --variable=libdir arrow 2>/dev/null)
+ARROW_CPP_FLAGS  := -std=c++20 -O3 $(shell pkg-config --cflags arrow arrow-compute)
+ARROW_LINK_FLAGS := $(shell pkg-config --libs arrow arrow-compute) -Wl,-rpath,$(ARROW_LDIR)
+PARQUET_LINK_FLAGS := $(shell pkg-config --libs arrow parquet) -Wl,-rpath,$(ARROW_LDIR)
+else
 ARROW_IDIR := $(shell python3 -c "import pyarrow; print(pyarrow.get_include())" 2>/dev/null)
 ARROW_LDIR := $(shell python3 -c "import pyarrow; print(pyarrow.get_library_dirs()[0])" 2>/dev/null)
-ARROW_VER  := 2400
+ARROW_VER  ?= $(shell python3 -c "import pyarrow, glob, os; d = pyarrow.get_library_dirs()[0]; m = sorted(glob.glob(os.path.join(d, 'libarrow.so.*'))); print(os.path.basename(m[0]).split('libarrow.so.')[1] if m else '2400')" 2>/dev/null)
+ARROW_COMPUTE_LIB := $(shell python3 -c "import pyarrow, glob, os; d = pyarrow.get_library_dirs()[0]; m = sorted(glob.glob(os.path.join(d, 'libarrow_compute.so.*'))); print('-l:' + os.path.basename(m[0]) if m else '')" 2>/dev/null)
 
 ARROW_CPP_FLAGS  := -std=c++20 -O3 -I$(ARROW_IDIR)
 ARROW_LINK_FLAGS := -L$(ARROW_LDIR) \
+    $(ARROW_COMPUTE_LIB) \
     -l:libarrow.so.$(ARROW_VER) \
-    -l:libarrow_compute.so.$(ARROW_VER) \
     -Wl,-rpath,$(ARROW_LDIR)
 
 PARQUET_LINK_FLAGS := -L$(ARROW_LDIR) \
-    -l:libarrow.so.$(ARROW_VER) \
     -l:libparquet.so.$(ARROW_VER) \
+    -l:libarrow.so.$(ARROW_VER) \
     -Wl,-rpath,$(ARROW_LDIR)
+endif
 
-TEST_DATA := $(HOME)/Work/Projects/Odin/test_data.parquet
+TEST_DATA ?= test_data.parquet
 
 .PHONY: all test test-cpp bench-odin bench-python bench bench-compare \
         build-arrow-capi bench-arrow-cpp \

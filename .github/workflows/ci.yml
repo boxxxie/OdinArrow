@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, "feat/**", "fix/**", "perf/**", "test/**"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Odin compiler
+        uses: laytan/setup-odin@v2
+        with:
+          release: latest
+          token: ${{ secrets.GITHUB_TOKEN }}
+          cache: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyArrow
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "pyarrow>=24.0.0" || python3 -m pip install pyarrow
+
+      - name: Run strict static analysis across all packages
+        run: |
+          if grep -q '^check:' Makefile; then
+            make check
+          else
+            odin check src -no-entry-point -vet -strict-style
+            odin check examples/quickstart -vet -strict-style
+          fi
+
+      - name: Run unit, regression & 4-layer ATDD specification suites
+        run: make test
+
+      - name: Verify package documentation generation
+        run: |
+          odin doc src > /dev/null
+          if [ -d src/pipeline ]; then odin doc src/pipeline > /dev/null; fi
+          if [ -d deps/sleipnir/actor ]; then odin doc deps/sleipnir/actor > /dev/null; fi
+
+      - name: Run quickstart example & verify PyArrow IPC interop
+        run: |
+          sed -i.bak '/defer os.remove(path)/d' examples/quickstart/main.odin
+          odin run examples/quickstart -out:/tmp/quickstart
+          mv examples/quickstart/main.odin.bak examples/quickstart/main.odin
+          python3 -c '
+          import pyarrow.ipc as ipc
+          t = ipc.open_file("/tmp/odinarrow_quickstart.arrow").read_all()
+          assert t.num_rows == 3, f"expected 3 rows, got {t.num_rows}"
+          assert t["id"].to_pylist() == [1, 2, 3]
+          assert t["name"].to_pylist() == ["ada", "alan", "grace"]
+          print("PyArrow IPC verification passed:", t.to_pydict())
+          '
+          rm -f /tmp/odinarrow_quickstart.arrow
+
+      - name: Build native CSV <-> Parquet CLI programs & verify round-trip
+        run: |
+          make parquet-odin csv-to-parquet-odin
+          printf "id,name,city\nR001,ada,London\nR002,alan,Paris\nR003,grace,Tokyo\n" > /tmp/ci_in.csv
+          ./bin/csv_to_parquet_odin /tmp/ci_in.csv /tmp/ci_out.parquet
+          ./bin/parquet_to_csv_odin /tmp/ci_out.parquet /tmp/ci_out.csv
+          diff -u /tmp/ci_in.csv /tmp/ci_out.csv
+
+      - name: Run Arrow C++ FFI layout compatibility tests (Linux)
+        if: runner.os == 'Linux'
+        run: make test-cpp build-parquet-capi parquet-ffi csv-to-parquet-ffi
