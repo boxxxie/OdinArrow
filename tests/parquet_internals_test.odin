@@ -14,7 +14,8 @@ g_pq_test_seq: u64
 
 pq_temp_file :: proc(tag: string) -> string {
 	seq := sync.atomic_add(&g_pq_test_seq, 1)
-	return fmt.tprintf("%s/oa_pq_unit_%d_%d_%s.bin", os.temp_dir(context.temp_allocator), os.get_pid(), seq, tag)
+	td, _ := os.temp_dir(context.temp_allocator)
+	return fmt.tprintf("%s/oa_pq_unit_%d_%d_%s.bin", td, os.get_pid(), seq, tag)
 }
 
 // Encodes `vals` (must be a multiple of 8) as a single Parquet bit-packed run.
@@ -707,4 +708,323 @@ test_csv_and_out_simd_16byte_boundaries :: proc(t: ^testing.T) {
 	out_bytes, r_err := os.read_entire_file(csv_out, context.temp_allocator)
 	testing.expect_value(t, r_err, nil)
 	testing.expect_value(t, string(out_bytes), content)
+}
+
+free_pq_metas :: proc(metas: []p2c.Column_Chunk_Meta) {
+	for &m in metas {
+		delete(transmute([]u8)m.name)
+		delete(m.extra_rg_data_offsets)
+		delete(m.extra_rg_num_values)
+		delete(m.extra_rg_dict_offsets)
+		delete(m.extra_rg_has_dict)
+	}
+	delete(metas)
+}
+
+@(test)
+test_parquet_parse_footer_corrupt_magic_and_truncated :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	csv_in  := pq_temp_file("bad_footer_in")
+	pq_path := pq_temp_file("bad_footer_pq")
+	bad_pq  := pq_temp_file("bad_footer_corrupt")
+	csv_out := pq_temp_file("bad_footer_out")
+	defer {
+		_ = os.remove(csv_in)
+		_ = os.remove(pq_path)
+		_ = os.remove(bad_pq)
+		_ = os.remove(csv_out)
+	}
+
+	testing.expect_value(t, os.write_entire_file(csv_in, transmute([]u8)string("a,b\n1,hello\n2,world\n")), nil)
+	rows, _, c_err := c2p.csv_to_parquet_stream(csv_in, pq_path, 64 * 1024 * 1024)
+	testing.expect_value(t, c_err, nil)
+	testing.expect_value(t, rows, 2)
+
+	orig, r_err := os.read_entire_file(pq_path, context.allocator)
+	testing.expect_value(t, r_err, nil)
+	defer delete(orig)
+
+	// Baseline: valid footer parses cleanly
+	num_rows, metas, base_ok := p2c.parse_footer(orig)
+	testing.expect(t, base_ok, "valid Parquet file must parse cleanly")
+	testing.expect_value(t, num_rows, i64(2))
+	testing.expect_value(t, len(metas), 2)
+	free_pq_metas(metas)
+
+	n := len(orig)
+	testing.expect(t, n > 12)
+
+	// 1. Short slices (< 12 bytes)
+	for cut in ([]int{0, 4, 8, 11}) {
+		_, m_short, ok_short := p2c.parse_footer(orig[:cut])
+		testing.expectf(t, !ok_short, "short slice of len %d must fail parse_footer", cut)
+		if ok_short { free_pq_metas(m_short) }
+	}
+
+	buf := make([]u8, n, context.allocator)
+	defer delete(buf)
+
+	// 2. Corrupt leading and trailing PAR1 magic bytes
+	for pos in ([]int{0, 3, n - 4, n - 1}) {
+		copy(buf, orig)
+		buf[pos] = 'X'
+		_, m_magic, ok_magic := p2c.parse_footer(buf)
+		testing.expectf(t, !ok_magic, "corrupted PAR1 magic at byte %d must fail", pos)
+		if ok_magic { free_pq_metas(m_magic) }
+	}
+
+	// 3. Invalid footer_len values: 0, negative (-1), and n - 11 (overlaps leading PAR1)
+	write_i32_le :: proc(dst: []u8, off: int, val: i32) {
+		u := u32(val)
+		dst[off + 0] = u8(u)
+		dst[off + 1] = u8(u >> 8)
+		dst[off + 2] = u8(u >> 16)
+		dst[off + 3] = u8(u >> 24)
+	}
+
+	for bad_len in ([]i32{0, -1, i32(n - 11), i32(n)}) {
+		copy(buf, orig)
+		write_i32_le(buf, n - 8, bad_len)
+		_, m_len, ok_len := p2c.parse_footer(buf)
+		testing.expectf(t, !ok_len, "footer_len=%d must fail parse_footer", bad_len)
+		if ok_len { free_pq_metas(m_len) }
+	}
+
+	// 4. Truncated Thrift footer metadata (first half of serialized FileMetaData repacked with PAR1 magic)
+	orig_footer_len := i32(orig[n-8]) | (i32(orig[n-7]) << 8) | (i32(orig[n-6]) << 16) | (i32(orig[n-5]) << 24)
+	orig_footer := orig[n - 8 - int(orig_footer_len) : n - 8]
+	trunc_len := max(1, len(orig_footer) / 2)
+	trunc_pq := make([]u8, 4 + trunc_len + 8, context.allocator)
+	defer delete(trunc_pq)
+	copy(trunc_pq[:4], transmute([]u8)string("PAR1"))
+	copy(trunc_pq[4:4+trunc_len], orig_footer[:trunc_len])
+	write_i32_le(trunc_pq, 4 + trunc_len, i32(trunc_len))
+	copy(trunc_pq[4+trunc_len+4:], transmute([]u8)string("PAR1"))
+	_, m_trunc, ok_trunc := p2c.parse_footer(trunc_pq)
+	testing.expect(t, !ok_trunc, "truncated Thrift footer must fail parse_footer")
+	if ok_trunc { free_pq_metas(m_trunc) }
+
+	// 5. parquet_to_csv_stream surfaces Parquet_To_CSV_Bad_Footer_Error on overlapping footer_len
+	copy(buf, orig)
+	write_i32_le(buf, n - 8, i32(n - 11))
+	testing.expect_value(t, os.write_entire_file(bad_pq, buf), nil)
+	_, _, stream_err := p2c.parquet_to_csv_stream(bad_pq, csv_out, 64 * 1024 * 1024)
+	_, is_bad_footer := stream_err.(p2c.Parquet_To_CSV_Bad_Footer_Error)
+	testing.expect(t, is_bad_footer, "parquet_to_csv_stream must return Bad_Footer_Error on invalid footer_len")
+}
+
+@(test)
+test_parquet_rejects_unsupported_compression_codecs :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	csv_in  := pq_temp_file("codec_in")
+	pq_path := pq_temp_file("codec_pq")
+	bad_pq  := pq_temp_file("codec_snappy_pq")
+	csv_out := pq_temp_file("codec_out")
+	defer {
+		_ = os.remove(csv_in)
+		_ = os.remove(pq_path)
+		_ = os.remove(bad_pq)
+		_ = os.remove(csv_out)
+	}
+
+	testing.expect_value(t, os.write_entire_file(csv_in, transmute([]u8)string("col_codec_marker\nval1\nval2\n")), nil)
+	rows, _, c_err := c2p.csv_to_parquet_stream(csv_in, pq_path, 64 * 1024 * 1024)
+	testing.expect_value(t, c_err, nil)
+	testing.expect_value(t, rows, 2)
+
+	orig, r_err := os.read_entire_file(pq_path, context.allocator)
+	testing.expect_value(t, r_err, nil)
+	defer delete(orig)
+
+	_, metas, ok := p2c.parse_footer(orig)
+	testing.expect(t, ok)
+	testing.expect_value(t, len(metas), 1)
+	defer free_pq_metas(metas)
+	testing.expect_value(t, metas[0].codec, i32(0))
+
+	// 1. col_stream_init rejects non-zero codecs (SNAPPY=1, ZSTD=6)
+	for bad_codec in ([]i32{1, 6}) {
+		bad_meta := metas[0]
+		bad_meta.codec = bad_codec
+		_, init_ok := p2c.col_stream_init(pq_path, bad_meta)
+		testing.expectf(t, !init_ok, "col_stream_init must reject unsupported codec %d", bad_codec)
+	}
+
+	// 2. col_stream_load_page rejects non-zero stream codec even after init
+	{
+		cs, cs_ok := p2c.col_stream_init(pq_path, metas[0])
+		testing.expect(t, cs_ok)
+		defer p2c.col_stream_destroy(&cs)
+		cs.codec = 2 // GZIP
+		testing.expect(t, !p2c.col_stream_load_page(&cs), "col_stream_load_page must reject non-zero codec")
+	}
+
+	// 3. Patch Thrift ColumnMetaData field 4 (codec=0 -> 1/SNAPPY) in footer & test full pipeline rejection
+	patched := make([]u8, len(orig), context.allocator)
+	defer delete(patched)
+	copy(patched, orig)
+
+	marker := "col_codec_marker"
+	n := len(patched)
+	footer_len := int(patched[n-8]) | (int(patched[n-7]) << 8) | (int(patched[n-6]) << 16) | (int(patched[n-5]) << 24)
+	footer_start := n - 8 - footer_len
+	patch_pos := -1
+	search: for i in footer_start ..< n - 8 - len(marker) - 2 {
+		for j in 0 ..< len(marker) {
+			if patched[i+j] != marker[j] { continue search }
+		}
+		// ColumnMetaData path_in_schema (field 3) is immediately followed by field 4 TW_I32 (0x15) and zigzag(0)=0x00.
+		if patched[i+len(marker)] == 0x15 && patched[i+len(marker)+1] == 0x00 {
+			patch_pos = i + len(marker) + 1
+			break
+		}
+	}
+	testing.expect(t, patch_pos >= 0, "expected ColumnMetaData codec field in Thrift footer")
+	if patch_pos >= 0 {
+		patched[patch_pos] = 0x02 // zigzag(1) -> codec = 1 (SNAPPY)
+		_, p_metas, p_ok := p2c.parse_footer(patched)
+		testing.expect(t, p_ok)
+		testing.expect_value(t, p_metas[0].codec, i32(1))
+		free_pq_metas(p_metas)
+
+		testing.expect_value(t, os.write_entire_file(bad_pq, patched), nil)
+		_, _, stream_err := p2c.parquet_to_csv_stream(bad_pq, csv_out, 64 * 1024 * 1024)
+		_, is_init_err := stream_err.(p2c.Parquet_To_CSV_Stream_Init_Error)
+		testing.expect(t, is_init_err, "parquet_to_csv_stream must reject non-uncompressed codec with Stream_Init_Error")
+	}
+}
+
+@(test)
+test_cli_csv_to_parquet_and_parquet_to_csv_flags_and_errors :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	// 1. Unit tests for csv_to_parquet.parse_cli_args
+	{
+		mb, inp, outp, ok := c2p.parse_cli_args([]string{"in.csv", "out.parquet"})
+		testing.expect(t, ok)
+		testing.expect_value(t, mb, 200)
+		testing.expect_value(t, inp, "in.csv")
+		testing.expect_value(t, outp, "out.parquet")
+
+		mb2, inp2, outp2, ok2 := c2p.parse_cli_args([]string{"-m", "64", "a.csv", "b.parquet"})
+		testing.expect(t, ok2)
+		testing.expect_value(t, mb2, 64)
+		testing.expect_value(t, inp2, "a.csv")
+		testing.expect_value(t, outp2, "b.parquet")
+
+		bad_cases := [][](string){
+			[]string{},
+			[]string{"only_one.csv"},
+			[]string{"-m"},
+			[]string{"a.csv", "b.parquet", "-m"},
+			[]string{"-m", "0", "a.csv", "b.parquet"},
+			[]string{"-m", "-5", "a.csv", "b.parquet"},
+			[]string{"-m", "abc", "a.csv", "b.parquet"},
+			[]string{"-x", "a.csv", "b.parquet"},
+			[]string{"a.csv", "b.parquet", "extra"},
+		}
+		for args in bad_cases {
+			_, _, _, bad_ok := c2p.parse_cli_args(args)
+			testing.expectf(t, !bad_ok, "c2p.parse_cli_args must reject %v", args)
+		}
+	}
+
+	// 2. Unit tests for parquet_to_csv.parse_cli_args
+	{
+		mb, inp, outp, ok := p2c.parse_cli_args([]string{"in.parquet"})
+		testing.expect(t, ok)
+		testing.expect_value(t, mb, 200)
+		testing.expect_value(t, inp, "in.parquet")
+		testing.expect_value(t, outp, "-")
+
+		mb2, inp2, outp2, ok2 := p2c.parse_cli_args([]string{"in.parquet", "-", "-m", "128"})
+		testing.expect(t, ok2)
+		testing.expect_value(t, mb2, 128)
+		testing.expect_value(t, inp2, "in.parquet")
+		testing.expect_value(t, outp2, "-")
+
+		bad_cases := [][](string){
+			[]string{},
+			[]string{"-", "out.csv"},
+			[]string{"-m"},
+			[]string{"-m", "0", "in.parquet"},
+			[]string{"-m", "-1", "in.parquet"},
+			[]string{"-m", "nope", "in.parquet"},
+			[]string{"--bogus", "in.parquet"},
+			[]string{"in.parquet", "out.csv", "extra"},
+		}
+		for args in bad_cases {
+			_, _, _, bad_ok := p2c.parse_cli_args(args)
+			testing.expectf(t, !bad_ok, "p2c.parse_cli_args must reject %v", args)
+		}
+	}
+
+	// 3. Build temporary CLI executables and verify subprocess exit codes
+	c2p_bin := pq_temp_file("cli_c2p_bin")
+	p2c_bin := pq_temp_file("cli_p2c_bin")
+	csv_in  := pq_temp_file("cli_in")
+	pq_mid  := pq_temp_file("cli_mid")
+	csv_out := pq_temp_file("cli_out")
+	defer {
+		_ = os.remove(c2p_bin)
+		_ = os.remove(p2c_bin)
+		_ = os.remove(csv_in)
+		_ = os.remove(pq_mid)
+		_ = os.remove(csv_out)
+	}
+
+	st_b1, _, _, err_b1 := os.process_exec(
+		os.Process_Desc{command = []string{"odin", "build", "examples/csv_to_parquet", fmt.tprintf("-out:%s", c2p_bin)}},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, err_b1, nil)
+	testing.expect_value(t, st_b1.exit_code, 0)
+
+	st_b2, _, _, err_b2 := os.process_exec(
+		os.Process_Desc{command = []string{"odin", "build", "examples/parquet_to_csv", fmt.tprintf("-out:%s", p2c_bin)}},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, err_b2, nil)
+	testing.expect_value(t, st_b2.exit_code, 0)
+
+	sample_csv := "k,v\nalpha,10\nbeta,20\n"
+	testing.expect_value(t, os.write_entire_file(csv_in, transmute([]u8)sample_csv), nil)
+
+	st_ok1, _, _, err_ok1 := os.process_exec(
+		os.Process_Desc{command = []string{c2p_bin, "-m", "32", csv_in, pq_mid}},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, err_ok1, nil)
+	testing.expect_value(t, st_ok1.exit_code, 0)
+
+	st_ok2, _, _, err_ok2 := os.process_exec(
+		os.Process_Desc{command = []string{p2c_bin, "-m", "32", pq_mid, csv_out}},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, err_ok2, nil)
+	testing.expect_value(t, st_ok2.exit_code, 0)
+
+	out_bytes, r_err := os.read_entire_file(csv_out, context.temp_allocator)
+	testing.expect_value(t, r_err, nil)
+	testing.expect_value(t, string(out_bytes), sample_csv)
+
+	bad_cmds := [][](string){
+		[]string{c2p_bin},
+		[]string{c2p_bin, "-m", "0", csv_in, pq_mid},
+		[]string{c2p_bin, "-m", "abc", csv_in, pq_mid},
+		[]string{c2p_bin, csv_in, pq_mid, "-m"},
+		[]string{c2p_bin, fmt.tprintf("%s_missing", csv_in), pq_mid},
+		[]string{p2c_bin},
+		[]string{p2c_bin, "-m", "0", pq_mid, csv_out},
+		[]string{p2c_bin, "-m", "abc", pq_mid, csv_out},
+		[]string{p2c_bin, pq_mid, csv_out, "-m"},
+		[]string{p2c_bin, fmt.tprintf("%s_missing", pq_mid), csv_out},
+	}
+	for cmd in bad_cmds {
+		st_bad, _, _, err_bad := os.process_exec(os.Process_Desc{command = cmd}, context.temp_allocator)
+		testing.expect_value(t, err_bad, nil)
+		testing.expectf(t, st_bad.exit_code != 0, "expected non-zero exit for %v, got %d", cmd, st_bad.exit_code)
+	}
 }

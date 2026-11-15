@@ -625,7 +625,8 @@ g_cpp_ipc_seq: u64
 
 cpp_temp_path :: proc(tag, ext: string) -> string {
     seq := sync.atomic_add(&g_cpp_ipc_seq, 1)
-    return fmt.tprintf("%s/oa_cpp_%d_%d_%s.%s", os.temp_dir(context.temp_allocator), os.get_pid(), seq, tag, ext)
+    td, _ := os.temp_dir(context.temp_allocator)
+    return fmt.tprintf("%s/oa_cpp_%d_%d_%s.%s", td, os.get_pid(), seq, tag, ext)
 }
 
 @(test)

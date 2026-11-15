@@ -22,6 +22,7 @@ REP_OPTIONAL :: i32(1)
 Column_Chunk_Meta :: struct {
 	name:          string,
 	ptype:         i32,
+	codec:         i32,
 	num_values:    i64,
 	uncomp_size:   i64, // total_uncompressed_size from ColumnMetaData field 6
 	data_offset:   i64,
@@ -112,6 +113,9 @@ parse_footer_struct :: proc(data: []u8) -> (num_rows: i64, metas: []Column_Chunk
 				vals[rg-1]      = rg_metas[rg_idx].num_values
 				dict_offs[rg-1] = rg_metas[rg_idx].dict_offset
 				has_dicts[rg-1] = rg_metas[rg_idx].has_dict
+				if rg_metas[rg_idx].codec != 0 && result[col].codec == 0 {
+					result[col].codec = rg_metas[rg_idx].codec
+				}
 			}
 			result[col].extra_rg_data_offsets = offs
 			result[col].extra_rg_num_values   = vals
@@ -130,7 +134,7 @@ parse_footer :: proc(data: []u8) -> (num_rows: i64, metas: []Column_Chunk_Meta, 
 	if n < 12 { return }
 	if string(data[:4]) != "PAR1" || string(data[n-4:]) != "PAR1" { return }
 	footer_len := int(read_i32_le(data, n-8))
-	if footer_len >= n-8 { return }
+	if footer_len <= 0 || footer_len > n - 12 { return }
 	return parse_footer_struct(data[n-8-footer_len : n-8])
 }
 
@@ -150,7 +154,7 @@ parse_footer_from_file :: proc(file: ^os.File) -> (num_rows: i64, metas: []Colum
 	if n_tail < 8 || string(tail[4:]) != "PAR1" { return }
 
 	footer_len := int(read_i32_le(tail[:], 0))
-	if footer_len <= 0 || i64(footer_len) >= file_size - 8 { return }
+	if footer_len <= 0 || i64(footer_len) > file_size - 12 { return }
 
 	footer_buf := make([]u8, footer_len)
 	defer delete(footer_buf)
@@ -231,6 +235,7 @@ parse_column_metadata :: proc(t: ^Thrift, meta: ^Column_Chunk_Meta) {
 		fid, ftype, stop := thrift_read_field(t, &prev)
 		if stop || t.err { break }
 		switch fid {
+		case 4:  meta.codec       = thrift_read_i32(t)
 		case 5:  meta.num_values  = thrift_read_i64(t)
 		case 6:  meta.uncomp_size = thrift_read_i64(t)
 		case 9:  meta.data_offset = thrift_read_i64(t)
@@ -430,6 +435,7 @@ Col_Stream :: struct {
 	file:                  ^os.File,
 	file_size:             i64,
 	ptype:                 i32,
+	codec:                 i32,
 	max_def:               i32,
 	has_dict:              bool,
 	page_is_dict:          bool,
@@ -471,7 +477,7 @@ _col_stream_load_dict :: proc(cs: ^Col_Stream, ph: Page_Header, probe: []u8, hdr
 
 	dict_data_size := int(ph.comp)
 	n_vals := int(ph.num_values)
-	if dict_data_size < 0 || n_vals < 0 || n_vals > dict_data_size / 4 {
+	if cs.codec != 0 || ph.comp != ph.uncomp || dict_data_size < 0 || n_vals < 0 || n_vals > dict_data_size / 4 {
 		return false
 	}
 	if page_start_off < 0 || hdr_pos < 0 {
@@ -542,7 +548,7 @@ col_stream_init :: proc(path: string, meta: Column_Chunk_Meta) -> (cs: Col_Strea
 		os.close(f)
 		return
 	}
-	if meta.num_values < 0 {
+	if meta.num_values < 0 || meta.codec != 0 {
 		os.close(f)
 		return
 	}
@@ -550,6 +556,7 @@ col_stream_init :: proc(path: string, meta: Column_Chunk_Meta) -> (cs: Col_Strea
 	cs.file         = f
 	cs.file_size    = fsz
 	cs.ptype        = meta.ptype
+	cs.codec        = meta.codec
 	cs.max_def      = meta.max_def_level
 	cs.has_dict     = meta.has_dict
 	cs.rg_total     = int(meta.num_values)
@@ -679,7 +686,7 @@ col_stream_load_page :: proc(cs: ^Col_Stream) -> bool {
 	}
 
 	total_data := int(ph.comp)
-	if total_data < 0 || cs.page_off < 0 || hdr_pos < 0 {
+	if cs.codec != 0 || ph.comp != ph.uncomp || total_data < 0 || cs.page_off < 0 || hdr_pos < 0 {
 		return false
 	}
 	if cs.file_size >= 0 {

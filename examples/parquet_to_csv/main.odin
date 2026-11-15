@@ -91,29 +91,50 @@ out_i32 :: proc(o: ^Out, v: i32) {
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
-main :: proc() {
-	args := os.args[1:]
-	max_mb   := 200
-	in_path  : string
-	out_path := "-"
-
+parse_cli_args :: proc(args: []string) -> (max_mb: int, in_path: string, out_path: string, ok: bool) {
+	max_mb = 200
+	out_path = "-"
+	has_out := false
 	i := 0
 	for i < len(args) {
-		switch args[i] {
-		case "-m":
-			if i+1 < len(args) {
-				if v, ok := strconv.parse_int(args[i+1]); ok && v > 0 { max_mb = v }
-				i += 2
-			} else {
-				i += 1
-			}
-		case:
-			if in_path == "" { in_path = args[i] } else { out_path = args[i] }
-			i += 1
+		arg := args[i]
+		if arg == "-m" {
+			if i + 1 >= len(args) { return 0, "", "", false }
+			v, v_ok := strconv.parse_int(args[i + 1])
+			if !v_ok || v <= 0 { return 0, "", "", false }
+			max_mb = v
+			i += 2
+			continue
 		}
+		if len(arg) > 0 && arg[0] == '-' {
+			// Allow standalone "-" as the stdout output path only once in_path is set.
+			if arg == "-" && in_path != "" && !has_out {
+				out_path = "-"
+				has_out = true
+				i += 1
+				continue
+			}
+			return 0, "", "", false
+		}
+		if in_path == "" {
+			in_path = arg
+		} else if !has_out {
+			out_path = arg
+			has_out = true
+		} else {
+			return 0, "", "", false
+		}
+		i += 1
 	}
-
 	if in_path == "" {
+		return 0, "", "", false
+	}
+	return max_mb, in_path, out_path, true
+}
+
+main :: proc() {
+	max_mb, in_path, out_path, args_ok := parse_cli_args(os.args[1:])
+	if !args_ok {
 		fmt.eprintln("usage: parquet_to_csv_odin [-m MB] <input.parquet> [output.csv]")
 		fmt.eprintln("  -m MB   memory limit in MB (default: 200)")
 		os.exit(1)

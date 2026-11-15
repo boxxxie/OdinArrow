@@ -6,29 +6,40 @@ import "core:strconv"
 import "core:time"
 import oa "../../skadi"
 
-main :: proc() {
-	args := os.args[1:]
-	max_mb   := 200
-	in_path  : string
-	out_path : string
-
+parse_cli_args :: proc(args: []string) -> (max_mb: int, in_path: string, out_path: string, ok: bool) {
+	max_mb = 200
 	i := 0
 	for i < len(args) {
-		switch args[i] {
-		case "-m":
-			if i+1 < len(args) {
-				if v, ok := strconv.parse_int(args[i+1]); ok && v > 0 { max_mb = v }
-				i += 2
-			} else {
-				i += 1
-			}
-		case:
-			if in_path == "" { in_path = args[i] } else { out_path = args[i] }
-			i += 1
+		arg := args[i]
+		if arg == "-m" {
+			if i + 1 >= len(args) { return 0, "", "", false }
+			v, v_ok := strconv.parse_int(args[i + 1])
+			if !v_ok || v <= 0 { return 0, "", "", false }
+			max_mb = v
+			i += 2
+			continue
 		}
+		if len(arg) > 0 && arg[0] == '-' {
+			return 0, "", "", false
+		}
+		if in_path == "" {
+			in_path = arg
+		} else if out_path == "" {
+			out_path = arg
+		} else {
+			return 0, "", "", false
+		}
+		i += 1
 	}
-
 	if in_path == "" || out_path == "" {
+		return 0, "", "", false
+	}
+	return max_mb, in_path, out_path, true
+}
+
+main :: proc() {
+	max_mb, in_path, out_path, args_ok := parse_cli_args(os.args[1:])
+	if !args_ok {
 		fmt.eprintln("usage: csv_to_parquet_odin [-m MB] <input.csv> <output.parquet>")
 		fmt.eprintln("  -m MB   memory limit in MB (default: 200)")
 		os.exit(1)
