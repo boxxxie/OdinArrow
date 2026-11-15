@@ -1,0 +1,8 @@
+{
+  "track_id": "odin_repo_layout_20261115",
+  "type": "chore",
+  "status": "new",
+  "created_at": "2026-11-15T22:18:48Z",
+  "updated_at": "2026-11-15T22:18:48Z",
+  "description": "Update repo file organization and naming to align with typical Odin library conventions"
+}
