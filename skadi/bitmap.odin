@@ -31,7 +31,7 @@ bitmap_popcount :: proc "contextless" (data: [^]u8, n_bits: int) -> int {
 	if n_bits == 0 { return 0 }
 	n_bytes := (n_bits + 7) / 8
 	count   := 0
-	n_words := n_bytes / 8
+	n_words := n_bits / 64
 
 	// 8-byte words — safe because buffer capacity is 64-byte aligned,
 	// so the underlying allocation is always u64-addressable from byte 0.
@@ -76,5 +76,62 @@ bitmap_set_all :: proc "contextless" (data: [^]u8, n_bits: int) {
 bitmap_clear_all :: proc "contextless" (data: [^]u8, n_bytes: int) {
 	for i in 0..<n_bytes {
 		data[i] = 0
+	}
+}
+
+// Copy `n_bits` bits from `src[src_off:]` into `dst[dst_off:]`, preserving
+// neighboring bits outside `[dst_off ..< dst_off + n_bits)`.
+bitmap_copy_bits :: proc "contextless" (dst: [^]u8, dst_off: int, src: [^]u8, src_off, n_bits: int) {
+	if n_bits <= 0 { return }
+	d   := dst_off
+	s   := src_off
+	rem := n_bits
+
+	if (d & 7) == 0 && (s & 7) == 0 {
+		full_bytes := rem >> 3
+		db := d >> 3
+		sb := s >> 3
+		n_words := full_bytes >> 3
+		for w in 0..<n_words {
+			v := intrinsics.unaligned_load(cast(^u64)&src[sb + w * 8])
+			intrinsics.unaligned_store(cast(^u64)&dst[db + w * 8], v)
+		}
+		for bi in (n_words * 8)..<full_bytes {
+			dst[db + bi] = src[sb + bi]
+		}
+		tail := uint(rem) & 7
+		if tail != 0 {
+			m := u8((1 << tail) - 1)
+			dst[db + full_bytes] = (dst[db + full_bytes] & ~m) | (src[sb + full_bytes] & m)
+		}
+		return
+	}
+
+	// Align destination bit offset to a byte boundary.
+	for rem > 0 && (d & 7) != 0 {
+		if bitmap_get(src, s) { bitmap_set(dst, d) } else { bitmap_clear(dst, d) }
+		d += 1; s += 1; rem -= 1
+	}
+
+	s_bit := uint(s & 7)
+	if s_bit == 0 {
+		for rem >= 64 {
+			w := intrinsics.unaligned_load(cast(^u64)&src[s >> 3])
+			intrinsics.unaligned_store(cast(^u64)&dst[d >> 3], w)
+			d += 64; s += 64; rem -= 64
+		}
+	} else {
+		for rem >= 64 {
+			sb := s >> 3
+			lo := intrinsics.unaligned_load(cast(^u64)&src[sb])
+			hi := src[sb + 8]
+			w  := (lo >> s_bit) | (u64(hi) << (64 - s_bit))
+			intrinsics.unaligned_store(cast(^u64)&dst[d >> 3], w)
+			d += 64; s += 64; rem -= 64
+		}
+	}
+
+	for i in 0..<rem {
+		if bitmap_get(src, s + i) { bitmap_set(dst, d + i) } else { bitmap_clear(dst, d + i) }
 	}
 }

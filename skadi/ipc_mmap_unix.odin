@@ -8,8 +8,30 @@ package skadi
 // through a read syscall, matching how Arrow C++/PyArrow read IPC files.
 
 import "core:c"
+import "core:os"
 import "core:strings"
 import "core:sys/posix"
+
+_IPC_IOVec     :: posix.iovec
+_IPC_IOVec_Len :: c.size_t
+
+_ipc_writev_all :: proc(f: ^os.File, iovs: []_IPC_IOVec) -> (written_total: i64, ok: bool) {
+	raw_fd := os.fd(f)
+	if raw_fd == ~uintptr(0) { return 0, false }
+	fd := posix.FD(raw_fd)
+	rem_iovs := iovs
+	for len(rem_iovs) > 0 {
+		n := posix.writev(fd, raw_data(rem_iovs), c.int(len(rem_iovs)))
+		if n < 0 {
+			if posix.errno() == .EINTR { continue }
+			return written_total, false
+		}
+		if n == 0 { return written_total, false }
+		written_total += i64(n)
+		rem_iovs = _ipc_advance_iovecs(rem_iovs, int(n))
+	}
+	return written_total, true
+}
 
 // Map `path` read-only. Returns the mapped bytes, a matching unmap proc, and
 // ok=true on success. On failure ok=false (the caller falls back to a read).

@@ -22,6 +22,8 @@ Aggregates :: struct {
 	valid:   bool, // any row matched
 }
 
+Agg_Result :: Aggregates
+
 // SELECT sum,count,min,max FROM values WHERE pred <op> scalar — fused, one pass.
 // `values` and `pred` must share the same numeric type.
 compute_agg_where_compare :: proc(values, pred: ^Array, op: Compare_Op, scalar: f64) -> Aggregates {
@@ -214,24 +216,55 @@ _agg_where_float_mono :: proc(values, pred: ^Array, scalar: $S, $T: typeid, $OP:
 	a: Aggregates
 	lo, hi: T
 	seen := false
-	for i in 0..<n {
-		if p_nulls && !array_is_valid(pred, i) { continue }
-		when S == i64 {
-			if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
-		} else {
-			if !_agg_cmp(f64(pdata[poff + i]), scalar, OP) { continue }
-		}
-		if v_nulls && !array_is_valid(values, i) { continue }
-		v := vdata[voff + i]
-		a.sum += f64(v)
-		a.count += 1
-		if seen {
-			if v < lo { lo = v }
-			if v > hi { hi = v }
-		} else {
+	if !p_nulls && !v_nulls {
+		i := 0
+		for ; i < n; i += 1 {
+			when S == i64 {
+				if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
+			} else {
+				if !_agg_cmp(f64(pdata[poff + i]), scalar, OP) { continue }
+			}
+			v := vdata[voff + i]
 			lo = v
 			hi = v
+			a.sum = f64(v)
+			a.count = 1
 			seen = true
+			i += 1
+			break
+		}
+		for ; i < n; i += 1 {
+			when S == i64 {
+				if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
+			} else {
+				if !_agg_cmp(f64(pdata[poff + i]), scalar, OP) { continue }
+			}
+			v := vdata[voff + i]
+			a.sum += f64(v)
+			a.count += 1
+			if v < lo { lo = v }
+			if v > hi { hi = v }
+		}
+	} else {
+		for i in 0..<n {
+			if p_nulls && !array_is_valid(pred, i) { continue }
+			when S == i64 {
+				if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
+			} else {
+				if !_agg_cmp(f64(pdata[poff + i]), scalar, OP) { continue }
+			}
+			if v_nulls && !array_is_valid(values, i) { continue }
+			v := vdata[voff + i]
+			a.sum += f64(v)
+			a.count += 1
+			if seen {
+				if v < lo { lo = v }
+				if v > hi { hi = v }
+			} else {
+				lo = v
+				hi = v
+				seen = true
+			}
 		}
 	}
 	if seen { a.min_val = f64(lo); a.max_val = f64(hi); a.valid = true }

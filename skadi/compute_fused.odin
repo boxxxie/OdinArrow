@@ -1,5 +1,7 @@
 package skadi
 
+import "base:intrinsics"
+
 // Fused kernels (C3): compute a filter+aggregate in a single pass over the data,
 // without materialising the filtered array in between. `compute_sum_where` is
 // the canonical example — it replaces `filter(values, mask)` followed by
@@ -40,16 +42,35 @@ _sum_where_typed :: #force_inline proc(values, mask: ^Array, $T: typeid) -> (sum
 	m_nulls := mask.buffers[0].data != nil
 
 	if !v_nulls && !m_nulls && moff == 0 {
-		// Byte-at-a-time over the mask: read 8 bits at once, skip empty bytes.
-		n_full := (n / 8) * 8
-		for i := 0; i < n_full; i += 8 {
-			b := mbits[i >> 3]
-			if b == 0 { continue }
-			for bit in u8(0)..<8 {
-				if (b >> bit) & 1 == 1 { sum += f64(data[voff + i + int(bit)]); valid_count += 1 }
+		// Coalesce all-1 (0xFF) mask bytes into SIMD runs via _sum_run, skip 0 bytes,
+		// and sum mixed bytes branchlessly.
+		full_bytes := n >> 3
+		run_lo     := -1
+		for byi in 0..<full_bytes {
+			b_val := mbits[byi]
+			if b_val == 0xFF {
+				if run_lo < 0 { run_lo = byi << 3 }
+				valid_count += 8
+				continue
+			}
+			if run_lo >= 0 {
+				sum += _sum_run(data[voff + run_lo:], (byi << 3) - run_lo)
+				run_lo = -1
+			}
+			if b_val != 0 {
+				eb := voff + (byi << 3)
+				valid_count += int(intrinsics.count_ones(b_val))
+				s0 := ((b_val & 0x01) != 0 ? f64(data[eb + 0]) : 0.0) + ((b_val & 0x02) != 0 ? f64(data[eb + 1]) : 0.0)
+				s1 := ((b_val & 0x04) != 0 ? f64(data[eb + 2]) : 0.0) + ((b_val & 0x08) != 0 ? f64(data[eb + 3]) : 0.0)
+				s2 := ((b_val & 0x10) != 0 ? f64(data[eb + 4]) : 0.0) + ((b_val & 0x20) != 0 ? f64(data[eb + 5]) : 0.0)
+				s3 := ((b_val & 0x40) != 0 ? f64(data[eb + 6]) : 0.0) + ((b_val & 0x80) != 0 ? f64(data[eb + 7]) : 0.0)
+				sum += (s0 + s1) + (s2 + s3)
 			}
 		}
-		for i := n_full; i < n; i += 1 {
+		if run_lo >= 0 {
+			sum += _sum_run(data[voff + run_lo:], (full_bytes << 3) - run_lo)
+		}
+		for i := full_bytes << 3; i < n; i += 1 {
 			if bitmap_get(mbits, i) { sum += f64(data[voff + i]); valid_count += 1 }
 		}
 		return

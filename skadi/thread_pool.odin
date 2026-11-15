@@ -20,26 +20,28 @@ import "core:thread"
 // (e.g. the test runner): the pool is a singleton that lives until process exit.
 
 _Pool_Worker :: struct {
-	pool: ^_Compute_Pool,
-	id:   int,
+	pool:      ^_Compute_Pool,
+	id:        int,
+	work_cond: sync.Cond, // dedicated per-worker condvar avoids waking idle SMT threads
 }
 
 _Compute_Pool :: struct {
-	workers:   []^thread.Thread,
-	wdata:     []_Pool_Worker,
-	n:         int, // number of worker threads (== logical cores)
+	workers:        []^thread.Thread,
+	wdata:          []_Pool_Worker,
+	n:              int, // number of worker threads (== logical cores)
 
-	submit:    sync.Mutex, // serialises whole jobs so concurrent callers don't clash
-	mutex:     sync.Mutex,
-	work_cond: sync.Cond, // wakes workers when a job is posted
-	done_cond: sync.Cond, // wakes the caller when the job is complete
+	submit:         sync.Mutex, // serialises whole jobs so concurrent callers don't clash
+	mutex:          sync.Mutex,
+	done_cond:      sync.Cond, // wakes the caller when the job is complete
 
-	gen:       u64, // job generation; workers wait for it to advance
-	job:       proc(ctx: rawptr, idx: int),
-	ctx:       rawptr,
-	job_n:     int, // number of partitions in the current job
-	completed: int, // partitions finished in the current job
-	shutdown:  bool,
+	gen:            u64, // job generation; workers wait for it to advance
+	job:            proc(ctx: rawptr, idx: int),
+	ctx:            rawptr,
+	job_n:          int, // total morsels in the current job
+	active_workers: int, // participating background workers (w.id < active_workers)
+	next_idx:       int, // atomic morsel counter claimed by workers and caller
+	completed:      int, // background workers finished in the current job
+	shutdown:       bool,
 }
 
 @(private) g_pool:      _Compute_Pool
@@ -72,57 +74,82 @@ _pool_worker :: proc(w: ^_Pool_Worker) {
 	last_gen := u64(0)
 	for {
 		sync.mutex_lock(&p.mutex)
-		for p.gen == last_gen && !p.shutdown {
-			sync.cond_wait(&p.work_cond, &p.mutex)
+		for (p.gen == last_gen || w.id >= p.active_workers) && !p.shutdown {
+			sync.cond_wait(&w.work_cond, &p.mutex)
 		}
 		if p.shutdown {
 			sync.mutex_unlock(&p.mutex)
 			return
 		}
 		last_gen = p.gen
-		job := p.job
-		ctx := p.ctx
-		jn  := p.job_n
+		job      := p.job
+		ctx      := p.ctx
+		n_tasks  := p.job_n
 		sync.mutex_unlock(&p.mutex)
 
-		if w.id < jn {
-			job(ctx, w.id)
-			free_all(context.temp_allocator)
-			sync.mutex_lock(&p.mutex)
-			p.completed += 1
-			if p.completed == jn {
-				sync.cond_signal(&p.done_cond)
-			}
-			sync.mutex_unlock(&p.mutex)
+		for {
+			idx := sync.atomic_add(&p.next_idx, 1)
+			if idx >= n_tasks { break }
+			job(ctx, idx)
 		}
+		free_all(context.temp_allocator)
+		sync.mutex_lock(&p.mutex)
+		p.completed += 1
+		if p.completed == p.active_workers {
+			sync.cond_signal(&p.done_cond)
+		}
+		sync.mutex_unlock(&p.mutex)
 	}
 }
 
-// Run job(ctx, i) for i in 0..<nt across the pool's workers and block until all
-// nt partitions complete. nt must be <= the worker count (callers cap it via
-// _resolve_threads). nt <= 1 runs inline on the calling thread.
-_pool_run :: proc(nt: int, job: proc(ctx: rawptr, idx: int), ctx: rawptr) {
-	if nt <= 1 {
-		job(ctx, 0)
+// Run job(ctx, i) for i in 0..<total_tasks across up to nt threads (up to
+// nt-1 pool workers plus the calling thread) using atomic morsel claiming, and
+// block until all tasks complete. nt <= 1 runs inline on the calling thread.
+_pool_run :: proc(nt: int, job: proc(ctx: rawptr, idx: int), ctx: rawptr, n_tasks := -1) {
+	total_tasks := n_tasks if n_tasks >= 0 else nt
+	if total_tasks <= 0 { return }
+	if nt <= 1 || total_tasks == 1 {
+		for i in 0..<total_tasks {
+			job(ctx, i)
+		}
 		return
 	}
 	p := _pool_get()
-	n := min(nt, p.n)
+	active_w := min(nt - 1, p.n, total_tasks - 1)
+	if active_w <= 0 {
+		for i in 0..<total_tasks {
+			job(ctx, i)
+		}
+		return
+	}
 
-	// One job uses every worker, so serialise whole jobs: concurrent callers
+	// One job uses the pool, so serialise whole jobs: concurrent callers
 	// (e.g. the multi-threaded test runner) each take the pool in turn rather
 	// than clobbering the shared job/gen/completed state.
 	sync.mutex_lock(&p.submit)
 	defer sync.mutex_unlock(&p.submit)
 
 	sync.mutex_lock(&p.mutex)
-	p.job       = job
-	p.ctx       = ctx
-	p.job_n     = n
-	p.completed = 0
-	p.gen      += 1
-	sync.cond_broadcast(&p.work_cond)
-	for p.completed < n {
+	p.job            = job
+	p.ctx            = ctx
+	p.job_n          = total_tasks
+	p.active_workers = active_w
+	p.completed      = 0
+	sync.atomic_store(&p.next_idx, 0)
+	p.gen           += 1
+	for i in 0..<active_w {
+		sync.cond_signal(&p.wdata[i].work_cond)
+	}
+	sync.mutex_unlock(&p.mutex)
+
+	for {
+		idx := sync.atomic_add(&p.next_idx, 1)
+		if idx >= total_tasks { break }
+		job(ctx, idx)
+	}
+
+	sync.mutex_lock(&p.mutex)
+	for p.completed < active_w {
 		sync.cond_wait(&p.done_cond, &p.mutex)
 	}
 	sync.mutex_unlock(&p.mutex)

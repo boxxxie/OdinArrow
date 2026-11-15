@@ -1,6 +1,7 @@
 package skadi_tests
 
 import "core:math"
+import "core:mem"
 import "core:testing"
 import oa "../skadi"
 
@@ -332,4 +333,83 @@ test_dict_numeric_empty_all_null_nullable_and_nan :: proc(t: ^testing.T) {
 		testing.expect_value(t, oa.array_get(&dec, 2, f64), f64(2.5))
 		testing.expect(t, oa.array_is_valid(&dec, 3) && math.is_nan(oa.array_get(&dec, 3, f64)))
 	}
+}
+
+@(test)
+test_dict_slice_and_group_sum :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved
+		check_no_leaks(t, &track)
+	}
+
+	// Str_Dict_Array slice + str_dict_group_sum with nulls in both codes and weights
+	sb := oa.string_builder_make(6)
+	defer oa.string_builder_destroy(&sb)
+	oa.string_builder_append(&sb, "red")
+	oa.string_builder_append(&sb, "blue")
+	oa.string_builder_append_null(&sb)
+	oa.string_builder_append(&sb, "red")
+	oa.string_builder_append(&sb, "blue")
+	oa.string_builder_append(&sb, "red")
+	sarr, _ := oa.string_builder_finish(&sb)
+	defer oa.array_free(&sarr)
+
+	sd := oa.str_dict_encode(&sarr)
+	defer oa.str_dict_free(&sd)
+
+	wb := oa.builder_make(f64, 6)
+	defer oa.builder_destroy(&wb)
+	oa.builder_append(&wb, 100.0)
+	oa.builder_append(&wb, 2.5)
+	oa.builder_append(&wb, 99.0)
+	oa.builder_append(&wb, 4.5)
+	oa.builder_append_null(&wb)
+	oa.builder_append(&wb, 5.5)
+	warr, _ := oa.builder_finish(&wb)
+	defer oa.array_free(&warr)
+
+	sd_sl := oa.str_dict_slice(sd, 1, 6)
+	defer oa.str_dict_free(&sd_sl)
+	w_sl := oa.array_slice(warr, 1, 6)
+
+	testing.expect_value(t, sd_sl.length, 5)
+	testing.expect_value(t, sd_sl.null_count, 1)
+
+	svc := oa.str_dict_value_counts(&sd_sl)
+	defer delete(svc)
+	testing.expect_value(t, svc[0], i64(2)) // "red"
+	testing.expect_value(t, svc[1], i64(2)) // "blue"
+
+	sgs := oa.str_dict_group_sum(&sd_sl, &w_sl)
+	defer delete(sgs)
+	testing.expect(t, approx_eq(sgs[0], 10.0, 1e-9)) // 4.5 + 5.5
+	testing.expect(t, approx_eq(sgs[1], 2.5, 1e-9))  // 2.5 (index 4 weight is null)
+
+	// Numeric Dict_Array(i32) slice + dict_group_sum
+	nb := oa.builder_make(i32, 6)
+	defer oa.builder_destroy(&nb)
+	oa.builder_append(&nb, 10)
+	oa.builder_append(&nb, 20)
+	oa.builder_append_null(&nb)
+	oa.builder_append(&nb, 10)
+	oa.builder_append(&nb, 20)
+	oa.builder_append(&nb, 10)
+	narr, _ := oa.builder_finish(&nb)
+	defer oa.array_free(&narr)
+
+	nd := oa.dict_encode(&narr, i32)
+	defer oa.dict_free(&nd)
+
+	nd_sl := oa.dict_slice(nd, 1, 6)
+	defer oa.dict_free(&nd_sl)
+	testing.expect_value(t, nd_sl.length, 5)
+	testing.expect_value(t, nd_sl.null_count, 1)
+
+	ngs := oa.dict_group_sum(&nd_sl, &w_sl)
+	defer delete(ngs)
+	testing.expect(t, approx_eq(ngs[0], 10.0, 1e-9))
+	testing.expect(t, approx_eq(ngs[1], 2.5, 1e-9))
 }

@@ -133,6 +133,7 @@ array_recount_nulls :: proc(arr: ^Array) -> int {
 // If src.offset > 0, the copied array is rebased to offset 0 with only the
 // slice window [src.offset ..< src.offset + src.length) copied.
 // Children are NOT deep-copied (Phase 4+ concern).
+@(require_results)
 array_copy :: proc(src: ^Array, allocator := context.allocator) -> (dst: Array, err: mem.Allocator_Error) {
 	if src.offset > 0 {
 		return _array_copy_rebased(src, allocator)
@@ -170,14 +171,7 @@ _array_copy_rebased :: proc(src: ^Array, allocator: mem.Allocator) -> (dst: Arra
 		bm_bytes := bitmap_byte_count(n)
 		bm_buf, b_err := buffer_make(bm_bytes, allocator)
 		if b_err != nil { return {}, b_err }
-		bm_slice := ([^]u8)(bm_buf.data)[:bm_bytes]
-		src_bm := ([^]u8)(src.buffers[0].data)
-		for i in 0..<n {
-			bit_idx := off + i
-			if (src_bm[bit_idx >> 3] & (1 << u32(bit_idx & 7))) != 0 {
-				bm_slice[i >> 3] |= 1 << u32(i & 7)
-			}
-		}
+		bitmap_copy_bits(bm_buf.data, 0, src.buffers[0].data, off, n)
 		dst.buffers[0] = bm_buf
 	}
 
@@ -193,14 +187,7 @@ _array_copy_rebased :: proc(src: ^Array, allocator: mem.Allocator) -> (dst: Arra
 			data_bytes := bitmap_byte_count(n)
 			dbuf, d_err := buffer_make(data_bytes, allocator)
 			if d_err != nil { cleanup(&dst); return {}, d_err }
-			dst_bits := ([^]u8)(dbuf.data)[:data_bytes]
-			src_bits := ([^]u8)(src.buffers[1].data)
-			for i in 0..<n {
-				bit_idx := off + i
-				if (src_bits[bit_idx >> 3] & (1 << u32(bit_idx & 7))) != 0 {
-					dst_bits[i >> 3] |= 1 << u32(i & 7)
-				}
-			}
+			bitmap_copy_bits(dbuf.data, 0, src.buffers[1].data, off, n)
 			dst.buffers[1] = dbuf
 		}
 	case String_Type, Binary_Type:
