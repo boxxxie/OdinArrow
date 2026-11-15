@@ -1,4 +1,4 @@
-# OdinArrow — Code Review, Architecture, and Improvement Plan
+# Skadi — Code Review, Architecture, and Improvement Plan
 
 > Generated: 2026-06-10  
 > Scope: full repository review (`src/`, `programs/`, `tests/`, `benchmarks/`, build tooling)  
@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary
 
-**OdinArrow** is a native [Odin](https://odin-lang.org/) implementation of the [Apache Arrow](https://arrow.apache.org/) columnar in-memory format. The library lives in `src/` under the `odinarrow` package and provides:
+**Skadi** is a native [Odin](https://odin-lang.org/) implementation of the [Apache Arrow](https://arrow.apache.org/) columnar in-memory format. The library lives in `src/` under the `odinarrow` package and provides:
 
 - Spec-aligned memory layout (64-byte aligned buffers, packed validity bitmaps, zero-copy slicing)
 - Primitive and variable-length column types with builders
@@ -33,7 +33,7 @@ The existing `PLAN.md` describes the original design intent; this document refle
 ## 2. Repository Layout
 
 ```
-OdinArrow/
+skadi/
 ├── src/                          # Core library (package: odinarrow)
 │   ├── buffer.odin               # 64-byte aligned allocation, slice, copy
 │   ├── bitmap.odin               # Validity bitmap ops + popcount
@@ -326,7 +326,7 @@ These are **application-layer** code importing `../../src` — not exported as l
 | `parquet_writer.odin` | PLAIN BYTE_ARRAY pages, UNCOMPRESSED, multi row-group |
 | `thrift_writer.odin` | Thrift compact encoder for Parquet metadata |
 
-Memory model: derive `max_rows` per chunk from `-m` limit; build OdinArrow string columns; write row group; free arrays.
+Memory model: derive `max_rows` per chunk from `-m` limit; build Skadi string columns; write row group; free arrays.
 
 #### Parquet → CSV (`programs/parquet_to_csv_odin/`)
 

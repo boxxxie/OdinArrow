@@ -1,6 +1,6 @@
-# OdinArrow
+# Skadi
 
-[![CI](https://github.com/boxxxie/OdinArrow/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/OdinArrow/actions/workflows/ci.yml)
+[![CI](https://github.com/boxxxie/skadi/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/skadi/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](CHANGELOG.md)
 [![Odin](https://img.shields.io/badge/Odin-lang-3882D2.svg)](https://odin-lang.org/)
 [![License: Zlib](https://img.shields.io/badge/License-Zlib-lightgrey.svg)](LICENSE)
@@ -11,7 +11,7 @@ A native [Apache Arrow](https://arrow.apache.org/) implementation in the
 kernels, and the Arrow IPC format (Feather v2), with zero-overhead abstractions
 and explicit memory management.
 
-Files written by OdinArrow are readable directly by **PyArrow** and **Apache Arrow
+Files written by Skadi are readable directly by **PyArrow** and **Apache Arrow
 C++**, and vice-versa.
 
 We aim to be faster than the original - with our appreciation of what the Apache
@@ -78,14 +78,14 @@ table = ipc.open_file("data.arrow").read_all()
 
 ## Benchmarks
 
-OdinArrow vs **Apache Arrow C++** (the LLVM-compiled library PyArrow wraps,
+Skadi vs **Apache Arrow C++** (the LLVM-compiled library PyArrow wraps,
 called directly) — **both single-threaded**, so this is a true apples-to-apples
-per-core comparison of OdinArrow's serial kernels against Arrow's. Median of 5
+per-core comparison of Skadi's serial kernels against Arrow's. Median of 5
 trials, 10M-element numeric / 1M-element string workloads, recycling memory pools
-on both sides. `C++/Odin` is Arrow C++ time ÷ OdinArrow time; **> 1× means
-OdinArrow is faster**.
+on both sides. `C++/Odin` is Arrow C++ time ÷ Skadi time; **> 1× means
+Skadi is faster**.
 
-| Benchmark                           | OdinArrow (ms) | Arrow C++ (ms) |  C++/Odin |
+| Benchmark                           | Skadi (ms) | Arrow C++ (ms) |  C++/Odin |
 | ----------------------------------- | -------------: | -------------: | --------: |
 | Build 10M i32 (1% nulls)            |          17.89 |          32.94 | **1.84×** |
 | Build 1M strings (2% nulls)         |           5.10 |           6.41 | **1.26×** |
@@ -113,9 +113,9 @@ recycling buffer pool plus non-temporal stores that skip the output buffer's
 read-for-ownership traffic. `min/max` and `take` sit at the memory-bandwidth floor,
 where both libraries are limited by RAM, not code.
 
-OdinArrow also beats **PyArrow** on every benchmark — typically several× up to
-~20× on construction (Python overhead removal). The 3-way OdinArrow / PyArrow /
-Arrow C++ comparison (with OdinArrow's multi-threaded `*_parallel` kernels) and
+Skadi also beats **PyArrow** on every benchmark — typically several× up to
+~20× on construction (Python overhead removal). The 3-way Skadi / PyArrow /
+Arrow C++ comparison (with Skadi's multi-threaded `*_parallel` kernels) and
 full methodology are in [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
 Reproduce: `bash benchmarks/bench_odin_c.sh` (single-threaded, vs Arrow C++) or
@@ -181,7 +181,7 @@ src/                 the odinarrow package (buffers, types, arrays, builders,
 tests/               the test suite (run with `make test`)
 examples/quickstart/ a runnable tour of the API
 benchmarks/          odin / python / cpp runners + compare.sh + RESULTS.md
-programs/            CSV<->Parquet example programs (OdinArrow and Arrow-FFI)
+programs/            CSV<->Parquet example programs (Skadi and Arrow-FFI)
 ```
 
 ## License

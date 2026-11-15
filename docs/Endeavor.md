@@ -1,8 +1,8 @@
 # Endeavor — surpassing the reference implementation
 
-A review of OdinArrow with two goals: (1) harden the parts that parse untrusted
+A review of Skadi with two goals: (1) harden the parts that parse untrusted
 input, and (2) lay out performance work — both Arrow-compatible and
-compatibility-breaking — that could make OdinArrow faster than Apache Arrow's
+compatibility-breaking — that could make Skadi faster than Apache Arrow's
 own C++ kernels on the operations that matter.
 
 Each item notes **impact**, **effort**, and whether it **breaks Arrow
@@ -195,7 +195,7 @@ builder, zero-copy accessor, a prefix-fast-path `umbra_compare`, `umbra_count_eq
 and `umbra_sort_indices`. The prefix lives in the slot, so comparisons resolve in
 registers without chasing into the data buffer.
 
-**Measured:** sorting 1M ~20-char strings — Umbra **272 ms** vs OdinArrow's
+**Measured:** sorting 1M ~20-char strings — Umbra **272 ms** vs Skadi's
 Arrow-layout sort **518 ms (1.9×)** and PyArrow's `pc.sort_indices` **415 ms
 (1.5×)**, identical ordering. Cost: ~30% more memory (fixed 16-byte slots). A
 smaller-but-real win than C4 because the data access during a sort, while
@@ -275,7 +275,7 @@ Run aggregates over the **encoded** form instead of decoding first. Implemented
 (`rle.odin`): `RLE_Array(T)` (run_ends + per-run values), a coalescing builder,
 `rle_encode`/`rle_decode`, and `rle_sum`/`rle_min_max` that run in **O(runs)**.
 
-**Measured (10M f64, 10K runs, single-thread):** `rle_sum` 11.8 µs vs OdinArrow's
+**Measured (10M f64, 10K runs, single-thread):** `rle_sum` 11.8 µs vs Skadi's
 plain sum 4541 µs (**385×**) and PyArrow's `pc.sum` 6045 µs (**510×**), on
 **667× less memory** (117 KB vs 78 MB). PyArrow has **no** REE sum kernel at all
 (`pc.sum` rejects `run_end_encoded`), so this is something the reference cannot
@@ -309,7 +309,7 @@ The hand-rolled FlatBuffer encode/decode has real per-message cost and is the
 A-section attack surface. A bespoke, directly-mmappable layout (fixed-offset
 header, no offset-chasing metadata) would read/write faster and validate
 trivially — at the price of needing a converter for Arrow interop. Keep Arrow
-IPC as the interchange format; use the native one for OdinArrow-to-OdinArrow.
+IPC as the interchange format; use the native one for Skadi-to-Skadi.
 
 ---
 
@@ -329,7 +329,7 @@ than DRAM-bound:
    purely bandwidth-bound (branchy / scatter-gather), so vectorising them should
    pay off where the reductions didn't.
 3. **C-items** — the structural changes that cut memory traffic and move
-   OdinArrow from "matches Arrow C++" to "beats it."
+   Skadi from "matches Arrow C++" to "beats it."
    - ✅ **C4 (run-end encoding)** — 385–510× on runny data; PyArrow can't do it.
    - ✅ **C4 (dictionary)** — value_counts 29× / 9.5× vs PyArrow (integer histogram).
    - ✅ **C1 (Umbra strings)** — 1.9× on string sort vs the Arrow layout.

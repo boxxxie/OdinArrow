@@ -1,6 +1,6 @@
-# OdinArrow Benchmark Analysis
+# Skadi Benchmark Analysis
 
-Head-to-head comparison of **OdinArrow** against **PyArrow** (Python) and
+Head-to-head comparison of **Skadi** against **PyArrow** (Python) and
 **Apache Arrow C++** (the same LLVM-compiled library PyArrow wraps, called
 directly through its C/C++ API — the "FFI" reference).
 
@@ -18,16 +18,16 @@ Reproduce with `bash benchmarks/compare.sh`.
 
 ## Methodology note (read this before the table)
 
-OdinArrow's `sum`, `min/max`, and `filter` run **multi-threaded across all 8
+Skadi's `sum`, `min/max`, and `filter` run **multi-threaded across all 8
 hardware threads**; PyArrow and Arrow C++ here are **single-threaded**. So those
-four ratios reflect *OdinArrow's threading + per-core efficiency together*, not
+four ratios reflect *Skadi's threading + per-core efficiency together*, not
 pure per-core speed. The other four rows — array build, string build, string
 scan, IPC roundtrip — are **single-threaded on all three**, so they are
 apples-to-apples.
 
 ## Results
 
-| Benchmark | Threading | OdinArrow (ms) | PyArrow (ms) | Arrow C++ (ms) | Py/Odin | C++/Odin |
+| Benchmark | Threading | Skadi (ms) | PyArrow (ms) | Arrow C++ (ms) | Py/Odin | C++/Odin |
 |---|---|---:|---:|---:|---:|---:|
 | Build 10M i32 (1% nulls) | all single | 44.20 | 957.49 | 41.69 | 21.66× | 0.94× |
 | Sum 10M f64 | Odin MT | 3.18 | 6.81 | 6.01 | 2.14× | 1.89× |
@@ -39,7 +39,7 @@ apples-to-apples.
 | Scan 1M strings | all single | 1.04 | 9.49 | 9.16 | 9.11× | 8.80× |
 | IPC roundtrip 10M i32 (w+r) | all single | 5.24 | 10.97 | 10.27 | 2.09× | 1.96× |
 
-Ratios > 1× mean OdinArrow is faster; < 1× mean it is slower.
+Ratios > 1× mean Skadi is faster; < 1× mean it is slower.
 (Builders use a reusable buffer pool; IPC read is mmap'd and `finish()` is
 zero-copy — see the analysis below.)
 
@@ -59,14 +59,14 @@ still mostly Python-list materialisation overhead.
 Multi-accumulator SIMD kernels fanned across 8 threads. On a 4-core machine the
 realistic threading ceiling is ~4× before memory bandwidth saturates; sum is
 memory-bound, so the observed ~2× over single-threaded C++ is bandwidth-limited
-rather than compute-limited. Per-core, OdinArrow's SIMD sum is roughly on par
+rather than compute-limited. Per-core, Skadi's SIMD sum is roughly on par
 with Arrow C++.
 
 ### Sum f64 with 1% nulls (Odin 2.4× C++, threaded) — the null-aware path
 The headline number is threaded, but the more telling figure is the **null
-overhead**: OdinArrow's sum goes from 3.18 → 3.48 ms when 1% of values are null
+overhead**: Skadi's sum goes from 3.18 → 3.48 ms when 1% of values are null
 (**+9%**), whereas Arrow C++ goes 6.01 → 8.54 ms (**+42%**) and PyArrow 6.81 →
-8.25 ms (+21%). OdinArrow handles nulls almost for free because the kernel walks
+8.25 ms (+21%). Skadi handles nulls almost for free because the kernel walks
 the validity bitmap a **byte at a time**: an all-valid byte (`0xFF`) means "8
 valid in a row," coalesced into a run and summed with the SIMD kernel; all-null
 bytes are skipped; only mixed bytes are bit-tested. The previous code did a
@@ -85,7 +85,7 @@ Single-pass combined min+max, SIMD + threaded. The smaller margin over C++ vs
 even more bandwidth-bound.
 
 ### Filter — 10M i32, 50% pass (Odin 3.7× C++, threaded)
-The largest threaded win. OdinArrow's filter exact-sizes the output via bitmap
+The largest threaded win. Skadi's filter exact-sizes the output via bitmap
 popcount, then runs a byte-at-a-time mask loop, parallelised. Filtering writes a
 full output array, so it scales better with threads than the reductions do.
 Even discounting threading (~4× headroom), the per-core path is competitive.
@@ -98,11 +98,11 @@ and the same **buffer pool**. Time fell from ~30 ms (0.31× C++) to ~8.5 ms
 (**0.85× C++**) — now within ~1.2× of Arrow C++'s `StringBuilder`, from ~3×.
 
 ### String scan — 1M strings (Odin ~11.7× both)
-OdinArrow walks the offsets buffer in a tight loop summing lengths. PyArrow and
+Skadi walks the offsets buffer in a tight loop summing lengths. PyArrow and
 Arrow C++ both pay **compute-kernel dispatch overhead** (`utf8_length` →
 `sum`) for what is a trivial pointer walk, which is why both land near 9 ms.
 This is partly an artifact of comparing a hand loop against a generic kernel
-pipeline — but it does show OdinArrow's zero-dispatch model paying off.
+pipeline — but it does show Skadi's zero-dispatch model paying off.
 
 ### IPC roundtrip — write+read 10M i32 (Odin 2.1× both)
 Now a **win over both**. The reader is **memory-mapped** (`mmap`, `PROT_READ`,
@@ -111,13 +111,13 @@ streams through a read syscall — pages fault in lazily. The "read" half drops 
 ~0.04 ms (was ~14 ms with an eager read, ~39 ms before zero-copy), leaving the
 ~5 ms write as the whole cost. PyArrow and Arrow C++ also mmap on read, so their
 ~11.7 ms is dominated by *their* write path, which does more bookkeeping than
-OdinArrow's. The mapping is released with `munmap` when the owning batch is freed
+Skadi's. The mapping is released with `munmap` when the owning batch is freed
 (`Record_Batch._backing_free`); on platforms without the unix mmap path the
 reader transparently falls back to a full read.
 
 ## Takeaways
 
-- **vs PyArrow:** OdinArrow is faster on **every** benchmark, by 1.3×–10×. Much
+- **vs PyArrow:** Skadi is faster on **every** benchmark, by 1.3×–10×. Much
   of the large wins (build, string build) is Python interpreter overhead rather
   than Arrow itself, but the systems-language model removes that overhead by
   construction.
@@ -130,7 +130,7 @@ reader transparently falls back to a full read.
     write path is lighter.
   - **At parity** on single-threaded *construction*: array build ~0.94× and
     string build ~0.85× after zero-copy `finish()`, uninitialised data buffers,
-    and a reusable buffer pool. OdinArrow no longer materially trails Arrow C++
+    and a reusable buffer pool. Skadi no longer materially trails Arrow C++
     on any benchmark here.
 - The honest summary matches the plan's stated goal: a zero-overhead systems
   language **matches or beats a Python-wrapped C++ library**, with much simpler,
@@ -161,11 +161,11 @@ elements the encoding collapsed.
 
 | | time | size |
 |---|---:|---:|
-| Plain `compute_sum` (OdinArrow) | 4541 µs | 78 MB |
+| Plain `compute_sum` (Skadi) | 4541 µs | 78 MB |
 | Plain `pc.sum` (PyArrow)        | 6045 µs | 78 MB |
-| **`rle_sum` (OdinArrow)**       | **11.8 µs** | **117 KB** |
+| **`rle_sum` (Skadi)**       | **11.8 µs** | **117 KB** |
 
-That is **~385× faster** than OdinArrow's own plain sum and **~510× faster** than
+That is **~385× faster** than Skadi's own plain sum and **~510× faster** than
 PyArrow's, on **667× less memory** — and **PyArrow cannot do it at all**: its
 `pc.sum` has no kernel for `run_end_encoded` input, so summing an REE column there
 means decoding back to 78 MB first. This is a compatibility-breaking layout (kept
@@ -185,11 +185,11 @@ Sorting 1M random ~20-char strings (`sort_indices`):
 
 | | time |
 |---|---:|
-| OdinArrow Arrow-layout sort | 518 ms |
+| Skadi Arrow-layout sort | 518 ms |
 | PyArrow `pc.sort_indices`   | 415 ms |
-| **OdinArrow Umbra sort**    | **272 ms** |
+| **Skadi Umbra sort**    | **272 ms** |
 
-**1.9× faster** than OdinArrow's own Arrow-layout sort and **1.5× faster** than
+**1.9× faster** than Skadi's own Arrow-layout sort and **1.5× faster** than
 PyArrow, with identical ordering. The cost is ~30% more memory (fixed 16-byte
 slots vs `offsets + bytes`) — the classic Umbra trade. Kept as a separate
 `Umbra_Array` type, transcoded at an Arrow/IPC boundary.
@@ -206,7 +206,7 @@ integer histogram over the codes — no string hashing or comparison.
 |---|---:|
 | PyArrow `value_counts` (plain string) | 190.6 ms |
 | PyArrow `value_counts` (dictionary)   | 62.6 ms |
-| **OdinArrow `str_dict_value_counts`** | **6.6 ms** |
+| **Skadi `str_dict_value_counts`** | **6.6 ms** |
 
 **29× faster** than PyArrow's plain-string group-by and **9.5× faster** than even
 PyArrow's own dictionary `value_counts`. Encoding the column is a one-time 196 ms
@@ -221,8 +221,8 @@ of length. 10M f64, 100 distinct:
 
 | | time |
 |---|---:|
-| OdinArrow plain `compute_min_max` | 12,795 µs |
-| **OdinArrow `dict_min_max`** | **0.1 µs (~126,000×)** |
+| Skadi plain `compute_min_max` | 12,795 µs |
+| **Skadi `dict_min_max`** | **0.1 µs (~126,000×)** |
 
 Honest counter-example, same file: **`dict_sum` is _not_ a win (0.80×)** — it
 reads the narrower i32 codes but the histogram's data-dependent load-add-store is
@@ -241,11 +241,11 @@ single pass with no allocation, replacing `filter(values, mask)` then `sum(...)`
 
 | | time |
 |---|---:|
-| OdinArrow `filter` then `sum` | 34.2 ms |
+| Skadi `filter` then `sum` | 34.2 ms |
 | PyArrow `sum(filter(...))`    | 41.6 ms |
-| **OdinArrow `sum_where`**     | **7.6 ms** |
+| **Skadi `sum_where`**     | **7.6 ms** |
 
-**4.5×** over OdinArrow's own filter+sum and **5.5×** over PyArrow — the
+**4.5×** over Skadi's own filter+sum and **5.5×** over PyArrow — the
 intermediate array's allocation, dense copy, and re-read are all gone.
 
 **General fusion via compile-time specialisation.** Beyond hand-written
@@ -262,7 +262,7 @@ it at compile time — the driver is parameterised on the value type and a compt
 | PyArrow (mask + filter + sum + min_max + count)  | 70.2 ms |
 | **Fused (one pass)**                             | **16.8 ms** |
 
-**1.64×** over OdinArrow's own unfused pipeline and **4.2×** over PyArrow — one
+**1.64×** over Skadi's own unfused pipeline and **4.2×** over PyArrow — one
 pass over the two columns, all four aggregates, zero intermediate arrays.
 
 **C2 — selection vectors.** A predicate over a batch yields a `Selection` (just

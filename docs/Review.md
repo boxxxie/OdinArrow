@@ -1,16 +1,16 @@
-# OdinArrow vs Apache Arrow — Capability Gap Review
+# Skadi vs Apache Arrow — Capability Gap Review
 
 > Generated: 2026-06-12  
 > Reference: [Apache Arrow](https://arrow.apache.org/) (format spec, C++ / PyArrow libraries, v24.x)  
-> Subject: **OdinArrow** (`src/`, package `odinarrow`) as it exists in this repository
+> Subject: **Skadi** (`src/`, package `odinarrow`) as it exists in this repository
 
-This document compares OdinArrow against the **Apache Arrow project** as a whole — the columnar format specification, the reference C++ libraries, and the ecosystem built around them (PyArrow, Parquet integration, Flight, Dataset, etc.). It is not a performance review; see [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for that.
+This document compares Skadi against the **Apache Arrow project** as a whole — the columnar format specification, the reference C++ libraries, and the ecosystem built around them (PyArrow, Parquet integration, Flight, Dataset, etc.). It is not a performance review; see [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for that.
 
 ### Status legend
 
 | Symbol | Meaning |
 |---|---|
-| ✅ | Implemented in OdinArrow core library (`src/`) |
+| ✅ | Implemented in Skadi core library (`src/`) |
 | 🔶 | Partial / subset / application code only (`programs/`, FFI) |
 | ❌ | Not implemented |
 
@@ -18,7 +18,7 @@ This document compares OdinArrow against the **Apache Arrow project** as a whole
 
 ## 1. Executive summary
 
-OdinArrow is a **focused, high-quality implementation of Arrow’s core in-memory columnar model** for flat (non-nested) data: aligned buffers, validity bitmaps, primitive and variable-length types, builders, schema/record-batch/table abstractions, a small set of compute kernels (with SIMD and threading), and Arrow IPC file + stream I/O with memory-mapped reads.
+Skadi is a **focused, high-quality implementation of Arrow’s core in-memory columnar model** for flat (non-nested) data: aligned buffers, validity bitmaps, primitive and variable-length types, builders, schema/record-batch/table abstractions, a small set of compute kernels (with SIMD and threading), and Arrow IPC file + stream I/O with memory-mapped reads.
 
 It **does not** replicate the breadth of the Apache Arrow **software ecosystem**. Measured against PyArrow / Arrow C++, the largest gaps are:
 
@@ -28,17 +28,17 @@ It **does not** replicate the breadth of the Apache Arrow **software ecosystem**
 4. **Infrastructure** — no Dataset API, filesystem abstraction, Flight/ADBC, Acero query engine, Gandiva, or GPU support  
 5. **Interop** — IPC-compatible with PyArrow, but no formal C Data Interface export/import layer
 
-Where OdinArrow **does** compete (and often wins on benchmarks) is the **narrow core**: building flat columns, scanning them, and IPC round-trips — the foundation Arrow was designed for, not the full analytics platform built on top.
+Where Skadi **does** compete (and often wins on benchmarks) is the **narrow core**: building flat columns, scanning them, and IPC round-trips — the foundation Arrow was designed for, not the full analytics platform built on top.
 
 ---
 
 ## 2. Columnar format & type system
 
-Apache Arrow defines a rich logical and physical type system ([Columnar format spec](https://arrow.apache.org/docs/format/Columnar.html)). OdinArrow implements a **flat subset**.
+Apache Arrow defines a rich logical and physical type system ([Columnar format spec](https://arrow.apache.org/docs/format/Columnar.html)). Skadi implements a **flat subset**.
 
 ### 2.1 Logical / physical types
 
-| Arrow type | OdinArrow | Notes |
+| Arrow type | Skadi | Notes |
 |---|---|---|
 | Null | ✅ | |
 | Boolean | ✅ | Bit-packed values buffer |
@@ -66,7 +66,7 @@ Apache Arrow defines a rich logical and physical type system ([Columnar format s
 
 ### 2.2 Layout & invariants
 
-| Capability | OdinArrow | Apache Arrow |
+| Capability | Skadi | Apache Arrow |
 |---|---|---|
 | 64-byte buffer alignment | ✅ | ✅ |
 | Validity bitmaps (optional when no nulls) | ✅ | ✅ |
@@ -80,7 +80,7 @@ Apache Arrow defines a rich logical and physical type system ([Columnar format s
 
 ## 3. Memory management
 
-| Capability | OdinArrow | Apache Arrow (C++) |
+| Capability | Skadi | Apache Arrow (C++) |
 |---|---|---|
 | Explicit aligned allocation (`buffer_make`) | ✅ | ✅ (`arrow::Buffer`) |
 | Zero-copy buffer views (`buffer_slice`) | ✅ | ✅ |
@@ -91,13 +91,13 @@ Apache Arrow defines a rich logical and physical type system ([Columnar format s
 | GPU / device memory | ❌ | ✅ (CUDA, etc.) |
 | Thread-safe pool | ❌ (documented single-thread) | ✅ |
 
-OdinArrow’s ownership model is **explicit and manual** (track `allocator`, never double-free sliced arrays). Arrow C++ uses reference counting for shared buffer lifetime across tables, IPC, and foreign runtimes.
+Skadi’s ownership model is **explicit and manual** (track `allocator`, never double-free sliced arrays). Arrow C++ uses reference counting for shared buffer lifetime across tables, IPC, and foreign runtimes.
 
 ---
 
 ## 4. Core data structures
 
-| Structure | OdinArrow | Apache Arrow |
+| Structure | Skadi | Apache Arrow |
 |---|---|---|
 | `Array` | ✅ | ✅ `arrow::Array` |
 | `ChunkedArray` | 🔶 basic (`Table` only) | ✅ full API, compute on chunks |
@@ -109,7 +109,7 @@ OdinArrow’s ownership model is **explicit and manual** (track `allocator`, nev
 | `Tensor` | ❌ | ✅ |
 | `SparseTensor` | ❌ | ✅ |
 
-**OdinArrow gaps in tabular API:**
+**Skadi gaps in tabular API:**
 
 - No field or schema **custom metadata** (key/value)
 - No **dictionary** on fields
@@ -121,7 +121,7 @@ OdinArrow’s ownership model is **explicit and manual** (track `allocator`, nev
 
 ## 5. Builders & array construction
 
-| Builder | OdinArrow | Apache Arrow |
+| Builder | Skadi | Apache Arrow |
 |---|---|---|
 | Primitive (all int/float/bool) | ✅ zero-copy `finish()` | ✅ `NumericBuilder`, etc. |
 | String / Binary | ✅ raw-buffer builder | ✅ |
@@ -135,7 +135,7 @@ OdinArrow’s ownership model is **explicit and manual** (track `allocator`, nev
 | Typed `ArrayBuilder` hierarchy | ❌ (generic `Primitive_Builder($T)`) | ✅ per-type classes |
 | `Buffer_Pool` integration | ✅ | ✅ default pool |
 
-OdinArrow builders are **fast for flat data** (see benchmarks) but cover only the types in `types.odin`.
+Skadi builders are **fast for flat data** (see benchmarks) but cover only the types in `types.odin`.
 
 ---
 
@@ -143,7 +143,7 @@ OdinArrow builders are **fast for flat data** (see benchmarks) but cover only th
 
 Apache Arrow Compute ([C++ docs](https://arrow.apache.org/docs/cpp/compute.html)) exposes a **function registry** with 100+ kernels invokable via `CallFunction(name, args)`, options structs, implicit casts, and support for Scalars, Arrays, ChunkedArrays, RecordBatches, and Tables.
 
-### 6.1 What OdinArrow implements
+### 6.1 What Skadi implements
 
 | Kernel | Serial | SIMD | Parallel |
 |---|---|---|---|
@@ -159,11 +159,11 @@ Apache Arrow Compute ([C++ docs](https://arrow.apache.org/docs/cpp/compute.html)
 
 **~15 functions**, hard-coded procs with `(T, Error)` returns — no registry, no options, no scalar/array broadcasting.
 
-### 6.2 Major compute categories missing in OdinArrow
+### 6.2 Major compute categories missing in Skadi
 
 #### Aggregations (scalar reduce)
 
-| Arrow function (examples) | OdinArrow |
+| Arrow function (examples) | Skadi |
 |---|---|
 | `all`, `any` | ❌ |
 | `count_distinct`, `count_all` | ❌ |
@@ -176,7 +176,7 @@ Apache Arrow Compute ([C++ docs](https://arrow.apache.org/docs/cpp/compute.html)
 
 #### Element-wise & logical
 
-| Category | Examples | OdinArrow |
+| Category | Examples | Skadi |
 |---|---|---|
 | Comparisons | `equal`, `less`, `not_equal`, … | ❌ |
 | Boolean logic | `and`, `or`, `not`, `xor`, Kleene | ❌ |
@@ -187,7 +187,7 @@ Apache Arrow Compute ([C++ docs](https://arrow.apache.org/docs/cpp/compute.html)
 
 #### Selection & ordering
 
-| Arrow function | OdinArrow |
+| Arrow function | Skadi |
 |---|---|
 | `sort_indices` | ✅ |
 | `array_sort` (materialised sorted array) | ❌ (compose via take) |
@@ -196,7 +196,7 @@ Apache Arrow Compute ([C++ docs](https://arrow.apache.org/docs/cpp/compute.html)
 
 #### String & binary
 
-| Arrow function | OdinArrow |
+| Arrow function | Skadi |
 |---|---|
 | `utf8_length` | ❌ (hand loop in benchmarks only) |
 | `binary_length` | ❌ |
@@ -209,7 +209,7 @@ All temporal extract, cast, and arithmetic functions | ❌ (no temporal types)
 
 #### Hash & set
 
-| Arrow function | OdinArrow |
+| Arrow function | Skadi |
 |---|---|
 | `hash`, `hash_aggregate` | ❌ |
 | `unique`, `value_counts`, `is_in` | ❌ |
@@ -217,7 +217,7 @@ All temporal extract, cast, and arithmetic functions | ❌ (no temporal types)
 
 #### Structural / nested
 
-| Arrow function | OdinArrow |
+| Arrow function | Skadi |
 |---|---|
 | `make_struct`, `struct_field` | ❌ |
 | `list_flatten`, `list_parent_indices` | ❌ |
@@ -225,7 +225,7 @@ All temporal extract, cast, and arithmetic functions | ❌ (no temporal types)
 
 #### Joins, windows, and query engine
 
-| Component | OdinArrow |
+| Component | Skadi |
 |---|---|
 | Hash join / asof join | ❌ |
 | Window functions (rank, lead/lag) | ❌ |
@@ -234,7 +234,7 @@ All temporal extract, cast, and arithmetic functions | ❌ (no temporal types)
 
 #### Compute infrastructure
 
-| Feature | OdinArrow | Apache Arrow |
+| Feature | Skadi | Apache Arrow |
 |---|---|---|
 | Function registry + `CallFunction` | ❌ | ✅ |
 | Kernel dispatch by exact type | ✅ manual switch | ✅ auto |
@@ -249,7 +249,7 @@ All temporal extract, cast, and arithmetic functions | ❌ (no temporal types)
 
 ## 7. IPC & serialization
 
-| Capability | OdinArrow | Apache Arrow |
+| Capability | Skadi | Apache Arrow |
 |---|---|---|
 | IPC **file** format (Feather v2) | ✅ read + write | ✅ |
 | IPC **stream** format | ✅ read + write | ✅ |
@@ -270,15 +270,15 @@ All temporal extract, cast, and arithmetic functions | ❌ (no temporal types)
 | C **stream** interface (`ArrowArrayStream`) | ❌ | ✅ |
 | C **device** interface (CUDA) | ❌ | ✅ |
 
-**Interop status:** Files produced by OdinArrow for supported flat types are readable by PyArrow and Arrow C++, and vice versa (verified in tests and README). Unsupported IPC features (dictionaries, nested columns, compression) will fail or be skipped.
+**Interop status:** Files produced by Skadi for supported flat types are readable by PyArrow and Arrow C++, and vice versa (verified in tests and README). Unsupported IPC features (dictionaries, nested columns, compression) will fail or be skipped.
 
 ---
 
 ## 8. File format I/O (beyond IPC)
 
-Apache Arrow libraries ship readers/writers and integration for many on-disk formats. OdinArrow separates **library** from **example programs**.
+Apache Arrow libraries ship readers/writers and integration for many on-disk formats. Skadi separates **library** from **example programs**.
 
-| Format | OdinArrow library | OdinArrow `programs/` | Apache Arrow |
+| Format | Skadi library | Skadi `programs/` | Apache Arrow |
 |---|---|---|---|
 | Arrow IPC / Feather | ✅ | — | ✅ |
 | **Parquet** read | ❌ | 🔶 native subset (`parquet_to_csv_odin`) | ✅ full |
@@ -314,7 +314,7 @@ What the experimental native reader/writer supports vs full Parquet:
 
 PyArrow’s **`Dataset` API** and Arrow C++ **`arrow::dataset`** provide partitioned, multi-file analytics:
 
-| Capability | OdinArrow | Apache Arrow |
+| Capability | Skadi | Apache Arrow |
 |---|---|---|
 | `Dataset` over Parquet/IPC/CSV | ❌ | ✅ |
 | Hive / directory partitioning | ❌ | ✅ |
@@ -324,13 +324,13 @@ PyArrow’s **`Dataset` API** and Arrow C++ **`arrow::dataset`** provide partiti
 | Write `Dataset` (partitioned output) | ❌ | ✅ |
 | Acero integration (exec plans over datasets) | ❌ | ✅ |
 
-OdinArrow has **`Table` / `Chunked_Array`** as a minimal in-memory analogue but no filesystem-aware scanning.
+Skadi has **`Table` / `Chunked_Array`** as a minimal in-memory analogue but no filesystem-aware scanning.
 
 ---
 
 ## 10. Filesystem & remote I/O
 
-| Capability | OdinArrow | Apache Arrow |
+| Capability | Skadi | Apache Arrow |
 |---|---|---|
 | Local file read/write | ✅ (`core:os`) | ✅ `arrow::fs::LocalFileSystem` |
 | Unified `FileSystem` abstraction | ❌ | ✅ |
@@ -342,7 +342,7 @@ OdinArrow has **`Table` / `Chunked_Array`** as a minimal in-memory analogue but 
 
 ## 11. Network protocols & database connectivity
 
-| Component | Purpose | OdinArrow |
+| Component | Purpose | Skadi |
 |---|---|---|
 | **Arrow Flight** | gRPC RPC for streaming Arrow batches | ❌ |
 | **Flight SQL** | JDBC/ODBC-style wire protocol over Flight | ❌ |
@@ -355,7 +355,7 @@ These are **separate sub-projects** in the Arrow ecosystem but are commonly grou
 
 ## 12. Query engine & advanced analytics
 
-| Component | OdinArrow | Apache Arrow |
+| Component | Skadi | Apache Arrow |
 |---|---|---|
 | **Acero** (C++ exec engine) | ❌ | ✅ filter, project, aggregate, join, order |
 | **Gandiva** (LLVM JIT) | ❌ | ✅ expression compilation to native code |
@@ -367,7 +367,7 @@ These are **separate sub-projects** in the Arrow ecosystem but are commonly grou
 
 ## 13. Interoperability & language ecosystem
 
-| Interface | OdinArrow | Apache Arrow |
+| Interface | Skadi | Apache Arrow |
 |---|---|---|
 | **C Data Interface** (`ArrowArray` / `ArrowSchema`) | 🔶 layout-compatible buffers; no export/import procs | ✅ spec + helpers |
 | **C Stream Interface** | ❌ | ✅ |
@@ -376,13 +376,13 @@ These are **separate sub-projects** in the Arrow ecosystem but are commonly grou
 | **nanoarrow** (minimal C) | ❌ | ✅ separate project |
 | Cross-language integration test suite | 🔶 IPC + C++ FFI tests | ✅ extensive |
 
-OdinArrow proves **binary layout compatibility** with Arrow C++ for sum/min/max/filter on raw pointers (`tests_cpp/`), but does not expose a stable C ABI for foreign callers.
+Skadi proves **binary layout compatibility** with Arrow C++ for sum/min/max/filter on raw pointers (`tests_cpp/`), but does not expose a stable C ABI for foreign callers.
 
 ---
 
 ## 14. Metadata, extension types & schema evolution
 
-| Feature | OdinArrow | Apache Arrow |
+| Feature | Skadi | Apache Arrow |
 |---|---|---|
 | Field nullable flag | ✅ | ✅ |
 | Field / schema custom metadata (KV) | ❌ | ✅ |
@@ -395,7 +395,7 @@ OdinArrow proves **binary layout compatibility** with Arrow C++ for sum/min/max/
 
 ## 15. Tooling, testing & packaging
 
-| Area | OdinArrow | Apache Arrow |
+| Area | Skadi | Apache Arrow |
 |---|---|---|
 | Unit tests | ✅ 122 tests (`make test`) | ✅ extensive |
 | C++ interop tests | ✅ `make test-cpp` | — |
@@ -411,7 +411,7 @@ OdinArrow proves **binary layout compatibility** with Arrow C++ for sum/min/max/
 ## 16. Side-by-side scope map
 
 ```
-Apache Arrow ecosystem                          OdinArrow coverage
+Apache Arrow ecosystem                          Skadi coverage
 ─────────────────────────────────────────────────────────────────────
 Columnar format (full type system)              ████░░░░░░  ~35%
 In-memory Array / Batch / Table (flat)          ████████░░  ~80%
@@ -429,7 +429,7 @@ Multi-language bindings                         ░░░░░░░░░░  
 
 ---
 
-## 17. What OdinArrow covers well (parity or better for flat analytics)
+## 17. What Skadi covers well (parity or better for flat analytics)
 
 These areas are **not missing** relative to Arrow’s core value proposition for flat data:
 
@@ -443,7 +443,7 @@ These areas are **not missing** relative to Arrow’s core value proposition for
 - Buffer pool for repeated construction  
 - Validated against Arrow C++ on raw buffer layout (`tests_cpp/`)
 
-For **“load flat columns → compute → exchange via IPC”**, OdinArrow is a credible subset. For **“drop-in PyArrow replacement”**, it is not.
+For **“load flat columns → compute → exchange via IPC”**, Skadi is a credible subset. For **“drop-in PyArrow replacement”**, it is not.
 
 ---
 
@@ -486,7 +486,7 @@ Grouped by dependency order. Effort: **S** / **M** / **L**.
 
 ### Explicit non-goals (match README / PLAN)
 
-Unless requirements change, these remain **out of scope** for OdinArrow as documented:
+Unless requirements change, these remain **out of scope** for Skadi as documented:
 
 - GPU / CUDA kernels  
 - Gandiva LLVM JIT  
@@ -504,7 +504,7 @@ Unless requirements change, these remain **out of scope** for OdinArrow as docum
 - [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html)  
 - [Arrow Flight](https://arrow.apache.org/docs/format/Flight.html)  
 - [PyArrow Dataset](https://arrow.apache.org/docs/python/dataset.html)  
-- OdinArrow: [`README.md`](README.md), [`PLAN.md`](PLAN.md), [`Cursor.md`](Cursor.md), [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md)
+- Skadi: [`README.md`](README.md), [`PLAN.md`](PLAN.md), [`Cursor.md`](Cursor.md), [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md)
 
 ---
 

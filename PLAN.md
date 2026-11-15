@@ -1,4 +1,4 @@
-# OdinArrow — Design & Development Plan
+# Skadi — Design & Development Plan
 
 ## What We Are Building
 
@@ -264,7 +264,7 @@ Benchmark scenarios:
 ## File Structure
 
 ```
-OdinArrow/
+skadi/
 ├── PLAN.md                      ← this file
 ├── src/
 │   ├── buffer.odin
@@ -346,9 +346,9 @@ match a Python-wrapped C++ library, with much simpler and more auditable code."
 
 ### Measured: single-threaded vs Apache Arrow C++
 
-`benchmarks/bench_odin_c.sh` runs OdinArrow's serial kernels 1:1 against Apache
+`benchmarks/bench_odin_c.sh` runs Skadi's serial kernels 1:1 against Apache
 Arrow C++ (both single-threaded, recycling memory pools on both sides). Ratios
-are C++ time ÷ Odin time — `>1` means OdinArrow is faster. Representative run:
+are C++ time ÷ Odin time — `>1` means Skadi is faster. Representative run:
 
 | Benchmark            | C++/Odin |   | Benchmark             | C++/Odin |
 |----------------------|----------|---|-----------------------|----------|
