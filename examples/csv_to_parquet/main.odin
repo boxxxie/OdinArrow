@@ -55,10 +55,16 @@ main :: proc() {
 		fmt.eprintfln("error: cannot open CSV %s: %v", in_path, e.err)
 		os.exit(1)
 	case CSV_To_Parquet_Invalid_CSV_Error:
-		fmt.eprintfln("error: empty or invalid CSV header in %s", in_path)
+		fmt.eprintfln("error: invalid CSV in %s: %s", in_path, e.message)
 		os.exit(1)
 	case CSV_To_Parquet_Create_Output_Error:
 		fmt.eprintfln("error: cannot create %s: %v", out_path, e.err)
+		os.exit(1)
+	case CSV_To_Parquet_Write_Output_Error:
+		fmt.eprintfln("error: write failed on %s: %v", out_path, e.err)
+		os.exit(1)
+	case CSV_To_Parquet_Page_Overflow_Error:
+		fmt.eprintfln("error: Parquet page size exceeds 2 GiB limit on %s", out_path)
 		os.exit(1)
 	}
 
@@ -73,16 +79,26 @@ CSV_To_Parquet_Open_CSV_Error :: struct {
 	err: os.Error,
 }
 
-CSV_To_Parquet_Invalid_CSV_Error :: struct {}
+CSV_To_Parquet_Invalid_CSV_Error :: struct {
+	message: string,
+}
 
 CSV_To_Parquet_Create_Output_Error :: struct {
 	err: os.Error,
 }
 
+CSV_To_Parquet_Write_Output_Error :: struct {
+	err: os.Error,
+}
+
+CSV_To_Parquet_Page_Overflow_Error :: struct {}
+
 CSV_To_Parquet_Error :: union {
 	CSV_To_Parquet_Open_CSV_Error,
 	CSV_To_Parquet_Invalid_CSV_Error,
 	CSV_To_Parquet_Create_Output_Error,
+	CSV_To_Parquet_Write_Output_Error,
+	CSV_To_Parquet_Page_Overflow_Error,
 }
 
 csv_to_parquet_stream :: proc(
@@ -110,7 +126,7 @@ csv_to_parquet_stream :: proc(
 		if open_err != nil {
 			return 0, 0, CSV_To_Parquet_Open_CSV_Error{err = open_err}
 		}
-		return 0, 0, CSV_To_Parquet_Invalid_CSV_Error{}
+		return 0, 0, CSV_To_Parquet_Invalid_CSV_Error{message = "empty or invalid CSV header"}
 	}
 	defer csv_stream_destroy(&csv)
 
@@ -120,7 +136,13 @@ csv_to_parquet_stream :: proc(
 	if out_err != nil {
 		return 0, 0, CSV_To_Parquet_Create_Output_Error{err = out_err}
 	}
-	defer os.close(out_file)
+	write_ok := false
+	defer {
+		if !write_ok {
+			_ = os.truncate(out_file, 0)
+		}
+		os.close(out_file)
+	}
 
 	pw := pw_open(out_file, csv.col_names)
 	defer pw_destroy(&pw)
@@ -146,6 +168,9 @@ csv_to_parquet_stream :: proc(
 
 	for {
 		arrays, n := csv_stream_read_chunk(&csv, max_rows)
+		if csv.row_err {
+			return 0, 0, CSV_To_Parquet_Invalid_CSV_Error{message = "row column count mismatch"}
+		}
 		if n == 0 {
 			break
 		}
@@ -157,10 +182,21 @@ csv_to_parquet_stream :: proc(
 		}
 		delete(arrays)
 
+		if pw.page_overflow {
+			return 0, 0, CSV_To_Parquet_Page_Overflow_Error{}
+		}
+		if pw.write_err != nil {
+			return 0, 0, CSV_To_Parquet_Write_Output_Error{err = pw.write_err}
+		}
+
 		total_rows += n
 		total_chunks += 1
 	}
 
 	pw_finish(&pw)
+	if pw.write_err != nil {
+		return 0, 0, CSV_To_Parquet_Write_Output_Error{err = pw.write_err}
+	}
+	write_ok = true
 	return total_rows, total_chunks, nil
 }

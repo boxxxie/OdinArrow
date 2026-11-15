@@ -1,6 +1,7 @@
 // Streaming RFC 4180 CSV reader.
 package csv_to_parquet
 
+import "base:intrinsics"
 import "core:os"
 import oa "../../skadi"
 
@@ -10,6 +11,7 @@ CSV_Stream :: struct {
 	buf_len:   int,       // valid bytes in buf
 	buf_pos:   int,       // parse cursor in buf
 	eof:       bool,
+	row_err:   bool,      // set true on ragged/malformed row column count mismatch
 	col_names: []string,  // column headers (heap-allocated, freed on destroy)
 	n_cols:    int,
 }
@@ -125,8 +127,23 @@ csv_read_field_into :: proc(cs: ^CSV_Stream, dst: ^[dynamic]u8) -> (eor: bool, e
 	}
 
 	// ── Unquoted field ────────────────────────────────────────────────────────
+	vc :: #simd[16]u8{',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ','}
+	vl :: #simd[16]u8{'\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n'}
+	vr :: #simd[16]u8{'\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r'}
 	uloop: for {
 		start := cs.buf_pos
+		for cs.buf_pos + 16 <= cs.buf_len {
+			v := intrinsics.unaligned_load((^#simd[16]u8)(&cs.buf[cs.buf_pos]))
+			m := intrinsics.simd_lanes_eq(v, vc) |
+			     intrinsics.simd_lanes_eq(v, vl) |
+			     intrinsics.simd_lanes_eq(v, vr)
+			mask := transmute(u16)intrinsics.simd_extract_msbs(m)
+			if mask != 0 {
+				cs.buf_pos += int(intrinsics.count_trailing_zeros(mask))
+				break
+			}
+			cs.buf_pos += 16
+		}
 		for cs.buf_pos < cs.buf_len {
 			ch := cs.buf[cs.buf_pos]
 			if ch == ',' || ch == '\n' || ch == '\r' { break }
@@ -201,24 +218,21 @@ csv_stream_read_chunk :: proc(cs: ^CSV_Stream, max_rows: int) -> (arrays: []oa.A
 			eor, var_eof = csv_read_field_into(cs, &field_tmp)
 			if var_eof && eor && ci == 0 && len(field_tmp) == 0 { ok = false; break }
 			oa.string_builder_append(&builders[ci], string(field_tmp[:]))
-			if eor {
-				for rci in ci + 1 ..< cs.n_cols {
-					oa.string_builder_append(&builders[rci], "")
-				}
+			if eor && ci + 1 < cs.n_cols {
+				cs.row_err = true
+				ok = false
 				break
 			}
 		}
 		if !ok { break }
 		if !eor {
-			for !eor && !csv_stream_at_eof(cs) {
-				clear(&field_tmp)
-				eor, _ = csv_read_field_into(cs, &field_tmp)
-			}
+			cs.row_err = true
+			break
 		}
 		n += 1
 	}
 
-	if n == 0 {
+	if cs.row_err || n == 0 {
 		for ci in 0..<cs.n_cols { oa.string_builder_destroy(&builders[ci]) }
 		delete(builders)
 		return nil, 0

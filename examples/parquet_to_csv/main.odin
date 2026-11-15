@@ -1,5 +1,6 @@
 package parquet_to_csv
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:io"
 import "core:os"
@@ -44,6 +45,7 @@ out_flush :: proc(o: ^Out) {
 }
 
 out_bytes :: proc(o: ^Out, b: []u8) {
+	if len(b) == 0 || o.write_err != nil { return }
 	src := b
 	for len(src) > 0 {
 		avail := len(o.buf) - o.pos
@@ -51,7 +53,10 @@ out_bytes :: proc(o: ^Out, b: []u8) {
 		copy(o.buf[o.pos:], src[:n])
 		o.pos += n
 		src = src[n:]
-		if o.pos == len(o.buf) { out_flush(o) }
+		if o.pos == len(o.buf) {
+			out_flush(o)
+			if o.write_err != nil { return }
+		}
 	}
 }
 
@@ -59,11 +64,35 @@ out_str :: proc(o: ^Out, s: string) { out_bytes(o, transmute([]u8)s) }
 
 // out_csv_field writes s as a CSV field, quoting per RFC 4180 when needed.
 out_csv_field :: proc(o: ^Out, s: string) {
+	b := transmute([]u8)s
+	n := len(b)
 	needs_quoting := false
-	for c in s {
-		if c == '"' || c == ',' || c == '\n' || c == '\r' {
-			needs_quoting = true
-			break
+	i := 0
+	if n >= 16 {
+		vq :: #simd[16]u8{'"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"', '"'}
+		vc :: #simd[16]u8{',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ',', ','}
+		vl :: #simd[16]u8{'\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n'}
+		vr :: #simd[16]u8{'\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r'}
+		for i + 16 <= n {
+			v := intrinsics.unaligned_load((^#simd[16]u8)(&b[i]))
+			m := intrinsics.simd_lanes_eq(v, vq) |
+			     intrinsics.simd_lanes_eq(v, vc) |
+			     intrinsics.simd_lanes_eq(v, vl) |
+			     intrinsics.simd_lanes_eq(v, vr)
+			if intrinsics.simd_extract_msbs(m) != {} {
+				needs_quoting = true
+				break
+			}
+			i += 16
+		}
+	}
+	if !needs_quoting {
+		for ; i < n; i += 1 {
+			c := b[i]
+			if c == '"' || c == ',' || c == '\n' || c == '\r' {
+				needs_quoting = true
+				break
+			}
 		}
 	}
 	if !needs_quoting {
@@ -72,11 +101,11 @@ out_csv_field :: proc(o: ^Out, s: string) {
 	}
 	out_str(o, "\"")
 	start := 0
-	for i := 0; i < len(s); i += 1 {
-		if s[i] == '"' {
-			out_str(o, s[start:i+1])
+	for k := 0; k < n; k += 1 {
+		if b[k] == '"' {
+			out_str(o, s[start:k+1])
 			out_str(o, "\"")
-			start = i + 1
+			start = k + 1
 		}
 	}
 	out_str(o, s[start:])
@@ -87,6 +116,28 @@ out_i32 :: proc(o: ^Out, v: i32) {
 	tmp: [16]u8
 	s := strconv.write_int(tmp[:], i64(v), 10)
 	out_str(o, s)
+}
+
+out_i64 :: proc(o: ^Out, v: i64) {
+	tmp: [24]u8
+	s := strconv.write_int(tmp[:], v, 10)
+	out_str(o, s)
+}
+
+out_f32 :: proc(o: ^Out, v: f32) {
+	tmp: [32]u8
+	s := fmt.bprintf(tmp[:], "%g", v)
+	out_str(o, s)
+}
+
+out_f64 :: proc(o: ^Out, v: f64) {
+	tmp: [32]u8
+	s := fmt.bprintf(tmp[:], "%g", v)
+	out_str(o, s)
+}
+
+out_bool :: proc(o: ^Out, v: bool) {
+	out_str(o, "true" if v else "false")
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -166,6 +217,10 @@ main :: proc() {
 	case Parquet_To_CSV_Write_Output_Error:
 		fmt.eprintfln("error: write failed on %s: %v", out_path, e.err)
 		os.exit(1)
+	case Parquet_To_CSV_Unsupported_Column_Error:
+		col_name := string(e.name_buf[:e.name_len])
+		fmt.eprintfln("error: unsupported physical type %d for column %s", e.ptype, col_name)
+		os.exit(1)
 	}
 
 	total_ns := time.duration_nanoseconds(time.since(t0))
@@ -194,12 +249,19 @@ Parquet_To_CSV_Write_Output_Error :: struct {
 	err: os.Error,
 }
 
+Parquet_To_CSV_Unsupported_Column_Error :: struct {
+	name_buf: [256]u8,
+	name_len: int,
+	ptype:    i32,
+}
+
 Parquet_To_CSV_Error :: union {
 	Parquet_To_CSV_Open_Input_Error,
 	Parquet_To_CSV_Bad_Footer_Error,
 	Parquet_To_CSV_Stream_Init_Error,
 	Parquet_To_CSV_Open_Output_Error,
 	Parquet_To_CSV_Write_Output_Error,
+	Parquet_To_CSV_Unsupported_Column_Error,
 }
 
 parquet_to_csv_stream :: proc(
@@ -208,16 +270,21 @@ parquet_to_csv_stream :: proc(
 	mem_limit:          i64,
 	chunk_rows_override := 0,
 ) -> (num_rows: i64, chunk_rows: int, err: Parquet_To_CSV_Error) {
-	// Open file for footer reading only
+	// Open file once and share handle across footer read and all column streams
 	file, file_err := os.open(in_path)
 	if file_err != nil {
 		return 0, 0, Parquet_To_CSV_Open_Input_Error{err = file_err}
+	}
+	defer os.close(file)
+
+	file_size, sz_err := os.file_size(file)
+	if sz_err != nil {
+		return 0, 0, Parquet_To_CSV_Bad_Footer_Error{}
 	}
 
 	metas: []Column_Chunk_Meta
 	footer_ok: bool
 	num_rows, metas, footer_ok = parse_footer_from_file(file)
-	os.close(file) // footer parsed; column streams open their own handles
 	if !footer_ok {
 		return 0, 0, Parquet_To_CSV_Bad_Footer_Error{}
 	}
@@ -233,6 +300,18 @@ parquet_to_csv_stream :: proc(
 	}
 
 	n_cols := len(metas)
+	for i in 0 ..< n_cols {
+		pt := metas[i].ptype
+		if pt != PTYPE_BOOLEAN && pt != PTYPE_INT32 && pt != PTYPE_INT64 &&
+		   pt != PTYPE_FLOAT && pt != PTYPE_DOUBLE && pt != PTYPE_BYTE_ARRAY {
+			u_err: Parquet_To_CSV_Unsupported_Column_Error
+			n_copy := min(len(metas[i].name), len(u_err.name_buf))
+			copy(u_err.name_buf[:n_copy], metas[i].name[:n_copy])
+			u_err.name_len = n_copy
+			u_err.ptype = pt
+			return 0, 0, u_err
+		}
+	}
 
 	// Compute chunk_rows from memory budget.
 	// Budget = 1 MB output buf + n_cols * 1 MB page bufs + chunk column arrays.
@@ -243,8 +322,12 @@ parquet_to_csv_stream :: proc(
 	bytes_per_row := i64(0)
 	for i in 0..<n_cols {
 		m := metas[i]
-		if m.ptype == PTYPE_INT32 {
+		if m.ptype == PTYPE_INT64 || m.ptype == PTYPE_DOUBLE {
+			bytes_per_row += 8
+		} else if m.ptype == PTYPE_INT32 || m.ptype == PTYPE_FLOAT {
 			bytes_per_row += 4
+		} else if m.ptype == PTYPE_BOOLEAN {
+			bytes_per_row += 1
 		} else if m.has_dict {
 			bytes_per_row += 16 // just the string header; dict stays loaded
 		} else {
@@ -270,7 +353,7 @@ parquet_to_csv_stream :: proc(
 		chunk_rows = 1
 	}
 
-	// Open per-column streaming readers
+	// Open per-column streaming readers sharing `file`
 	streams := make([]Col_Stream, n_cols)
 	initialized := 0
 	defer {
@@ -280,7 +363,7 @@ parquet_to_csv_stream :: proc(
 		delete(streams)
 	}
 	for j in 0 ..< n_cols {
-		s, s_ok := col_stream_init(in_path, metas[j])
+		s, s_ok := col_stream_init_shared(file, file_size, metas[j])
 		if !s_ok {
 			init_err: Parquet_To_CSV_Stream_Init_Error
 			n_copy := min(len(metas[j].name), len(init_err.name_buf))
@@ -307,7 +390,13 @@ parquet_to_csv_stream :: proc(
 		}
 		opened_file = f
 	}
-	defer if using_file && opened_file != nil { os.close(opened_file) }
+	write_ok := false
+	defer if using_file && opened_file != nil {
+		if !write_ok {
+			_ = os.truncate(opened_file, 0)
+		}
+		os.close(opened_file)
+	}
 
 	out_file := opened_file if using_file else os.stdout
 
@@ -328,10 +417,13 @@ parquet_to_csv_stream :: proc(
 		n := min(chunk_rows, total - rows_done)
 
 		for j in 0..<n_cols {
-			if metas[j].ptype == PTYPE_INT32 {
-				chunk_arrays[j] = col_stream_to_i32_array(&streams[j], n)
-			} else {
-				chunk_arrays[j] = col_stream_to_string_array(&streams[j], n)
+			switch metas[j].ptype {
+			case PTYPE_INT32:   chunk_arrays[j] = col_stream_to_i32_array(&streams[j], n)
+			case PTYPE_INT64:   chunk_arrays[j] = col_stream_to_i64_array(&streams[j], n)
+			case PTYPE_FLOAT:   chunk_arrays[j] = col_stream_to_f32_array(&streams[j], n)
+			case PTYPE_DOUBLE:  chunk_arrays[j] = col_stream_to_f64_array(&streams[j], n)
+			case PTYPE_BOOLEAN: chunk_arrays[j] = col_stream_to_bool_array(&streams[j], n)
+			case:               chunk_arrays[j] = col_stream_to_string_array(&streams[j], n)
 			}
 			if chunk_arrays[j].length != n {
 				for k in 0..=j {
@@ -354,6 +446,14 @@ parquet_to_csv_stream :: proc(
 					#partial switch _ in chunk_arrays[j].type {
 					case oa.Int32_Type:
 						out_i32(&o, oa.array_get(&chunk_arrays[j], r, i32))
+					case oa.Int64_Type:
+						out_i64(&o, oa.array_get(&chunk_arrays[j], r, i64))
+					case oa.Float32_Type:
+						out_f32(&o, oa.array_get(&chunk_arrays[j], r, f32))
+					case oa.Float64_Type:
+						out_f64(&o, oa.array_get(&chunk_arrays[j], r, f64))
+					case oa.Bool_Type:
+						out_bool(&o, oa.array_get(&chunk_arrays[j], r, bool))
 					case oa.String_Type:
 						out_csv_field(&o, oa.array_get_string(&chunk_arrays[j], r))
 					}
@@ -374,5 +474,6 @@ parquet_to_csv_stream :: proc(
 	if o.write_err != nil {
 		return 0, 0, Parquet_To_CSV_Write_Output_Error{err = o.write_err}
 	}
+	write_ok = true
 	return num_rows, chunk_rows, nil
 }
