@@ -23,16 +23,16 @@ Backports the 11 as-is tests and 4 adapted/extracted tests from `56fbd38`, `9ade
 ## Phase 2: Refactor ATDD Spec Layers & Harden Existing Assertions
 Splits oversized ATDD Layer 2/3 files by domain and fixes weak assertions and temp-file churn.
 
-- [ ] Task: Split Monolithic ATDD Layer 2 (`dsl_test.odin`) and Layer 3 (`driver_arrow_test.odin`) Files by Domain
-    - [ ] Split `specs/dsl_test.odin` into `specs/dsl_core_test.odin`, `specs/dsl_ipc_test.odin`, and `specs/dsl_parquet_csv_test.odin`
-    - [ ] Split `specs/driver_arrow_test.odin` into `specs/driver_core_test.odin`, `specs/driver_ipc_test.odin`, and `specs/driver_parquet_csv_test.odin`
-    - [ ] Verify `odin check specs` and `odin test specs` pass with 0 warnings
-- [ ] Task: Harden Weak Assertions & Reduce Temp-File Churn in `tests/` and `tests_cpp/`
-    - [ ] Refactor `test_ipc_fuzz_no_crash` in `tests/ipc_test.odin` to reuse a single temp file path, assert `ok == true` on unmutated `orig`, assert `ok == false` on strict truncations (`cut < len(orig)`), and remove `testing.expect(t, true)`
-    - [ ] Strengthen `test_compute_filter_large` in `tests/compute_test.odin` to verify all surviving elements across the entire result array
-    - [ ] Strengthen `test_arrow_cpp_filter_count_matches` and `test_arrow_cpp_filter_large` in `tests_cpp/arrow_cpp_test.odin` to verify surviving element values and validity bits
-    - [ ] Audit touched/refactored tests in `tests/` to assert `err == .None` / `ok == true` on `builder_finish`, `string_builder_finish`, and `buffer_make` instead of discarding with `_`
-    - [ ] Run `make check && make test && make test-cpp` and confirm 0 warnings/failures
+- [x] Task: Split Monolithic ATDD Layer 2 (`dsl_test.odin`) and Layer 3 (`driver_arrow_test.odin`) Files by Domain `a80ce9f`
+    - [x] Split `specs/dsl_test.odin` into `specs/dsl_core_test.odin`, `specs/dsl_ipc_test.odin`, and `specs/dsl_parquet_csv_test.odin`
+    - [x] Split `specs/driver_arrow_test.odin` into `specs/driver_core_test.odin`, `specs/driver_ipc_test.odin`, and `specs/driver_parquet_csv_test.odin`
+    - [x] Verify `odin check specs` and `odin test specs` pass with 0 warnings
+- [x] Task: Harden Weak Assertions & Reduce Temp-File Churn in `tests/` and `tests_cpp/` `2237d2a`
+    - [x] Refactor `test_ipc_fuzz_no_crash` in `tests/ipc_test.odin` to reuse a single temp file path, assert `ok == true` on unmutated `orig`, assert `ok == false` on strict truncations (`cut < len(orig)`), and remove `testing.expect(t, true)`
+    - [x] Strengthen `test_compute_filter_large` in `tests/compute_test.odin` to verify all surviving elements across the entire result array
+    - [x] Strengthen `test_arrow_cpp_filter_count_matches` and `test_arrow_cpp_filter_large` in `tests_cpp/arrow_cpp_test.odin` to verify surviving element values and validity bits
+    - [x] Audit touched/refactored tests in `tests/` to assert `err == .None` / `ok == true` on `builder_finish`, `string_builder_finish`, and `buffer_make` instead of discarding with `_`
+    - [x] Run `make check && make test && make test-cpp` and confirm 0 warnings/failures
 - [ ] Task: Conductor - User Manual Verification 'Phase 2: Refactor ATDD Spec Layers & Harden Existing Assertions' (Protocol in workflow.md)
 
 ---
