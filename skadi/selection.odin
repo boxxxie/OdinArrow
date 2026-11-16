@@ -197,7 +197,7 @@ _sum_selection_typed :: #force_inline proc(arr: ^Array, sel: ^Selection, $T: typ
 	off  := arr.offset
 	if arr.buffers[0].data == nil {
 		indices := sel.indices
-		m := len(indices)
+		m := sel.length
 		s0, s1, s2, s3: f64
 		j := 0
 		for ; j + 4 <= m; j += 4 {
@@ -212,8 +212,8 @@ _sum_selection_typed :: #force_inline proc(arr: ^Array, sel: ^Selection, $T: typ
 		sum = (s0 + s1) + (s2 + s3)
 		valid_count = sel.length
 	} else {
-		for idx in sel.indices {
-			i := int(idx)
+		for j in 0..<sel.length {
+			i := int(sel.indices[j])
 			if array_is_valid(arr, i) { sum += f64(data[off + i]); valid_count += 1 }
 		}
 	}
@@ -245,16 +245,30 @@ _min_max_selection_typed :: #force_inline proc(arr: ^Array, sel: ^Selection, $T:
 	data := cast([^]T)arr.buffers[1].data
 	off  := arr.offset
 	has_nulls := arr.buffers[0].data != nil
-	lo, hi: T
+	lo, hi, last_nan: T
+	when T != f32 && T != f64 {
+		_ = last_nan
+	}
 	seen := false
 	for j in 0..<sel.length {
 		i := int(sel.indices[j])
 		if has_nulls && !array_is_valid(arr, i) { continue }
 		v := data[off + i]
-		if seen { if v < lo { lo = v }; if v > hi { hi = v } } else { lo = v; hi = v; seen = true }
 		valid_count += 1
+		when T == f32 || T == f64 {
+			if v != v { last_nan = v; continue }
+		}
+		if seen { if v < lo { lo = v }; if v > hi { hi = v } } else { lo = v; hi = v; seen = true }
 	}
-	if seen { min_val = f64(lo); max_val = f64(hi) }
+	if seen {
+		min_val = f64(lo)
+		max_val = f64(hi)
+	} else if valid_count > 0 {
+		when T == f32 || T == f64 {
+			min_val = f64(last_nan)
+			max_val = f64(last_nan)
+		}
+	}
 	return
 }
 
@@ -390,7 +404,8 @@ _selection_take_string :: proc(arr: ^Array, sel: ^Selection, allocator: mem.Allo
 // keeping a selection and gathering lazily — provided for comparison/when a
 // dense batch is genuinely required).
 record_batch_take :: proc(batch: ^Record_Batch, sel: ^Selection, allocator := context.allocator) -> (result: Record_Batch, ok: bool) {
-	cols := make([]Array, len(batch.columns), allocator)
+	cols, alloc_err := make([]Array, len(batch.columns), allocator)
+	if alloc_err != nil { return {}, false }
 	for ci in 0..<len(batch.columns) {
 		c, e := selection_take(&batch.columns[ci], sel, allocator)
 		if e != nil {

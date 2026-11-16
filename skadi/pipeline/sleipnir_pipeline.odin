@@ -153,8 +153,8 @@ _agg_subtotal_handler :: proc(state: ^_Agg_State, msg: ^Morsel_Subtotal) {
 	state.valid_count += msg.count
 	if msg.valid {
 		if state.valid {
-			if msg.min_val < state.min_val { state.min_val = msg.min_val }
-			if msg.max_val > state.max_val { state.max_val = msg.max_val }
+			if state.min_val != state.min_val || msg.min_val < state.min_val { state.min_val = msg.min_val }
+			if state.max_val != state.max_val || msg.max_val > state.max_val { state.max_val = msg.max_val }
 		} else {
 			state.min_val = msg.min_val
 			state.max_val = msg.max_val
@@ -198,8 +198,8 @@ _worker_agg_where_fallback_range :: proc(msg: ^Morsel_Work, step: int, sub: ^Mor
 			sub.sum   += part.sum
 			sub.count += part.count
 			if sub.valid {
-				if part.min_val < sub.min_val { sub.min_val = part.min_val }
-				if part.max_val > sub.max_val { sub.max_val = part.max_val }
+				if sub.min_val != sub.min_val || part.min_val < sub.min_val { sub.min_val = part.min_val }
+				if sub.max_val != sub.max_val || part.max_val > sub.max_val { sub.max_val = part.max_val }
 			} else {
 				sub.min_val = part.min_val
 				sub.max_val = part.max_val
@@ -407,8 +407,8 @@ _worker_receive :: proc(ctx: ^actor.Context, self: ^actor.Actor(_Worker_State, M
 					sub.sum   += msum
 					sub.count += k1
 					if sub.valid {
-						if mmin < sub.min_val { sub.min_val = mmin }
-						if mmax > sub.max_val { sub.max_val = mmax }
+						if sub.min_val != sub.min_val || mmin < sub.min_val { sub.min_val = mmin }
+						if sub.max_val != sub.max_val || mmax > sub.max_val { sub.max_val = mmax }
 					} else {
 						sub.min_val = mmin
 						sub.max_val = mmax

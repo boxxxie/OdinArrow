@@ -217,23 +217,7 @@ _agg_where_float_mono :: proc(values, pred: ^Array, scalar: $S, $T: typeid, $OP:
 	lo, hi: T
 	seen := false
 	if !p_nulls && !v_nulls {
-		i := 0
-		for ; i < n; i += 1 {
-			when S == i64 {
-				if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
-			} else {
-				if !_agg_cmp(f64(pdata[poff + i]), scalar, OP) { continue }
-			}
-			v := vdata[voff + i]
-			lo = v
-			hi = v
-			a.sum = f64(v)
-			a.count = 1
-			seen = true
-			i += 1
-			break
-		}
-		for ; i < n; i += 1 {
+		for i in 0..<n {
 			when S == i64 {
 				if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
 			} else {
@@ -242,8 +226,16 @@ _agg_where_float_mono :: proc(values, pred: ^Array, scalar: $S, $T: typeid, $OP:
 			v := vdata[voff + i]
 			a.sum += f64(v)
 			a.count += 1
-			if v < lo { lo = v }
-			if v > hi { hi = v }
+			if v == v {
+				if seen {
+					if v < lo { lo = v }
+					if v > hi { hi = v }
+				} else {
+					lo = v
+					hi = v
+					seen = true
+				}
+			}
 		}
 	} else {
 		for i in 0..<n {
@@ -257,17 +249,28 @@ _agg_where_float_mono :: proc(values, pred: ^Array, scalar: $S, $T: typeid, $OP:
 			v := vdata[voff + i]
 			a.sum += f64(v)
 			a.count += 1
-			if seen {
-				if v < lo { lo = v }
-				if v > hi { hi = v }
-			} else {
-				lo = v
-				hi = v
-				seen = true
+			if v == v {
+				if seen {
+					if v < lo { lo = v }
+					if v > hi { hi = v }
+				} else {
+					lo = v
+					hi = v
+					seen = true
+				}
 			}
 		}
 	}
-	if seen { a.min_val = f64(lo); a.max_val = f64(hi); a.valid = true }
+	if a.count > 0 {
+		a.valid = true
+		if seen {
+			a.min_val = f64(lo)
+			a.max_val = f64(hi)
+		} else {
+			a.min_val = a.sum
+			a.max_val = a.sum
+		}
+	}
 	return a
 }
 
