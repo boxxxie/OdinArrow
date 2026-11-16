@@ -107,7 +107,7 @@ parse_footer_struct :: proc(data: []u8) -> (num_rows: i64, metas: []Column_Chunk
 		}
 		if t.err { break }
 	}
-	if t.err { return }
+	if t.err || num_rows < 0 { return }
 
 	n_cols := len(col_names)
 	if n_cols > 0 && len(rg_metas) % n_cols != 0 { return }
@@ -966,13 +966,13 @@ col_stream_to_string_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 		} else if cs.page_is_dict {
 			idx := cs.rle_idx_buf[cs.rle_idx_pos]
 			cs.rle_idx_pos += 1
-			if idx < 0 || idx >= len(cs.dict_strs) { break }
+			if idx < 0 || idx >= len(cs.dict_strs) { cs.page_rows_left = 0; cs.rows_done = cs.total_rows; break }
 			oa.string_builder_append(&b, cs.dict_strs[idx])
 		} else {
-			if cs.plain_pos + 4 > len(cs.plain_data) { break }
+			if len(cs.plain_data) - cs.plain_pos < 4 { cs.page_rows_left = 0; cs.rows_done = cs.total_rows; break }
 			slen := int(read_i32_le(cs.plain_data, cs.plain_pos))
 			cs.plain_pos += 4
-			if slen < 0 || cs.plain_pos + slen > len(cs.plain_data) { break }
+			if slen < 0 || slen > len(cs.plain_data) - cs.plain_pos { cs.page_rows_left = 0; cs.rows_done = cs.total_rows; break }
 			oa.string_builder_append(&b, string(cs.plain_data[cs.plain_pos : cs.plain_pos + slen]))
 			cs.plain_pos += slen
 		}
@@ -998,7 +998,7 @@ _col_stream_to_fixed_array :: proc(cs: ^Col_Stream, n: int, $T: typeid, dict_ptr
 			if cs.max_def == 0 && !cs.page_is_dict {
 				avail := (len(cs.plain_data) - cs.plain_pos) / size_of(T)
 				take := min(n - count, min(cs.page_rows_left, avail))
-				if take <= 0 { break }
+				if take <= 0 { cs.page_rows_left = 0; cs.rows_done = cs.total_rows; break }
 				mem.copy(&b.data[b.length], &cs.plain_data[cs.plain_pos], take * size_of(T))
 				b.length          += take
 				cs.plain_pos      += take * size_of(T)
@@ -1023,10 +1023,10 @@ _col_stream_to_fixed_array :: proc(cs: ^Col_Stream, n: int, $T: typeid, dict_ptr
 			idx := cs.rle_idx_buf[cs.rle_idx_pos]
 			cs.rle_idx_pos += 1
 			dict := dict_ptr^
-			if idx < 0 || idx >= len(dict) { break }
+			if idx < 0 || idx >= len(dict) { cs.page_rows_left = 0; cs.rows_done = cs.total_rows; break }
 			oa.builder_append(&b, dict[idx])
 		} else {
-			if cs.plain_pos + size_of(T) > len(cs.plain_data) { break }
+			if len(cs.plain_data) - cs.plain_pos < size_of(T) { cs.page_rows_left = 0; cs.rows_done = cs.total_rows; break }
 			val: T
 			mem.copy(&val, &cs.plain_data[cs.plain_pos], size_of(T))
 			when ODIN_ENDIAN != .Little {
@@ -1082,7 +1082,7 @@ col_stream_to_bool_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 		if cs.page_rows_left == 0 {
 			if !col_stream_load_page(cs) { break }
 		}
-		if cs.page_is_dict { break }
+		if cs.page_is_dict { cs.page_rows_left = 0; cs.rows_done = cs.total_rows; break }
 		is_null := false
 		if cs.max_def > 0 {
 			if cs.def_buf[cs.def_pos] < int(cs.max_def) {
@@ -1095,7 +1095,7 @@ col_stream_to_bool_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 			oa.builder_append_null(&b)
 		} else {
 			byte_i := cs.plain_pos + (cs.plain_bit_pos >> 3)
-			if byte_i >= len(cs.plain_data) { break }
+			if byte_i >= len(cs.plain_data) { cs.page_rows_left = 0; cs.rows_done = cs.total_rows; break }
 			bit := ((cs.plain_data[byte_i] >> uint(cs.plain_bit_pos & 7)) & 1) != 0
 			cs.plain_bit_pos += 1
 			oa.builder_append(&b, bit)

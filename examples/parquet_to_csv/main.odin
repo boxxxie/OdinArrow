@@ -154,7 +154,7 @@ parse_cli_args :: proc(args: []string) -> (max_mb: int, in_path: string, out_pat
 		if arg == "-m" {
 			if i + 1 >= len(args) { return 0, "", "", false }
 			v, v_ok := strconv.parse_int(args[i + 1])
-			if !v_ok || v <= 0 { return 0, "", "", false }
+			if !v_ok || v <= 0 || i64(v) > max(i64) / (1024 * 1024) { return 0, "", "", false }
 			max_mb = v
 			i += 2
 			continue
@@ -301,9 +301,6 @@ parquet_to_csv_stream :: proc(
 	metas: []Column_Chunk_Meta
 	footer_ok: bool
 	num_rows, metas, footer_ok = parse_footer_from_file(file)
-	if !footer_ok || num_rows < 0 {
-		return 0, 0, Parquet_To_CSV_Bad_Footer_Error{}
-	}
 	defer {
 		for &m in metas {
 			delete(transmute([]u8)m.name)
@@ -313,6 +310,9 @@ parquet_to_csv_stream :: proc(
 			delete(m.extra_rg_has_dict)
 		}
 		delete(metas)
+	}
+	if !footer_ok || num_rows < 0 {
+		return 0, 0, Parquet_To_CSV_Bad_Footer_Error{}
 	}
 
 	n_cols := len(metas)

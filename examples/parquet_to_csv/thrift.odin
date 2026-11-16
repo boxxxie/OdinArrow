@@ -78,7 +78,7 @@ thrift_read_i64 :: proc "contextless" (t: ^Thrift) -> i64 {
 
 thrift_read_binary :: proc "contextless" (t: ^Thrift) -> []u8 {
 	n := int(thrift_read_varint(t))
-	if t.err || n < 0 || t.pos + n > len(t.data) {
+	if t.err || n < 0 || n > len(t.data) - t.pos {
 		t.err = true
 		return nil
 	}
@@ -165,7 +165,7 @@ thrift_skip :: proc (t: ^Thrift, ftype: u8) {
 		t.pos += 8
 	case THRIFT_BINARY:
 		n := int(thrift_read_varint(t))
-		if t.err || n < 0 || t.pos + n > len(t.data) {
+		if t.err || n < 0 || n > len(t.data) - t.pos {
 			t.err = true
 			t.pos = len(t.data)
 			return

@@ -286,7 +286,9 @@ csv_stream_read_chunk :: proc(cs: ^CSV_Stream, max_rows: int) -> (arrays: []oa.A
 
 	arrays = make([]oa.Array, cs.n_cols)
 	for ci in 0..<cs.n_cols {
-		arrays[ci], _ = oa.string_builder_finish(&builders[ci])
+		arr, finish_err := oa.string_builder_finish(&builders[ci])
+		assert(finish_err == nil, "csv_stream_read_chunk: string_builder_finish failed")
+		arrays[ci] = arr
 		oa.string_builder_destroy(&builders[ci])
 	}
 	delete(builders)
