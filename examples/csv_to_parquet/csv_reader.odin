@@ -2,6 +2,7 @@
 package csv_to_parquet
 
 import "base:intrinsics"
+import "core:io"
 import "core:os"
 import oa "../../skadi"
 
@@ -11,7 +12,8 @@ CSV_Stream :: struct {
 	buf_len:   int,       // valid bytes in buf
 	buf_pos:   int,       // parse cursor in buf
 	eof:       bool,
-	row_err:   bool,      // set true on ragged/malformed row column count mismatch
+	read_err:  os.Error,  // non-nil on os.read failure (excluding io.Error.EOF)
+	row_err:   bool,      // set true on ragged/malformed row or quote syntax error
 	col_names: []string,  // column headers (heap-allocated, freed on destroy)
 	n_cols:    int,
 }
@@ -45,7 +47,18 @@ csv_stream_open :: proc(path: string, buf_size: int, open_err: ^os.Error = nil) 
 		if eor { break }
 	}
 
-	if len(names) == 0 || (len(names) == 1 && len(names[0]) == 0) {
+	if cs.read_err != nil {
+		if open_err != nil {
+			open_err^ = cs.read_err
+		}
+		for s in names { delete(transmute([]u8)s) }
+		delete(names)
+		delete(cs.buf)
+		os.close(fd)
+		return {}, false
+	}
+
+	if cs.row_err || len(names) == 0 || (len(names) == 1 && len(names[0]) == 0) {
 		for s in names { delete(transmute([]u8)s) }
 		delete(names)
 		delete(cs.buf)
@@ -76,9 +89,14 @@ csv_refill :: proc(cs: ^CSV_Stream) {
 	}
 	cs.buf_len = remaining
 	cs.buf_pos = 0
-	n, _ := os.read(cs.file, cs.buf[cs.buf_len:])
+	n, err := os.read(cs.file, cs.buf[cs.buf_len:])
+	if err != nil && err != io.Error.EOF {
+		cs.read_err = err
+		cs.eof = true
+		return
+	}
 	cs.buf_len += n
-	if n == 0 { cs.eof = true }
+	if n == 0 || err == io.Error.EOF { cs.eof = true }
 }
 
 // csv_read_field_view reads the next CSV field, returning a view into `cs.buf`
@@ -96,6 +114,7 @@ csv_read_field_view :: proc(cs: ^CSV_Stream, dst: ^[dynamic]u8) -> (field: strin
 	if cs.buf[cs.buf_pos] == '"' {
 		// ── Quoted field ──────────────────────────────────────────────────────
 		cs.buf_pos += 1 // skip opening quote
+		closed := false
 		qloop: for {
 			for cs.buf_pos < cs.buf_len {
 				ch := cs.buf[cs.buf_pos]
@@ -110,6 +129,7 @@ csv_read_field_view :: proc(cs: ^CSV_Stream, dst: ^[dynamic]u8) -> (field: strin
 						cs.buf_pos += 1
 					} else {
 						// Closing quote
+						closed = true
 						break qloop
 					}
 				} else {
@@ -122,6 +142,10 @@ csv_read_field_view :: proc(cs: ^CSV_Stream, dst: ^[dynamic]u8) -> (field: strin
 				if cs.eof { break qloop }
 				csv_refill(cs)
 			}
+		}
+		if !closed {
+			cs.row_err = true
+			return string(dst[:]), true, false
 		}
 		eor = csv_consume_sep(cs)
 		return string(dst[:]), eor, false
@@ -206,7 +230,8 @@ csv_consume_sep :: proc(cs: ^CSV_Stream) -> (eor: bool) {
 		cs.buf_pos += 1
 		return true
 	}
-	return true // fallback
+	cs.row_err = true
+	return true
 }
 
 // csv_stream_read_chunk reads up to max_rows rows and returns one OdinArrow
@@ -215,7 +240,7 @@ csv_consume_sep :: proc(cs: ^CSV_Stream) -> (eor: bool) {
 //   for ci in 0..<csv.n_cols { oa.array_free(&arrays[ci]) }
 //   delete(arrays)
 csv_stream_read_chunk :: proc(cs: ^CSV_Stream, max_rows: int) -> (arrays: []oa.Array, n: int) {
-	if cs.row_err || csv_stream_at_eof(cs) { return nil, 0 }
+	if cs.row_err || cs.read_err != nil || csv_stream_at_eof(cs) { return nil, 0 }
 
 	builders := make([]oa.String_Builder, cs.n_cols)
 	for ci in 0..<cs.n_cols {
@@ -225,7 +250,7 @@ csv_stream_read_chunk :: proc(cs: ^CSV_Stream, max_rows: int) -> (arrays: []oa.A
 	field_tmp := make([dynamic]u8, 0, 4096)
 	defer delete(field_tmp)
 
-	for n < max_rows && !csv_stream_at_eof(cs) {
+	for n < max_rows && !csv_stream_at_eof(cs) && !cs.row_err && cs.read_err == nil {
 		ok := true
 		eor := false
 		for ci in 0..<cs.n_cols {
@@ -233,6 +258,10 @@ csv_stream_read_chunk :: proc(cs: ^CSV_Stream, max_rows: int) -> (arrays: []oa.A
 			field: string
 			var_eof: bool
 			field, eor, var_eof = csv_read_field_view(cs, &field_tmp)
+			if cs.row_err || cs.read_err != nil {
+				ok = false
+				break
+			}
 			if var_eof && eor && ci == 0 && len(field) == 0 { ok = false; break }
 			oa.string_builder_append(&builders[ci], field)
 			if eor && ci + 1 < cs.n_cols {
@@ -249,7 +278,7 @@ csv_stream_read_chunk :: proc(cs: ^CSV_Stream, max_rows: int) -> (arrays: []oa.A
 		n += 1
 	}
 
-	if cs.row_err || n == 0 {
+	if cs.row_err || cs.read_err != nil || n == 0 {
 		for ci in 0..<cs.n_cols { oa.string_builder_destroy(&builders[ci]) }
 		delete(builders)
 		return nil, 0

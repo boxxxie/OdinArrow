@@ -54,6 +54,9 @@ main :: proc() {
 	case CSV_To_Parquet_Open_CSV_Error:
 		fmt.eprintfln("error: cannot open CSV %s: %v", in_path, e.err)
 		os.exit(1)
+	case CSV_To_Parquet_Read_CSV_Error:
+		fmt.eprintfln("error: read failed on CSV %s: %v", in_path, e.err)
+		os.exit(1)
 	case CSV_To_Parquet_Invalid_CSV_Error:
 		fmt.eprintfln("error: invalid CSV in %s: %s", in_path, e.message)
 		os.exit(1)
@@ -79,6 +82,10 @@ CSV_To_Parquet_Open_CSV_Error :: struct {
 	err: os.Error,
 }
 
+CSV_To_Parquet_Read_CSV_Error :: struct {
+	err: os.Error,
+}
+
 CSV_To_Parquet_Invalid_CSV_Error :: struct {
 	message: string,
 }
@@ -95,6 +102,7 @@ CSV_To_Parquet_Page_Overflow_Error :: struct {}
 
 CSV_To_Parquet_Error :: union {
 	CSV_To_Parquet_Open_CSV_Error,
+	CSV_To_Parquet_Read_CSV_Error,
 	CSV_To_Parquet_Invalid_CSV_Error,
 	CSV_To_Parquet_Create_Output_Error,
 	CSV_To_Parquet_Write_Output_Error,
@@ -168,8 +176,11 @@ csv_to_parquet_stream :: proc(
 
 	for {
 		arrays, n := csv_stream_read_chunk(&csv, max_rows)
+		if csv.read_err != nil {
+			return 0, 0, CSV_To_Parquet_Read_CSV_Error{err = csv.read_err}
+		}
 		if csv.row_err {
-			return 0, 0, CSV_To_Parquet_Invalid_CSV_Error{message = "row column count mismatch"}
+			return 0, 0, CSV_To_Parquet_Invalid_CSV_Error{message = "malformed CSV row or column count mismatch"}
 		}
 		if n == 0 {
 			break

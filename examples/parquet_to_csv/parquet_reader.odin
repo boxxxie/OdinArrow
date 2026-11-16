@@ -1,6 +1,7 @@
 package parquet_to_csv
 
 import "base:intrinsics"
+import "core:io"
 import "core:mem"
 import "core:os"
 import oa "../../skadi"
@@ -625,7 +626,7 @@ _col_stream_load_dict :: proc(cs: ^Col_Stream, ph: Page_Header, probe: []u8, hdr
 		read_off := already
 		for read_off < dict_data_size {
 			n_rd, rd_err := os.read_at(cs.file, cs.dict_buf[read_off:], base_off + i64(read_off))
-			if n_rd <= 0 || (rd_err != nil && n_rd == 0) {
+			if (rd_err != nil && rd_err != io.Error.EOF) || n_rd <= 0 {
 				return false
 			}
 			read_off += n_rd
@@ -850,7 +851,7 @@ col_stream_load_page :: proc(cs: ^Col_Stream) -> bool {
 		read_off := already
 		for read_off < total_data {
 			n_rd, rd_err := os.read_at(cs.file, cs.page_buf[read_off:total_data], base_off + i64(read_off))
-			if n_rd <= 0 || (rd_err != nil && n_rd == 0) { return false }
+			if (rd_err != nil && rd_err != io.Error.EOF) || n_rd <= 0 { return false }
 			read_off += n_rd
 		}
 	}

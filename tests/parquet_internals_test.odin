@@ -1489,3 +1489,31 @@ test_parquet_unsupported_ptype_and_bad_boolean_dict :: proc(t: ^testing.T) {
 	_, bok := p2c.col_stream_init(dict_pq, bmeta)
 	testing.expect(t, !bok, "PTYPE_BOOLEAN dictionary page must be rejected")
 }
+
+@(test)
+test_csv_to_parquet_rejects_malformed_quotes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	bad_cases := [2]struct {
+		label: string,
+		body:  string,
+	}{
+		{"unclosed_quote", "a,b\n\"unclosed,2\n"},
+		{"trailing_after_quote", "a,b\n\"abc\"def,2\n"},
+	}
+
+	for tc in bad_cases {
+		csv_path := pq_temp_file(tc.label)
+		pq_path  := pq_temp_file(fmt.tprintf("%s_out", tc.label))
+		defer {
+			_ = os.remove(csv_path)
+			_ = os.remove(pq_path)
+		}
+		testing.expect_value(t, os.write_entire_file(csv_path, transmute([]u8)tc.body), nil)
+
+		_, _, err := c2p.csv_to_parquet_stream(csv_path, pq_path, 64 * 1024 * 1024)
+		_, is_inv := err.(c2p.CSV_To_Parquet_Invalid_CSV_Error)
+		testing.expectf(t, is_inv, "%s must return CSV_To_Parquet_Invalid_CSV_Error", tc.label)
+		testing.expectf(t, !os.exists(pq_path), "%s must remove partial output file", tc.label)
+	}
+}

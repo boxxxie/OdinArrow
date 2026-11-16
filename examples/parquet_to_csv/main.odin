@@ -223,6 +223,14 @@ main :: proc() {
 		col_name := string(e.name_buf[:e.name_len])
 		fmt.eprintfln("error: unsupported physical type %d for column %s", e.ptype, col_name)
 		os.exit(1)
+	case Parquet_To_CSV_Corrupt_Page_Error:
+		col_name := string(e.name_buf[:e.name_len])
+		if len(col_name) > 0 {
+			fmt.eprintfln("error: corrupt or truncated page data in column %s", col_name)
+		} else {
+			fmt.eprintln("error: corrupt or truncated page data")
+		}
+		os.exit(1)
 	}
 
 	total_ns := time.duration_nanoseconds(time.since(t0))
@@ -257,6 +265,11 @@ Parquet_To_CSV_Unsupported_Column_Error :: struct {
 	ptype:    i32,
 }
 
+Parquet_To_CSV_Corrupt_Page_Error :: struct {
+	name_buf: [256]u8,
+	name_len: int,
+}
+
 Parquet_To_CSV_Error :: union {
 	Parquet_To_CSV_Open_Input_Error,
 	Parquet_To_CSV_Bad_Footer_Error,
@@ -264,6 +277,7 @@ Parquet_To_CSV_Error :: union {
 	Parquet_To_CSV_Open_Output_Error,
 	Parquet_To_CSV_Write_Output_Error,
 	Parquet_To_CSV_Unsupported_Column_Error,
+	Parquet_To_CSV_Corrupt_Page_Error,
 }
 
 parquet_to_csv_stream :: proc(
@@ -287,7 +301,7 @@ parquet_to_csv_stream :: proc(
 	metas: []Column_Chunk_Meta
 	footer_ok: bool
 	num_rows, metas, footer_ok = parse_footer_from_file(file)
-	if !footer_ok {
+	if !footer_ok || num_rows < 0 {
 		return 0, 0, Parquet_To_CSV_Bad_Footer_Error{}
 	}
 	defer {
@@ -447,11 +461,11 @@ parquet_to_csv_stream :: proc(
 				for k in 0..=j {
 					oa.array_free(&chunk_arrays[k])
 				}
-				init_err: Parquet_To_CSV_Stream_Init_Error
-				n_copy := min(len(metas[j].name), len(init_err.name_buf))
-				copy(init_err.name_buf[:n_copy], metas[j].name[:n_copy])
-				init_err.name_len = n_copy
-				return 0, 0, init_err
+				page_err: Parquet_To_CSV_Corrupt_Page_Error
+				n_copy := min(len(metas[j].name), len(page_err.name_buf))
+				copy(page_err.name_buf[:n_copy], metas[j].name[:n_copy])
+				page_err.name_len = n_copy
+				return 0, 0, page_err
 			}
 		}
 
