@@ -2,7 +2,6 @@ package pipeline
 
 import "base:intrinsics"
 import "core:mem"
-import "core:sync"
 import oa ".."
 import actor "../../deps/sleipnir/actor"
 
@@ -1326,7 +1325,7 @@ pipeline_dict_group_sum_into :: proc{
 // ── Sleipnir Actor MSB-Bucket Parallel Sort ──────────────────────────────────
 
 @(private="file")
-_MAX_SORT_BUCKET_JOBS :: 768
+_MAX_SORT_BUCKET_JOBS :: 2048
 
 @(private="file")
 _Sort_Bucket_Job :: struct {
@@ -1490,15 +1489,7 @@ _sort_send_one :: proc(p: ^Morsel_Pipeline, w: int, msg: Sort_Bucket_Work, acc: 
 @(private="file")
 _sort_begin_unparked :: proc(p: ^Morsel_Pipeline) -> bool {
 	if p == nil || p.sched == nil { return false }
-	was := intrinsics.atomic_exchange_explicit(&p.sched.enable_parking, false, .Seq_Cst)
-	if was {
-		intrinsics.atomic_thread_fence(.Seq_Cst)
-		if intrinsics.atomic_load_explicit(&p.sched.parked_workers, .Seq_Cst) > 0 {
-			intrinsics.atomic_add_explicit((^u32)(&p.sched.wake_futex), 1, .Release)
-			sync.futex_broadcast(&p.sched.wake_futex)
-		}
-	}
-	return was
+	return actor.scheduler_set_parking(p.sched, false)
 }
 
 @(private="file")
@@ -1506,7 +1497,7 @@ _sort_end_unparked :: proc(p: ^Morsel_Pipeline, was_parking: bool) {
 	if p == nil || p.sched == nil { return }
 	actor.scheduler_wait_idle(p.sched)
 	if was_parking {
-		intrinsics.atomic_store_explicit(&p.sched.enable_parking, true, .Release)
+		actor.scheduler_set_parking(p.sched, true)
 	}
 }
 
@@ -1781,15 +1772,16 @@ _run_u64_count_scatter_wave :: proc(
 
 @(private="file")
 _collect_u64_bucket_jobs :: proc(
-	p:           ^Morsel_Pipeline,
-	bucket_offs: ^[256]u32,
-	bucket_cnts: ^[256]u32,
-	total_n:     int,
-	src_is_a:    bool,
-	rem_mask:    u32,
-	depth:       int,
-	jobs:        ^[_MAX_SORT_BUCKET_JOBS]_Sort_Bucket_Job,
-	job_count:   ^int,
+	p:                 ^Morsel_Pipeline,
+	bucket_offs:       ^[256]u32,
+	bucket_cnts:       ^[256]u32,
+	total_n:           int,
+	src_is_a:          bool,
+	rem_mask:          u32,
+	depth:             int,
+	jobs:              ^[_MAX_SORT_BUCKET_JOBS]_Sort_Bucket_Job,
+	job_count:         ^int,
+	reserved_siblings := 0,
 ) {
 	skew_thresh := max(total_n / 2, SORT_PARALLEL_PARTITION_MIN)
 	for b in 0..<256 {
@@ -1797,12 +1789,15 @@ _collect_u64_bucket_jobs :: proc(
 		if cnt == 0 { continue }
 		b_start := int(bucket_offs[b])
 		b_end   := b_start + cnt
+		rem_sib := 255 - b
 
-		if cnt > skew_thresh && rem_mask != 0 && depth < 2 && p.num_workers > 1 && job_count^ + 256 < _MAX_SORT_BUCKET_JOBS {
+		if cnt > skew_thresh && rem_mask != 0 && depth < 2 && p.num_workers > 1 &&
+		   job_count^ + 256 + reserved_siblings + rem_sib <= _MAX_SORT_BUCKET_JOBS {
 			cur_src := src_is_a ? p.sort_entries_a : p.sort_entries_b
 			cur_dst := src_is_a ? p.sort_entries_b : p.sort_entries_a
 			sub_diff := _compute_diff_mask_u64_key(cur_src[b_start:b_end], rem_mask)
 			if sub_diff == 0 {
+				if job_count^ >= len(jobs) { panic("_collect_u64_bucket_jobs: exceeded _MAX_SORT_BUCKET_JOBS") }
 				jobs[job_count^] = _Sort_Bucket_Job{start = b_start, end = b_end, rem_mask = 0, src_is_a = src_is_a}
 				job_count^ += 1
 				continue
@@ -1815,10 +1810,11 @@ _collect_u64_bucket_jobs :: proc(
 			sub_offs: [256]u32
 			sub_cnts: [256]u32
 			_run_u64_count_scatter_wave(p, b_start, b_end, cur_src, cur_dst, sub_shift, &sub_offs, &sub_cnts)
-			_collect_u64_bucket_jobs(p, &sub_offs, &sub_cnts, total_n, !src_is_a, sub_rem, depth + 1, jobs, job_count)
+			_collect_u64_bucket_jobs(p, &sub_offs, &sub_cnts, total_n, !src_is_a, sub_rem, depth + 1, jobs, job_count, reserved_siblings + rem_sib)
 			continue
 		}
 
+		if job_count^ >= len(jobs) { panic("_collect_u64_bucket_jobs: exceeded _MAX_SORT_BUCKET_JOBS") }
 		jobs[job_count^] = _Sort_Bucket_Job{start = b_start, end = b_end, rem_mask = rem_mask, src_is_a = src_is_a}
 		job_count^ += 1
 	}
@@ -1826,15 +1822,16 @@ _collect_u64_bucket_jobs :: proc(
 
 @(private="file")
 _collect_umbra_bucket_jobs :: proc(
-	p:           ^Morsel_Pipeline,
-	bucket_offs: ^[256]u32,
-	bucket_cnts: ^[256]u32,
-	total_n:     int,
-	src_is_a:    bool,
-	rem_shift:   u32,
-	depth:       int,
-	jobs:        ^[_MAX_SORT_BUCKET_JOBS]_Sort_Bucket_Job,
-	job_count:   ^int,
+	p:                 ^Morsel_Pipeline,
+	bucket_offs:       ^[256]u32,
+	bucket_cnts:       ^[256]u32,
+	total_n:           int,
+	src_is_a:          bool,
+	rem_shift:         u32,
+	depth:             int,
+	jobs:              ^[_MAX_SORT_BUCKET_JOBS]_Sort_Bucket_Job,
+	job_count:         ^int,
+	reserved_siblings := 0,
 ) {
 	skew_thresh := max(total_n / 2, SORT_PARALLEL_PARTITION_MIN)
 	for b in 0..<256 {
@@ -1842,13 +1839,16 @@ _collect_umbra_bucket_jobs :: proc(
 		if cnt == 0 { continue }
 		b_start := int(bucket_offs[b])
 		b_end   := b_start + cnt
+		rem_sib := 255 - b
 
-		if cnt > skew_thresh && rem_shift >= 8 && depth < 2 && p.num_workers > 1 && job_count^ + 256 < _MAX_SORT_BUCKET_JOBS {
+		if cnt > skew_thresh && rem_shift >= 8 && depth < 2 && p.num_workers > 1 &&
+		   job_count^ + 256 + reserved_siblings + rem_sib <= _MAX_SORT_BUCKET_JOBS {
 			cur_src := src_is_a ? p.sort_entries_a : p.sort_entries_b
 			cur_dst := src_is_a ? p.sort_entries_b : p.sort_entries_a
 			low_mask := rem_shift < 32 ? ((u32(1) << rem_shift) - 1) : max(u32)
 			sub_diff := _compute_diff_mask_u64_key(cur_src[b_start:b_end], low_mask)
 			if sub_diff == 0 {
+				if job_count^ >= len(jobs) { panic("_collect_umbra_bucket_jobs: exceeded _MAX_SORT_BUCKET_JOBS") }
 				jobs[job_count^] = _Sort_Bucket_Job{start = b_start, end = b_end, rem_mask = 0, src_is_a = src_is_a}
 				job_count^ += 1
 				continue
@@ -1864,11 +1864,12 @@ _collect_umbra_bucket_jobs :: proc(
 				sub_offs: [256]u32
 				sub_cnts: [256]u32
 				_run_u64_count_scatter_wave(p, b_start, b_end, cur_src, cur_dst, u32(next_shift), &sub_offs, &sub_cnts)
-				_collect_umbra_bucket_jobs(p, &sub_offs, &sub_cnts, total_n, !src_is_a, u32(next_shift), depth + 1, jobs, job_count)
+				_collect_umbra_bucket_jobs(p, &sub_offs, &sub_cnts, total_n, !src_is_a, u32(next_shift), depth + 1, jobs, job_count, reserved_siblings + rem_sib)
 				continue
 			}
 		}
 
+		if job_count^ >= len(jobs) { panic("_collect_umbra_bucket_jobs: exceeded _MAX_SORT_BUCKET_JOBS") }
 		jobs[job_count^] = _Sort_Bucket_Job{start = b_start, end = b_end, rem_mask = rem_shift, src_is_a = src_is_a}
 		job_count^ += 1
 	}
@@ -1939,6 +1940,7 @@ _collect_str_bucket_jobs :: proc(
 	depth:             int,
 	jobs:              ^[_MAX_SORT_BUCKET_JOBS]_Sort_Bucket_Job,
 	job_count:         ^int,
+	reserved_siblings := 0,
 ) {
 	skew_thresh := max(total_n / 2, SORT_PARALLEL_PARTITION_MIN)
 	for b in 0..<256 {
@@ -1946,8 +1948,10 @@ _collect_str_bucket_jobs :: proc(
 		if cnt == 0 { continue }
 		b_start := int(bucket_offs[b])
 		b_end   := b_start + cnt
+		rem_sib := 255 - b
 
-		if cnt > skew_thresh && prefix_bytes_done < 8 && depth < 2 && p.num_workers > 1 && job_count^ + 256 < _MAX_SORT_BUCKET_JOBS {
+		if cnt > skew_thresh && prefix_bytes_done < 8 && depth < 2 && p.num_workers > 1 &&
+		   job_count^ + 256 + reserved_siblings + rem_sib <= _MAX_SORT_BUCKET_JOBS {
 			cur_src := src_is_a ? p.str_entries_a : p.str_entries_b
 			cur_dst := src_is_a ? p.str_entries_b : p.str_entries_a
 			p0 := cur_src[b_start].prefix
@@ -1964,6 +1968,7 @@ _collect_str_bucket_jobs :: proc(
 				}
 			}
 			if next_shift < 0 {
+				if job_count^ >= len(jobs) { panic("_collect_str_bucket_jobs: exceeded _MAX_SORT_BUCKET_JOBS") }
 				jobs[job_count^] = _Sort_Bucket_Job{start = b_start, end = b_end, rem_mask = 8, src_is_a = src_is_a}
 				job_count^ += 1
 				continue
@@ -1972,10 +1977,11 @@ _collect_str_bucket_jobs :: proc(
 			sub_cnts: [256]u32
 			_run_str_byte_count_scatter_wave(p, b_start, b_end, cur_src, cur_dst, u32(next_shift), &sub_offs, &sub_cnts)
 			sub_done := u32(8 - next_shift / 8)
-			_collect_str_bucket_jobs(p, &sub_offs, &sub_cnts, total_n, !src_is_a, sub_done, depth + 1, jobs, job_count)
+			_collect_str_bucket_jobs(p, &sub_offs, &sub_cnts, total_n, !src_is_a, sub_done, depth + 1, jobs, job_count, reserved_siblings + rem_sib)
 			continue
 		}
 
+		if job_count^ >= len(jobs) { panic("_collect_str_bucket_jobs: exceeded _MAX_SORT_BUCKET_JOBS") }
 		jobs[job_count^] = _Sort_Bucket_Job{start = b_start, end = b_end, rem_mask = prefix_bytes_done, src_is_a = src_is_a}
 		job_count^ += 1
 	}
@@ -1990,7 +1996,7 @@ _dispatch_u64_bucket_jobs :: proc(
 	umbra_arr: ^oa.Umbra_Array,
 ) {
 	nw := p.num_workers
-	worker_loads: [64]int
+	worker_loads: [256]int
 	acc := _Sort_Done_Acc{}
 	sent := 0
 	kind: Sort_Task_Kind = is_umbra ? .Sort_Bucket_Umbra : .Sort_Bucket_U64
@@ -2036,7 +2042,7 @@ _dispatch_str_bucket_jobs :: proc(
 	out_i64: []i64,
 ) {
 	nw := p.num_workers
-	worker_loads: [64]int
+	worker_loads: [256]int
 	acc := _Sort_Done_Acc{}
 	sent := 0
 

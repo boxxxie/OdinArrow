@@ -1,8 +1,10 @@
 package skadi
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:os"
 import "core:sync"
+import sysinfo "core:sys/info"
 
 // Hardware topology and CPU cache parameters discovered at runtime from Linux
 // sysfs (or overridden deterministically for tests) so morsel sizing and worker
@@ -21,7 +23,7 @@ Hardware_Config :: struct {
 @(private="file") g_hw_mutex:    sync.Mutex
 @(private="file") g_hw_detected: Hardware_Config
 @(private="file") g_hw_override: Hardware_Config
-@(private="file") g_hw_has_ovr:  bool
+@(private="file") g_hw_has_ovr:  u32
 
 // Parse a sysfs cache size string (e.g., "32K", "512K", "16384K", "6M", "32768") into bytes.
 parse_cache_size_bytes :: proc "contextless" (raw: string) -> (bytes: int, ok: bool) {
@@ -135,7 +137,7 @@ _detect_hardware_config :: proc() -> Hardware_Config {
 
 	// Deduplicate (physical_package_id, core_id) across logical CPUs so SMT siblings
 	// and multi-socket topologies count true physical cores accurately.
-	seen_pairs: [256][2]i32
+	seen_pairs: [1024][2]i32
 	n_seen := 0
 	max_scan := min(max(logical * 2, 32), len(seen_pairs))
 	for cpu in 0..<max_scan {
@@ -162,7 +164,12 @@ _detect_hardware_config :: proc() -> Hardware_Config {
 		}
 	}
 
-	physical := clamp(n_seen, 1, logical) if n_seen > 0 else logical
+	physical := logical
+	if n_seen > 0 {
+		physical = clamp(n_seen, 1, logical)
+	} else if p_cnt, l_cnt, cores_ok := sysinfo.cpu_core_count(); cores_ok && p_cnt > 0 {
+		physical = clamp(p_cnt, 1, max(l_cnt, logical))
+	}
 	if l1d <= 0 { l1d = 32 * 1024 }
 	if l2  <= 0 { l2  = 256 * 1024 }
 	if l3  <= 0 { l3  = 6 * 1024 * 1024 }
@@ -186,9 +193,14 @@ _init_hw_once :: proc() {
 // Return the active hardware topology & cache configuration (cached after first call).
 hardware_config_get :: proc() -> Hardware_Config {
 	sync.once_do(&g_hw_once, _init_hw_once)
+	if intrinsics.atomic_load_explicit(&g_hw_has_ovr, .Acquire) == 0 {
+		return g_hw_detected
+	}
 	sync.mutex_lock(&g_hw_mutex)
 	defer sync.mutex_unlock(&g_hw_mutex)
-	if g_hw_has_ovr { return g_hw_override }
+	if intrinsics.atomic_load_explicit(&g_hw_has_ovr, .Relaxed) != 0 {
+		return g_hw_override
+	}
 	return g_hw_detected
 }
 
@@ -197,7 +209,7 @@ hardware_config_set :: proc(cfg: Hardware_Config) {
 	sync.once_do(&g_hw_once, _init_hw_once)
 	sync.mutex_lock(&g_hw_mutex)
 	g_hw_override = cfg
-	g_hw_has_ovr  = true
+	intrinsics.atomic_store_explicit(&g_hw_has_ovr, 1, .Release)
 	sync.mutex_unlock(&g_hw_mutex)
 }
 
@@ -205,7 +217,7 @@ hardware_config_set :: proc(cfg: Hardware_Config) {
 hardware_config_reset :: proc() {
 	sync.once_do(&g_hw_once, _init_hw_once)
 	sync.mutex_lock(&g_hw_mutex)
-	g_hw_has_ovr  = false
+	intrinsics.atomic_store_explicit(&g_hw_has_ovr, 0, .Release)
 	g_hw_override = {}
 	sync.mutex_unlock(&g_hw_mutex)
 }

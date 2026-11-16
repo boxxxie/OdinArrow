@@ -415,6 +415,18 @@ scheduler_wait_idle :: proc(s: ^Scheduler = nil) {
 
 wait_idle :: scheduler_wait_idle
 
+// Toggle adaptive worker Futex parking on or off and return the previous state.
+// When disabling parking, unconditionally wakes any sleeping or parking workers.
+scheduler_set_parking :: proc(s: ^Scheduler, enable: bool) -> (prev: bool) {
+	if s == nil { return false }
+	prev = intrinsics.atomic_exchange_explicit(&s.enable_parking, enable, .Seq_Cst)
+	if !enable && prev {
+		intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Seq_Cst)
+		sync.futex_broadcast(&s.wake_futex)
+	}
+	return prev
+}
+
 // Wait until `pending_tokens` drops to 0 (useful for autonomous Actor-to-Actor graphs).
 scheduler_wait_tokens :: proc(s: ^Scheduler = nil) {
 	sched := s if s != nil else current_scheduler()
