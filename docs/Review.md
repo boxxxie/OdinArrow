@@ -1,46 +1,46 @@
-# Skadi vs Apache Arrow — Capability Gap Review
+# Skadi — Apache Arrow Capability Gap Review
 
-> Generated: 2026-06-12  
-> Reference: [Apache Arrow](https://arrow.apache.org/) (format spec, C++ / PyArrow libraries, v24.x)  
-> Subject: **Skadi** (`src/`, package `odinarrow`) as it exists in this repository
+> Updated: 2026-11-16  
+> Reference: [Apache Arrow](https://arrow.apache.org/) (format spec, C++ / PyArrow libraries, v25.0.1)  
+> Subject: **Skadi** (`skadi/` `package skadi` and `skadi/pipeline/` `package pipeline`) as it exists in this repository
 
-This document compares Skadi against the **Apache Arrow project** as a whole — the columnar format specification, the reference C++ libraries, and the ecosystem built around them (PyArrow, Parquet integration, Flight, Dataset, etc.). It is not a performance review; see [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for that.
+This document compares Skadi against the **Apache Arrow project** as a whole — the columnar format specification, the reference C++ libraries, and the ecosystem built around them (PyArrow, Parquet integration, Flight, Dataset, etc.). It is not a performance review; see [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) for that.
 
 ### Status legend
 
 | Symbol | Meaning |
 |---|---|
-| ✅ | Implemented in Skadi core library (`src/`) |
-| 🔶 | Partial / subset / application code only (`programs/`, FFI) |
+| ✅ | Implemented in Skadi core/pipeline (`skadi/`, `skadi/pipeline/`) |
+| 🔶 | Partial / companion encoding / CLI example (`examples/`, FFI) |
 | ❌ | Not implemented |
 
 ---
 
 ## 1. Executive summary
 
-Skadi is a **focused, high-quality implementation of Arrow’s core in-memory columnar model** for flat (non-nested) data: aligned buffers, validity bitmaps, primitive and variable-length types, builders, schema/record-batch/table abstractions, a small set of compute kernels (with SIMD and threading), and Arrow IPC file + stream I/O with memory-mapped reads.
+Skadi is a **focused, high-performance implementation of Arrow's core in-memory columnar model** for flat (non-nested) data: 64-byte aligned buffers, packed validity bitmaps, all 16 flat `DataType` variants (`Null_Type`, `Bool_Type`, `Int8..64`, `UInt8..64`, `Float32/64`, `String_Type`/`Binary_Type` `i32`, `Large_String_Type`/`Large_Binary_Type` `i64`), builders, schema/record-batch/table abstractions, target-scoped AVX2/SIMD + thread-pooled + Sleipnir actor compute/selection/fusion kernels, companion compressed encodings (`Umbra_Array`, `RLE_Array(T)`, `Dict_Array(T)` / `Str_Dict_Array`), and Arrow IPC file + stream I/O with vectored `writev` writes and memory-mapped zero-copy reads.
 
 It **does not** replicate the breadth of the Apache Arrow **software ecosystem**. Measured against PyArrow / Arrow C++, the largest gaps are:
 
-1. **Data types** — no nested, temporal, decimal, dictionary, union, map, or run-end-encoded types  
-2. **Compute** — ~15 hand-written kernels vs **100+ registered functions**, no expression engine, no grouped aggregations or joins  
-3. **I/O** — no library-level CSV/JSON/Parquet; experimental Parquet lives in `programs/` only  
-4. **Infrastructure** — no Dataset API, filesystem abstraction, Flight/ADBC, Acero query engine, Gandiva, or GPU support  
-5. **Interop** — IPC-compatible with PyArrow, but no formal C Data Interface export/import layer
+1. **Data types** — no nested (`List`, `Struct`, `Union`, `Map`), temporal (`Date`, `Time`, `Timestamp`), `Float16`, or `Decimal` types; dictionary and RLE exist as companion types (`skadi/dict.odin`, `skadi/rle.odin`) rather than Arrow IPC union variants
+2. **Compute** — ~35+ specialized compute, comparison, selection, fusion, encoding, and actor pipeline procs vs **100+ dynamically registered Arrow functions**, no general multi-join/window query planner
+3. **I/O** — no library-level CSV/JSON/Parquet; uncompressed subset Parquet/CSV CLI tools live in `examples/` (with Arrow C++ FFI baselines in `benchmarks/`)
+4. **Infrastructure** — no Dataset API, filesystem abstraction, Flight/ADBC, Acero query engine, Gandiva, or GPU support
+5. **Interop** — wire-compatible IPC and binary-compatible raw buffer layout (`tests_cpp/`) with PyArrow and Arrow C++, but no formal `ArrowSchema`/`ArrowArray` C Data Interface export/import procs
 
-Where Skadi **does** compete (and often wins on benchmarks) is the **narrow core**: building flat columns, scanning them, and IPC round-trips — the foundation Arrow was designed for, not the full analytics platform built on top.
+Where Skadi **does** compete (and beats Arrow C++ `25.0.1` across all 26 canonical 1v1 benchmarks) is the **narrow analytical core**: building flat/encoded columns, fused & selection-vector scans, sorting, and IPC round-trips.
 
 ---
 
 ## 2. Columnar format & type system
 
-Apache Arrow defines a rich logical and physical type system ([Columnar format spec](https://arrow.apache.org/docs/format/Columnar.html)). Skadi implements a **flat subset**.
+Apache Arrow defines a rich logical and physical type system ([Columnar format spec](https://arrow.apache.org/docs/format/Columnar.html)). Skadi implements a **flat subset** plus companion cache-optimized encodings.
 
 ### 2.1 Logical / physical types
 
 | Arrow type | Skadi | Notes |
 |---|---|---|
-| Null | ✅ | |
+| Null | ✅ | `Null_Type` in `Array`, `compute_count`, IPC schema/batch |
 | Boolean | ✅ | Bit-packed values buffer |
 | Int8 / Int16 / Int32 / Int64 | ✅ | |
 | UInt8 / UInt16 / UInt32 / UInt64 | ✅ | |
@@ -51,8 +51,8 @@ Apache Arrow defines a rich logical and physical type system ([Columnar format s
 | Time32 / Time64 | ❌ | |
 | Timestamp (with timezone) | ❌ | |
 | Duration / Interval | ❌ | |
-| Binary / String (Utf8) | ✅ | i32 offsets |
-| LargeBinary / LargeString | ✅ | i64 offsets; builders + IPC |
+| Binary / String (Utf8) | ✅ | `i32` offsets |
+| LargeBinary / LargeString | ✅ | `i64` offsets; builders + IPC |
 | FixedSizeBinary | ❌ | |
 | List / LargeList | ❌ | `Array.children` field exists but unused |
 | FixedSizeList | ❌ | |
@@ -60,8 +60,9 @@ Apache Arrow defines a rich logical and physical type system ([Columnar format s
 | Struct | ❌ | |
 | Union (sparse / dense) | ❌ | |
 | Map | ❌ | |
-| Dictionary (encoded) | ❌ | Parquet reader handles dict *pages*; no Arrow dictionary arrays |
-| RunEndEncoded | ❌ | Arrow 12+ layout |
+| Dictionary (encoded) | 🔶 | `Dict_Array(T)` & `Str_Dict_Array` (`skadi/dict.odin`) + Parquet dict pages; not in Arrow IPC |
+| RunEndEncoded | 🔶 | `RLE_Array(T)` (`skadi/rle.odin`) with run-level validity; not in Arrow IPC |
+| Umbra / German Strings (16-byte inline/prefix) | 🔶 | `Umbra_Array` (`skadi/umbra.odin`); standalone fast-compare layout |
 | Extension types | ❌ | User-defined logical types with storage type + metadata |
 
 ### 2.2 Layout & invariants
@@ -72,7 +73,7 @@ Apache Arrow defines a rich logical and physical type system ([Columnar format s
 | Validity bitmaps (optional when no nulls) | ✅ | ✅ |
 | Zero-copy slice (offset + length) | ✅ | ✅ |
 | Lazy / cached null count | ✅ | ✅ |
-| Variadic buffer counts (nested / REE) | ❌ | ✅ |
+| Variadic buffer counts (nested) | ❌ | ✅ |
 | Endianness conversion | ❌ (LE assumed) | ✅ |
 | Buffer compression in-memory | ❌ | 🔶 (optional in some paths) |
 
@@ -82,16 +83,17 @@ Apache Arrow defines a rich logical and physical type system ([Columnar format s
 
 | Capability | Skadi | Apache Arrow (C++) |
 |---|---|---|
-| Explicit aligned allocation (`buffer_make`) | ✅ | ✅ (`arrow::Buffer`) |
+| Explicit aligned allocation (`buffer_make` / `buffer_make_uninit`) | ✅ | ✅ (`arrow::Buffer`) |
 | Zero-copy buffer views (`buffer_slice`) | ✅ | ✅ |
-| Reusable allocation pool | ✅ `Buffer_Pool` | ✅ `arrow::MemoryPool` (default, jemalloc, etc.) |
-| Reference-counted shared buffers | ❌ | ✅ `shared_ptr<Buffer>` |
-| Memory accounting / statistics | ❌ | ✅ pool stats, debugger hooks |
-| Memory-mapped file backing | ✅ IPC read (Unix `mmap`) | ✅ |
+| Reusable allocation pool | ✅ `Buffer_Pool` (power-of-two/256 KB buckets, 25% slack reuse, 128 MB LRU cap) | ✅ `arrow::MemoryPool` |
+| Reference-counted shared buffers | 🔶 `Record_Batch._ipc_backing` atomic refcounting | ✅ `shared_ptr<Buffer>` |
+| Memory accounting / statistics | 🔶 `Buffer_Pool` `hits`/`misses`/`free_large_bytes`, `mem.Tracking_Allocator` | ✅ pool stats, debugger hooks |
+| Memory-mapped file backing | ✅ IPC read (Unix `mmap` + copy fallback) | ✅ |
+| Vectored scatter-gather IPC writes (`writev`) | ✅ `_IPC_Vectored_Writer` | ✅ |
 | GPU / device memory | ❌ | ✅ (CUDA, etc.) |
-| Thread-safe pool | ❌ (documented single-thread) | ✅ |
+| Thread-safe pool | ❌ (single-thread per builder/thread; documented) | ✅ |
 
-Skadi’s ownership model is **explicit and manual** (track `allocator`, never double-free sliced arrays). Arrow C++ uses reference counting for shared buffer lifetime across tables, IPC, and foreign runtimes.
+Skadi's ownership model is **explicit and deterministic** (`allocator` per buffer, non-owning slices with `allocator = {}`, and refcounted `_IPC_Backing` for zero-copy `mmap` batches). Arrow C++ uses reference counting everywhere via `shared_ptr`.
 
 ---
 
@@ -100,22 +102,21 @@ Skadi’s ownership model is **explicit and manual** (track `allocator`, never d
 | Structure | Skadi | Apache Arrow |
 |---|---|---|
 | `Array` | ✅ | ✅ `arrow::Array` |
-| `ChunkedArray` | 🔶 basic (`Table` only) | ✅ full API, compute on chunks |
-| `RecordBatch` | ✅ | ✅ |
-| `Table` | 🔶 stacks batches, borrows data | ✅ owns schema, column chunks, metadata |
+| `Selection` + L1d `u16` morsels | ✅ (`skadi/selection.odin`, `skadi/compare.odin`) | 🔶 internal ExecBatch selection |
+| `Chunked_Array` | 🔶 (`skadi/table.odin`: `get` / `is_null`) | ✅ full API, compute on chunks |
+| `Record_Batch` | ✅ | ✅ |
+| `Table` | 🔶 stacks batches with schema validation, borrows chunks | ✅ owns schema, column chunks, metadata |
 | `Schema` / `Field` | ✅ | ✅ + field metadata, dictionaries |
 | `Scalar` | ❌ | ✅ typed single values for compute |
 | `Datum` (Array \| Scalar \| Chunked \| …) | ❌ | ✅ unified compute input |
-| `Tensor` | ❌ | ✅ |
-| `SparseTensor` | ❌ | ✅ |
+| `Tensor` / `SparseTensor` | ❌ | ✅ |
 
 **Skadi gaps in tabular API:**
 
 - No field or schema **custom metadata** (key/value)
-- No **dictionary** on fields
-- `table_from_record_batches` checks column count only, not type compatibility
-- No `Table` → `RecordBatch` iterator, slice, filter, or join
-- `Chunked_Array` has get/is_null only — no slice, concat, or compute
+- No **dictionary** on `Field` (dictionaries live in `Str_Dict_Array` / `Dict_Array(T)`)
+- No `Table` → `Record_Batch` iterator, slice, filter, or join
+- `Chunked_Array` has `get` / `is_null` only — no slice, concat, or compute
 
 ---
 
@@ -123,127 +124,103 @@ Skadi’s ownership model is **explicit and manual** (track `allocator`, never d
 
 | Builder | Skadi | Apache Arrow |
 |---|---|---|
-| Primitive (all int/float/bool) | ✅ zero-copy `finish()` | ✅ `NumericBuilder`, etc. |
-| String / Binary | ✅ raw-buffer builder | ✅ |
-| Large String / Binary | ✅ | ✅ |
-| Null builder | ❌ | ✅ |
-| FixedSizeBinary | ❌ | ✅ |
+| Primitive (`bool`, all int/float widths) | ✅ zero-copy `finish()`, lazy bitmap | ✅ `NumericBuilder`, etc. |
+| String / Binary (`i32` offsets) | ✅ raw-buffer builder + `reserve_data` | ✅ |
+| Large String / Binary (`i64` offsets) | ✅ raw-buffer builder + `reserve_data` | ✅ |
+| Null array | 🔶 constructed via `Array{type = Null_Type{}, ...}`; no dedicated builder struct | ✅ `NullBuilder` |
+| Umbra strings | ✅ `Umbra_Builder` (`skadi/umbra.odin`) | ❌ |
+| RunEndEncoded | 🔶 `RLE_Builder(T)` / `rle_encode` | ✅ |
+| Dictionary | 🔶 `dict_encode` / `str_dict_encode` | ✅ |
+| FixedSizeBinary / Decimal / Temporal | ❌ | ✅ |
 | List / Struct / Union | ❌ | ✅ nested builders |
-| Dictionary | ❌ | ✅ |
-| Decimal | ❌ | ✅ |
-| Temporal | ❌ | ✅ |
-| Typed `ArrayBuilder` hierarchy | ❌ (generic `Primitive_Builder($T)`) | ✅ per-type classes |
+| Typed `ArrayBuilder` hierarchy | ❌ (generic `Primitive_Builder($T)` & `_Var_Builder`) | ✅ per-type classes |
 | `Buffer_Pool` integration | ✅ | ✅ default pool |
-
-Skadi builders are **fast for flat data** (see benchmarks) but cover only the types in `types.odin`.
 
 ---
 
 ## 6. Compute engine
 
-Apache Arrow Compute ([C++ docs](https://arrow.apache.org/docs/cpp/compute.html)) exposes a **function registry** with 100+ kernels invokable via `CallFunction(name, args)`, options structs, implicit casts, and support for Scalars, Arrays, ChunkedArrays, RecordBatches, and Tables.
+Apache Arrow Compute ([C++ docs](https://arrow.apache.org/docs/cpp/compute.html)) exposes a **function registry** with 100+ kernels invokable via `CallFunction(name, args)`. Skadi provides direct, monomorphised Odin procs with zero dynamic dispatch overhead.
 
 ### 6.1 What Skadi implements
 
-| Kernel | Serial | SIMD | Parallel |
-|---|---|---|---|
-| `sum` | ✅ | ✅ i32/f64 | ✅ |
-| `min` / `max` / `min_max` | ✅ | ✅ i32 | ✅ |
-| `mean` | ✅ | via sum | ✅ |
-| `count` | ✅ | — | ❌ |
-| `filter` | ✅ | — | ✅ (not strings in parallel) |
-| `take` | ✅ | — | ❌ |
-| `cast` (numeric) | ✅ | — | ❌ |
-| `add` / `sub` / `mul` / `div` | ✅ | — | ❌ |
-| `sort_indices` (stable, nulls-last) | ✅ | — | ❌ |
+| Kernel / Family | Serial | SIMD | Parallel (`thread_pool`) | Sleipnir Actor (`skadi/pipeline`) |
+|---|---|---|---|---|
+| `compute_sum` | ✅ | ✅ `f32`, `f64`, `i8..32`, `u8..32` | ✅ | — |
+| `compute_min` / `compute_max` / `compute_min_max` | ✅ | ✅ all numeric widths | ✅ | — |
+| `compute_mean` | ✅ | via sum | ✅ | — |
+| `compute_count` | ✅ (incl. `Null_Type`) | — | ❌ | — |
+| `compute_filter` | ✅ (`tzcnt` + 256-entry LUT) | — | ✅ (fixed + `String`/`Binary`) | — |
+| `compute_take` | ✅ (prefetched) | — | ✅ (prefetched) | — |
+| `compute_cast` (numeric) | ✅ | — | ❌ | — |
+| `compute_arithmetic` (`add`/`sub`/`mul`/`div`) | ✅ | — | ❌ | — |
+| `compute_compare*` (`==`, `!=`, `<`, `<=`, `>`, `>=`) | ✅ (comptime `$OP`) | auto-vec | — | — |
+| `Selection` (`compute_select*`, `selection_refine*`, `selection_take`) | ✅ (`tzcnt`/LUT + `u16` morsels) | — | ✅ (`compute_sel_2pred_sum_parallel`) | ✅ (`pipeline_sel_2pred_sum_f64`) |
+| Fused `*_where` (`compute_sum_where`, `compute_agg_where_compare*`) | ✅ | — | — | ✅ (`pipeline_agg_where_f64`) |
+| `compute_sort_indices` (stable, nulls-last) | ✅ (LSD radix + prefix radix) | — | — | ✅ (`pipeline_sort_indices`) |
+| `RLE_Array(T)` (`rle_sum`, `rle_min_max`, `rle_encode`/`decode`) | ✅ (`O(runs)`) | — | — | — |
+| `Dict_Array(T)` / `Str_Dict_Array` (`value_counts`, `group_sum`, `min_max`, `sum`) | ✅ (`O(n_dict)` min/max) | — | — | ✅ (`pipeline_dict_*`) |
+| `Umbra_Array` (`umbra_compare`, `umbra_count_eq`, `umbra_sort_indices`) | ✅ (prefix radix + merge) | — | — | ✅ (`pipeline_umbra_sort_indices`) |
 
-**~15 functions**, hard-coded procs with `(T, Error)` returns — no registry, no options, no scalar/array broadcasting.
+### 6.2 Major compute categories compared with Arrow
 
-### 6.2 Major compute categories missing in Skadi
-
-#### Aggregations (scalar reduce)
+#### Aggregations (scalar & grouped reduce)
 
 | Arrow function (examples) | Skadi |
 |---|---|
+| `sum`, `min`, `max`, `min_max`, `mean`, `count` | ✅ |
 | `all`, `any` | ❌ |
 | `count_distinct`, `count_all` | ❌ |
-| `first`, `last`, `first_last` | ❌ |
-| `product` | ❌ |
+| `first`, `last`, `first_last`, `product` | ❌ |
 | `stddev`, `variance`, `skew`, `kurtosis` | ❌ |
-| `quantile`, `tdigest`, `approximate_median` | ❌ |
-| `mode`, `pivot_wider` | ❌ |
-| Grouped / hash aggregations | ❌ |
+| `quantile`, `tdigest`, `approximate_median`, `mode` | ❌ |
+| Grouped / hash aggregations | 🔶 `str_dict_group_sum`, `dict_group_sum`, `pipeline_dict_group_sum` (single dictionary key) |
 
 #### Element-wise & logical
 
 | Category | Examples | Skadi |
 |---|---|---|
-| Comparisons | `equal`, `less`, `not_equal`, … | ❌ |
-| Boolean logic | `and`, `or`, `not`, `xor`, Kleene | ❌ |
-| Null predicates | `is_null`, `is_valid`, `fill_null` | ❌ (manual via bitmap) |
-| Bitwise | `bit_wise_and`, `shift_left`, … | ❌ |
-| Math | `sin`, `cos`, `log`, `power`, `abs`, … | ❌ |
-| Rounding | `round`, `floor`, `ceil` | ❌ |
+| Comparisons | `equal`, `less`, `not_equal`, `less_equal`, `greater`, `greater_equal` | ✅ (`compute_compare`, `compute_compare_i64`, `compute_compare_u64`) |
+| Boolean logic | `and`, `or`, `not`, `xor`, Kleene | ❌ (chained predicates via `selection_refine_compare*`) |
+| Null predicates | `is_null`, `is_valid`, `fill_null` | ❌ (per-element via `array_is_null` / `array_is_valid`) |
+| Bitwise / Math / Rounding | `bit_wise_and`, `sin`, `log`, `round`, `floor`, `ceil` | ❌ |
 
 #### Selection & ordering
 
 | Arrow function | Skadi |
 |---|---|
-| `sort_indices` | ✅ |
-| `array_sort` (materialised sorted array) | ❌ (compose via take) |
-| `partition_nth`, `select_k_unstable` | ❌ |
-| `indices_nonzero` | ❌ |
+| `sort_indices` | ✅ (`compute_sort_indices`, `pipeline_sort_indices`, `umbra_sort_indices`) |
+| `array_sort` | ❌ (compose via `compute_take`) |
+| `partition_nth`, `select_k_unstable`, `indices_nonzero` | ❌ |
 
 #### String & binary
 
 | Arrow function | Skadi |
 |---|---|
-| `utf8_length` | ❌ (hand loop in benchmarks only) |
-| `binary_length` | ❌ |
-| `utf8_trim`, `replace`, `match`, `split`, `join` | ❌ |
-| `binary_concat`, `binary_slice` | ❌ |
+| `utf8_length` (total length scan) | 🔶 `string_view_sum_lengths` (`skadi/var_length.odin`) |
+| `binary_length`, `utf8_trim`, `replace`, `match`, `split`, `join`, `binary_concat` | ❌ |
 
-#### Temporal
+#### Temporal, Hash/Set, Structural & Query Engine
 
-All temporal extract, cast, and arithmetic functions | ❌ (no temporal types)
-
-#### Hash & set
-
-| Arrow function | Skadi |
+| Category / Function | Skadi |
 |---|---|
-| `hash`, `hash_aggregate` | ❌ |
-| `unique`, `value_counts`, `is_in` | ❌ |
-| `filter` with inverted mask | manual |
-
-#### Structural / nested
-
-| Arrow function | Skadi |
-|---|---|
-| `make_struct`, `struct_field` | ❌ |
-| `list_flatten`, `list_parent_indices` | ❌ |
-| `run_end_decode`, `run_end_encode` | ❌ |
-
-#### Joins, windows, and query engine
-
-| Component | Skadi |
-|---|---|
-| Hash join / asof join | ❌ |
-| Window functions (rank, lead/lag) | ❌ |
-| **Acero** declarative exec plans | ❌ |
-| **Substrait** integration | ❌ |
+| Temporal extract, cast, arithmetic | ❌ (no temporal types) |
+| `value_counts` | 🔶 `dict_value_counts`, `str_dict_value_counts`, `pipeline_dict_value_counts` |
+| `unique`, `is_in`, `hash` | ❌ |
+| `run_end_encode`, `run_end_decode` | ✅ (`rle_encode`, `rle_decode` in `skadi/rle.odin`) |
+| `make_struct`, `struct_field`, `list_flatten` | ❌ |
+| Hash join / asof join / Window functions / Acero / Gandiva / GPU | ❌ |
 
 #### Compute infrastructure
 
 | Feature | Skadi | Apache Arrow |
 |---|---|---|
 | Function registry + `CallFunction` | ❌ | ✅ |
-| Kernel dispatch by exact type | ✅ manual switch | ✅ auto |
-| Implicit numeric promotion | ❌ | ✅ |
+| Kernel dispatch by exact type | ✅ `switch` + comptime generics | ✅ auto |
+| Implicit numeric promotion / `Scalar` broadcasting | ❌ | ✅ |
 | Options (`ScalarAggregateOptions`, …) | ❌ | ✅ |
-| Compute on `ChunkedArray` | ❌ | ✅ |
-| Compute on `RecordBatch` / `Table` | ❌ | ✅ |
-| User-defined functions (UDF) | ❌ | ✅ |
-| **Gandiva** (LLVM JIT expressions) | ❌ | ✅ (C++) |
+| Compute on `ChunkedArray` / `RecordBatch` / `Table` | ❌ (`pipeline_record_batch_stream_sum` only) | ✅ |
+| **Gandiva** (LLVM JIT expressions) | ❌ (comptime Odin monomorphisation for `fusion.odin`) | ✅ (C++) |
 
 ---
 
@@ -254,174 +231,108 @@ All temporal extract, cast, and arithmetic functions | ❌ (no temporal types)
 | IPC **file** format (Feather v2) | ✅ read + write | ✅ |
 | IPC **stream** format | ✅ read + write | ✅ |
 | Encapsulated message framing | ✅ | ✅ |
-| Self-contained FlatBuffers encoder | ✅ (no FlatBuffers dep) | ✅ |
-| Zero-copy read (mmap) | ✅ Unix; fallback read | ✅ |
-| Zero-copy read into `RecordBatch._owned_backing` | ✅ | ✅ |
-| Supported IPC types (flat) | ✅ primitives + utf8/binary + large variants | ✅ |
-| Nested types in IPC | ❌ | ✅ |
-| Dictionary batches / delta dict | ❌ (stream reader stops on unknown) | ✅ |
-| IPC body **compression** (LZ4, ZSTD) | ❌ | ✅ |
-| Custom schema / field metadata | ❌ | ✅ |
-| Extension type metadata | ❌ | ✅ |
-| Alignment / continuation tokens | ✅ | ✅ |
-| Random batch access (file footer index) | ✅ | ✅ |
-| Tensor IPC | ❌ | ✅ |
-| Sparse tensor IPC | ❌ | ✅ |
-| C **stream** interface (`ArrowArrayStream`) | ❌ | ✅ |
-| C **device** interface (CUDA) | ❌ | ✅ |
+| Self-contained FlatBuffers encoder/decoder | ✅ (bounds- & overflow-hardened) | ✅ |
+| Vectored `writev` zero-copy writes | ✅ (Darwin `max(i32)` chunking + overwrite-safe truncate) | ✅ |
+| Zero-copy read (`mmap`) + copy fallback | ✅ Unix `mmap` (`use_mmap=true`), heap copy (`use_mmap=false`) | ✅ |
+| Offset & metadata validation (`validate=true`) | ✅ | ✅ |
+| Zero-copy refcounted `Record_Batch._ipc_backing` | ✅ | ✅ |
+| Supported IPC types (flat) | ✅ all 16 flat types incl. `Null_Type` and `Large_*` | ✅ |
+| Nested types / Dictionary batches / IPC body compression (LZ4, ZSTD) | ❌ | ✅ |
+| Custom schema / field metadata & extension metadata | ❌ | ✅ |
+| Tensor / SparseTensor IPC & C Stream / Device interfaces | ❌ | ✅ |
 
-**Interop status:** Files produced by Skadi for supported flat types are readable by PyArrow and Arrow C++, and vice versa (verified in tests and README). Unsupported IPC features (dictionaries, nested columns, compression) will fail or be skipped.
+**Interop status:** Files and streams produced by Skadi for supported flat types are readable by PyArrow and Arrow C++, and vice versa (verified in `tests/`, `specs/`, `tests_cpp/`, and GitHub Actions CI).
 
 ---
 
 ## 8. File format I/O (beyond IPC)
 
-Apache Arrow libraries ship readers/writers and integration for many on-disk formats. Skadi separates **library** from **example programs**.
+Skadi separates **library (`skadi/`)** from **CLI examples (`examples/`)** and **FFI comparison runners (`benchmarks/`)**.
 
-| Format | Skadi library | Skadi `programs/` | Apache Arrow |
+| Format | Skadi library | Skadi `examples/` | Apache Arrow |
 |---|---|---|---|
-| Arrow IPC / Feather | ✅ | — | ✅ |
-| **Parquet** read | ❌ | 🔶 native subset (`parquet_to_csv_odin`) | ✅ full |
-| **Parquet** write | ❌ | 🔶 native subset (`csv_to_parquet_odin`) | ✅ full |
-| Parquet via FFI | — | 🔶 Arrow C++ shim | ✅ |
-| **CSV** read/write | ❌ | 🔶 streaming CSV in converter | ✅ `arrow::csv` |
-| **JSON** | ❌ | ❌ | ✅ |
-| **ORC** | ❌ | ❌ | ✅ (Java primary; C++ limited) |
-| **Avro** | ❌ | ❌ | 🔶 |
-| **NDJSON** | ❌ | ❌ | 🔶 (via parsers) |
+| Arrow IPC / Feather | ✅ | `examples/quickstart` | ✅ |
+| **Parquet** read | ❌ | 🔶 native subset (`examples/parquet_to_csv`) | ✅ full |
+| **Parquet** write | ❌ | 🔶 native subset (`examples/csv_to_parquet`) | ✅ full |
+| Parquet via FFI | — | 🔶 `benchmarks/*_ffi` (Arrow C++ shim) | ✅ |
+| **CSV** read/write | ❌ | 🔶 streaming RFC 4180 CSV parser/writer | ✅ `arrow::csv` |
+| **JSON / ORC / Avro / NDJSON** | ❌ | ❌ | ✅ / 🔶 |
 
-### 8.1 Native Odin Parquet subset (programs only)
-
-What the experimental native reader/writer supports vs full Parquet:
+### 8.1 Native Odin Parquet subset (`examples/` only)
 
 | Parquet feature | Native Odin | Apache Arrow Parquet |
 |---|---|---|
 | PLAIN encoding | ✅ | ✅ |
-| Dictionary pages | 🔶 read only | ✅ |
-| RLE, DELTA, BIT_PACKED encodings | ❌ | ✅ |
-| Page compression (SNAPPY, ZSTD, GZIP, …) | ❌ | ✅ |
-| Statistics / column indexes | ❌ | ✅ |
-| Bloom filters | ❌ | ✅ (Arrow 24+) |
-| Nested / repeated fields | ❌ | ✅ |
-| All physical types | 🔶 INT32 + BYTE_ARRAY write; broader read | ✅ |
-| Schema evolution | ❌ | ✅ |
-| Encryption | ❌ | ✅ |
-| Multi-threaded decode | ❌ | ✅ |
+| Dictionary pages | 🔶 read only (multi-page) | ✅ |
+| RLE / bit-packed definition & dictionary levels | 🔶 read only | ✅ |
+| Page compression (SNAPPY, ZSTD, GZIP, …) | ❌ (rejected cleanly) | ✅ |
+| Statistics / column indexes / Bloom filters | ❌ | ✅ |
+| Nested / repeated fields / Schema evolution / Encryption | ❌ | ✅ |
+| Physical types | 🔶 `BYTE_ARRAY` + `INT32` write; `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY` read | ✅ |
 
 ---
 
-## 9. Dataset & scanning layer
-
-PyArrow’s **`Dataset` API** and Arrow C++ **`arrow::dataset`** provide partitioned, multi-file analytics:
-
-| Capability | Skadi | Apache Arrow |
-|---|---|---|
-| `Dataset` over Parquet/IPC/CSV | ❌ | ✅ |
-| Hive / directory partitioning | ❌ | ✅ |
-| File discovery & fragment scan | ❌ | ✅ |
-| Projection / filter pushdown | ❌ | ✅ |
-| `Scanner` → stream of RecordBatches | ❌ | ✅ |
-| Write `Dataset` (partitioned output) | ❌ | ✅ |
-| Acero integration (exec plans over datasets) | ❌ | ✅ |
-
-Skadi has **`Table` / `Chunked_Array`** as a minimal in-memory analogue but no filesystem-aware scanning.
-
----
-
-## 10. Filesystem & remote I/O
-
-| Capability | Skadi | Apache Arrow |
-|---|---|---|
-| Local file read/write | ✅ (`core:os`) | ✅ `arrow::fs::LocalFileSystem` |
-| Unified `FileSystem` abstraction | ❌ | ✅ |
-| S3 / GCS / Azure / HDFS | ❌ | ✅ |
-| Memory filesystem (testing) | ❌ | ✅ |
-| IO interface for IPC/Parquet | direct paths only | ✅ abstract streams |
-
----
-
-## 11. Network protocols & database connectivity
-
-| Component | Purpose | Skadi |
-|---|---|---|
-| **Arrow Flight** | gRPC RPC for streaming Arrow batches | ❌ |
-| **Flight SQL** | JDBC/ODBC-style wire protocol over Flight | ❌ |
-| **ADBC** | Standard database API returning Arrow batches | ❌ |
-| REST / custom RPC | — | ❌ (Arrow had experimental REST) |
-
-These are **separate sub-projects** in the Arrow ecosystem but are commonly grouped under “Apache Arrow capabilities” in production stacks (Dremio, InfluxDB 3, etc.).
-
----
-
-## 12. Query engine & advanced analytics
+## 9. Dataset, Filesystem, Network & Query Engine
 
 | Component | Skadi | Apache Arrow |
 |---|---|---|
-| **Acero** (C++ exec engine) | ❌ | ✅ filter, project, aggregate, join, order |
-| **Gandiva** (LLVM JIT) | ❌ | ✅ expression compilation to native code |
-| **Substrait** consumer/producer | ❌ | 🔶 |
-| SQL parsing | ❌ | ❌ (delegated to engines) |
-| GPU compute (cuDF / libarrow CUDA) | ❌ | ✅ |
+| `Dataset` / Hive partitioning / `Scanner` | ❌ | ✅ |
+| Unified `FileSystem` (S3 / GCS / Azure / HDFS) | ❌ (local `core:os` + POSIX `mmap` only) | ✅ |
+| **Arrow Flight** / **Flight SQL** / **ADBC** | ❌ | ✅ |
+| **Acero** / **Gandiva** / **Substrait** / GPU | ❌ | ✅ |
 
 ---
 
-## 13. Interoperability & language ecosystem
+## 10. Interoperability & language ecosystem
 
 | Interface | Skadi | Apache Arrow |
 |---|---|---|
-| **C Data Interface** (`ArrowArray` / `ArrowSchema`) | 🔶 layout-compatible buffers; no export/import procs | ✅ spec + helpers |
+| **C Data Interface** (`ArrowArray` / `ArrowSchema`) | 🔶 binary-compatible raw buffers; no export/import procs | ✅ spec + helpers |
 | **C Stream Interface** | ❌ | ✅ |
-| PyArrow / Python | ✅ via IPC files | ✅ native binding |
-| R, Java, Go, Rust, JS, … | ❌ | ✅ official libraries |
-| **nanoarrow** (minimal C) | ❌ | ✅ separate project |
-| Cross-language integration test suite | 🔶 IPC + C++ FFI tests | ✅ extensive |
-
-Skadi proves **binary layout compatibility** with Arrow C++ for sum/min/max/filter on raw pointers (`tests_cpp/`), but does not expose a stable C ABI for foreign callers.
+| PyArrow / Python | ✅ via IPC files/streams | ✅ native binding |
+| Arrow C++ FFI validation (`tests_cpp/`) | ✅ 14 parity tests (`i32`, `i64`, `u64`, `f32`, `f64`, `bool`, `String`, `Binary`, slices, IPC) | — |
+| Multi-language bindings (R, Java, Go, Rust, JS, …) | ❌ (Odin only) | ✅ |
 
 ---
 
-## 14. Metadata, extension types & schema evolution
+## 11. Metadata, extension types & schema evolution
 
 | Feature | Skadi | Apache Arrow |
 |---|---|---|
 | Field nullable flag | ✅ | ✅ |
 | Field / schema custom metadata (KV) | ❌ | ✅ |
-| Dictionary type on field | ❌ | ✅ |
-| Extension types (uuid, json, geo, …) | ❌ | ✅ |
-| Schema evolution (add/rename columns) | ❌ | 🔶 (format + library support) |
-| Canonical extension type registry | ❌ | ✅ (Arrow docs) |
+| Dictionary type on `Field` | ❌ | ✅ |
+| Extension types & schema evolution | ❌ | ✅ / 🔶 |
 
 ---
 
-## 15. Tooling, testing & packaging
+## 12. Tooling, testing & packaging
 
 | Area | Skadi | Apache Arrow |
 |---|---|---|
-| Unit tests | ✅ 122 tests (`make test`) | ✅ extensive |
-| C++ interop tests | ✅ `make test-cpp` | — |
-| Benchmark suite vs PyArrow/C++ | ✅ | ✅ (conbench) |
-| Integration / cross-lang golden tests | 🔶 IPC + roundtrip script | ✅ |
-| CI (GitHub Actions) | ❌ | ✅ |
-| Package manager (`odin pkg`, pip, conda) | ❌ / ad hoc `import "../../src"` | ✅ |
-| Documentation site | 🔶 README, PLAN, RESULTS | ✅ arrow.apache.org |
-| Feature status matrix | — | ✅ per language |
+| Unit & regression tests | ✅ **224 tests** across 17 files (`tests/` via `make test`) | ✅ extensive |
+| 4-layer ATDD specs & property tests | ✅ **22 specs** (`specs/` via `make test-specs`) + 6 Python tests | — |
+| C++ interop & layout parity tests | ✅ **14 tests** (`tests_cpp/` via `make test-cpp`) | — |
+| Statistical 1v1 benchmark suite vs C++ `25.0.1` | ✅ **26 workloads / 32 rows** (`make bench-1v1`) | ✅ (conbench) |
+| CI (GitHub Actions) | ✅ [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (Linux + macOS) | ✅ |
+| Repo layout & IDE tooling | ✅ idiomatic `skadi/` + `skadi/pipeline/` + `ols.json` | ✅ |
+| Documentation | ✅ `README.md`, `CHANGELOG.md`, `docs/`, `benchmarks/RESULTS.md` | ✅ arrow.apache.org |
 
 ---
 
-## 16. Side-by-side scope map
+## 13. Side-by-side scope map
 
 ```
 Apache Arrow ecosystem                          Skadi coverage
 ─────────────────────────────────────────────────────────────────────
-Columnar format (full type system)              ████░░░░░░  ~35%
-In-memory Array / Batch / Table (flat)          ████████░░  ~80%
-Builders (flat)                                 ████████░░  ~85%
-Compute (function registry)                     ██░░░░░░░░  ~10%
-IPC file + stream (flat, uncompressed)          ███████░░░  ~70%
-Parquet (full)                                  █░░░░░░░░░  ~5%  (programs only)
-CSV / JSON / ORC I/O                            ░░░░░░░░░░   0%  (CSV in programs)
-Dataset / Scanner                               ░░░░░░░░░░   0%
-Filesystem (local + cloud)                      ░░░░░░░░░░   0%
+Columnar format (16 flat types + companions)    █████░░░░░  ~45%
+In-memory Array / Batch / Table (flat)          ████████░░  ~85%
+Builders (flat + large + Umbra/RLE/Dict)        █████████░  ~90%
+Compute (flat, SIMD, selection, fusion, actors) ████░░░░░░  ~35%
+IPC file + stream (flat, mmap + writev)         ████████░░  ~80%
+Parquet (native CLI subset in examples/)        ██░░░░░░░░  ~15%
+CSV I/O (streaming CLI in examples/)            ██░░░░░░░░  ~20%
+Dataset / Scanner / Cloud FileSystem            ░░░░░░░░░░   0%
 Flight / Flight SQL / ADBC                      ░░░░░░░░░░   0%
 Acero / Gandiva / GPU                           ░░░░░░░░░░   0%
 Multi-language bindings                         ░░░░░░░░░░   0%  (Odin only)
@@ -429,83 +340,54 @@ Multi-language bindings                         ░░░░░░░░░░  
 
 ---
 
-## 17. What Skadi covers well (parity or better for flat analytics)
+## 14. What Skadi covers well (parity or faster for flat analytics)
 
-These areas are **not missing** relative to Arrow’s core value proposition for flat data:
-
-- Columnar memory layout and Arrow buffer conventions  
-- Zero-copy slice, mmap IPC read, zero-copy builder `finish()`  
-- Primitive + string/binary/large-string/large-binary types  
-- Schema, RecordBatch, basic Table/ChunkedArray  
-- Essential compute: sum, min/max, mean, filter, take, cast, arithmetic, sort_indices  
-- SIMD + multi-threaded reductions/filter  
-- IPC file and stream with PyArrow interoperability  
-- Buffer pool for repeated construction  
-- Validated against Arrow C++ on raw buffer layout (`tests_cpp/`)
-
-For **“load flat columns → compute → exchange via IPC”**, Skadi is a credible subset. For **“drop-in PyArrow replacement”**, it is not.
+- Columnar memory layout and Arrow buffer conventions (`tests_cpp/` verified)
+- Zero-copy slice, `mmap` IPC read, vectored `writev` IPC write, zero-copy builder `finish()`, and `Buffer_Pool` recycling
+- All 16 flat Arrow types including `Null_Type` and `Large_String`/`Large_Binary`
+- Companion encodings (`Umbra_Array`, `RLE_Array(T)`, `Dict_Array(T)`, `Str_Dict_Array`)
+- Core compute, monomorphised comparisons, lazy `Selection` + L1d `u16` morsels, operator fusion, persistent thread pool, and Sleipnir actor pipelines — beating Arrow C++ `25.0.1` across all 26 1v1 workloads
 
 ---
 
-## 18. Prioritised gap closure (if aiming at Arrow parity)
+## 15. Prioritised remaining gaps (if aiming at broader Arrow parity)
 
-Grouped by dependency order. Effort: **S** / **M** / **L**.
-
-### Tier 1 — Format completeness (unblocks interop)
+### Tier 1 — Format completeness
 
 | Priority | Gap | Effort |
 |---|---|---|
-| P1 | Temporal types (Date32, Timestamp) + IPC + cast | M |
-| P1 | Dictionary-encoded arrays + IPC dictionary messages | L |
-| P2 | Struct + List types (arrays, builders, IPC, compute) | L |
+| P1 | Temporal types (`Date32`, `Date64`, `Timestamp`) + IPC + cast | M |
+| P1 | Arrow IPC dictionary batches + `Field` dictionary metadata | L |
+| P2 | `Struct` + `List` nested types (arrays, builders, IPC, compute) | L |
 | P2 | IPC body compression (ZSTD/LZ4) | M |
-| P3 | Field/schema custom metadata | S |
-| P3 | Extension types | M |
+| P3 | Field/schema custom metadata & extension types | M |
 
-### Tier 2 — Compute breadth (unblocks analytics)
-
-| Priority | Gap | Effort |
-|---|---|---|
-| P1 | Comparisons + boolean kernels (`equal`, `is_null`, …) | M |
-| P2 | `value_counts`, `unique`, `is_in` | M |
-| P2 | String kernels (`utf8_length`, `binary_concat`, …) | M |
-| P3 | Function registry pattern (even if small initial set) | M |
-| P3 | ChunkedArray / RecordBatch-level compute wrappers | M |
-| P4 | Grouped aggregations | L |
-| P5 | Joins / Acero-style plans | L |
-
-### Tier 3 — I/O & ecosystem (unblocks production pipelines)
+### Tier 2 — Compute & I/O breadth
 
 | Priority | Gap | Effort |
 |---|---|---|
-| P1 | Parquet as library module (decode compression + common encodings) | L |
-| P2 | CSV reader/writer in `src/` | M |
-| P3 | C Data Interface export/import | M |
-| P4 | Dataset + filesystem abstraction | L |
-| P5 | Flight server/client | L |
+| P1 | Arrow C Data Interface export/import procs (`ArrowSchema` / `ArrowArray`) | M |
+| P2 | Parquet page decompression (Snappy/ZSTD) & reusable library module | L |
+| P2 | `unique`, `is_in`, null-handling kernels (`is_null`, `fill_null`), `selection_take` for remaining types | M |
+| P3 | Multi-key grouped aggregations & multi-column fusion planner | L |
 
-### Explicit non-goals (match README / PLAN)
+### Explicit non-goals
 
-Unless requirements change, these remain **out of scope** for Skadi as documented:
-
-- GPU / CUDA kernels  
-- Gandiva LLVM JIT  
-- Full Acero / SQL engine  
-- Multi-language bindings beyond Odin  
-- Complete Parquet specification in native code (FFI path exists for full fidelity)
+- GPU / CUDA kernels
+- Gandiva LLVM JIT
+- Full Acero / SQL engine / Arrow Flight RPC
+- Multi-language bindings beyond Odin
 
 ---
 
-## 19. References
+## 16. References
 
 - [Apache Arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html)  
 - [Arrow IPC format](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format)  
 - [Arrow C++ compute functions](https://arrow.apache.org/docs/cpp/compute.html)  
 - [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html)  
-- [Arrow Flight](https://arrow.apache.org/docs/format/Flight.html)  
-- [PyArrow Dataset](https://arrow.apache.org/docs/python/dataset.html)  
-- Skadi: [`README.md`](../README.md), [`Cursor.md`](Cursor.md), [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)
+- Skadi: [`README.md`](../README.md), [`Cursor.md`](Cursor.md), [`Endeavor.md`](Endeavor.md), [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)
 
 ---
 
-*This review reflects the repository state at generation time (122 passing tests). Update when major types, compute kernels, or I/O modules land.*
+*This review reflects the repository state at update time (**224 unit tests + 22 ATDD specs + 6 Python comparator tests + 14 C++ FFI tests**).*

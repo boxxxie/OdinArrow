@@ -1,32 +1,30 @@
 # Skadi — Code Review, Architecture, and Improvement Plan
 
-> Generated: 2026-06-10  
-> Scope: full repository review (`src/`, `programs/`, `tests/`, `benchmarks/`, build tooling)  
-> Test status at review time: **105 tests passing** (`make test`)
+> Updated: 2026-11-16  
+> Scope: full repository review (`skadi/`, `skadi/pipeline/`, `deps/sleipnir/actor/`, `examples/`, `tests/`, `specs/`, `tests_cpp/`, `benchmarks/`, `.github/workflows/ci.yml`)  
+> Test status: **224 unit/regression tests + 22 ATDD specs + 6 Python comparator tests passing** (`make test`), plus **14 Arrow C++ FFI parity tests** (`make test-cpp`) and strict static checks across 13 Odin targets (`make check`)
 
 ---
 
 ## 1. Executive Summary
 
-**Skadi** is a native [Odin](https://odin-lang.org/) implementation of the [Apache Arrow](https://arrow.apache.org/) columnar in-memory format. The library lives in `src/` under the `odinarrow` package and provides:
+**Skadi** is a native [Odin](https://odin-lang.org/) implementation of the [Apache Arrow](https://arrow.apache.org/) columnar in-memory format. The core library lives in `skadi/` (`package skadi`), paired with an optional cache-resident actor execution pipeline in `skadi/pipeline/` (`package pipeline`, backed by `deps/sleipnir/actor/`), providing:
 
-- Spec-aligned memory layout (64-byte aligned buffers, packed validity bitmaps, zero-copy slicing)
-- Primitive and variable-length column types with builders
-- Schema, RecordBatch, and Table abstractions
-- Compute kernels (aggregations, filter, take, cast, arithmetic) with SIMD and multi-threaded variants
-- Arrow IPC **file** format read/write (Feather v2 / random-access `.arrow` files)
-- Benchmark harness comparing Odin, PyArrow, and Arrow C++
+- **Spec-aligned memory layout** — 64-byte aligned buffers, packed validity bitmaps, zero-copy slicing, Arrow C Data Interface buffer layout, and a recycling `Buffer_Pool` (power-of-two / 256 KB bucketing, 25% large-block slack reuse, hit/miss telemetry, and a 128 MB LRU cap for `>4 MB` blocks)
+- **Type system & compressed encodings** — all 16 `DataType` tagged-union variants (`Null_Type`, `Bool_Type`, `Int8..64`, `UInt8..64`, `Float32/64`, `String_Type`/`Binary_Type` with `i32` offsets, `Large_String_Type`/`Large_Binary_Type` with `i64` offsets) plus encoding-aware companion arrays: `Umbra_Array` (16-byte German strings), `RLE_Array(T)` (run-end encoding with run-level validity), and `Dict_Array(T)` / `Str_Dict_Array` (dictionary encoding)
+- **Tabular containers** — `Schema` / `Field`, `Record_Batch` (with atomic refcounted `_ipc_backing` for zero-copy IPC reads), and `Table` / `Chunked_Array`
+- **Compute, selection, fusion & Sleipnir actor kernels** — reductions (`sum`, `min`, `max`, `min_max`, `mean`, `count`), `filter` (selectivity-hybrid 256-entry LUT / `tzcnt`), `take` (software-prefetched with release-mode bounds guards), numeric `cast`, element-wise arithmetic (`compute_arithmetic` / `compute_add/sub/mul/div`), monomorphised comparisons (`compute_compare*`), `compute_sort_indices` (packed LSD radix sort for integers, 8-byte prefix radix + merge sort for strings), lazy `Selection` vectors + L1d `u16` morsel kernels, fused multi-aggregate operators (`compute_sum_where`, `compute_agg_where_compare`), persistent thread-pool `*_parallel` variants, hardware cache discovery (`Hardware_Config`), and Sleipnir actor `pipeline_*` kernels
+- **Arrow IPC file & stream I/O** — self-contained FlatBuffers encoder/decoder, vectored `writev` zero-copy writes (with Darwin `max(i32)` chunking and overwrite-safe regular-file truncation), `mmap` zero-copy reads (`use_mmap=false` copy fallback), and structural/offset bounds validation (`validate=true`)
+- **Statistical 1v1 benchmark suite** — `make bench-1v1` compares Skadi single-threaded (`Odin ST`) and multi-threaded/actor (`Odin MT`) against **Apache Arrow C++ `25.0.1`** (`-O3`) across 26 canonical workloads (plus 3-way comparisons with PyArrow)
 
-Beyond the core library, the repo ships **end-to-end CSV ↔ Parquet pipelines** in two flavors:
+Beyond the core library, the repo ships **end-to-end streaming CSV ↔ Parquet CLI tools** in two flavors:
 
 | Pipeline | Write | Read |
 |---|---|---|
-| Native Odin | `csv_to_parquet_odin` | `parquet_to_csv_odin` |
-| Arrow C++ FFI | `csv_to_parquet_ffi` | `parquet_to_csv_ffi` |
+| Native Odin | `examples/csv_to_parquet` (`bin/csv_to_parquet_odin`) | `examples/parquet_to_csv` (`bin/parquet_to_csv_odin`) |
+| Arrow C++ FFI | `benchmarks/csv_to_parquet_ffi` (`bin/csv_to_parquet_ffi`) | `benchmarks/parquet_to_csv_ffi` (`bin/parquet_to_csv_ffi`) |
 
-The FFI path wraps PyArrow/Arrow C++ via thin C shims (`lib/libarrow_capi.so`, `lib/libparquet_capi.so`) for correctness baselines and performance comparison. The native Odin Parquet code is a focused subset (PLAIN encoding, UNCOMPRESSED, Thrift compact) — not a full Parquet implementation.
-
-The existing `PLAN.md` describes the original design intent; this document reflects **what is actually implemented today** and proposes next steps.
+The FFI path wraps Arrow C++ / Parquet C++ via thin C shims (`lib/libarrow_capi.so`, `lib/libparquet_capi.so`) for correctness baselines and performance comparison. The native Odin Parquet tools implement a focused uncompressed subset (Thrift Compact Protocol, PLAIN writes, dictionary + RLE/bit-packed definition-level reads across `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, and `BYTE_ARRAY`) — not the full Parquet specification.
 
 ---
 
@@ -34,49 +32,66 @@ The existing `PLAN.md` describes the original design intent; this document refle
 
 ```
 skadi/
-├── src/                          # Core library (package: odinarrow)
-│   ├── buffer.odin               # 64-byte aligned allocation, slice, copy
-│   ├── bitmap.odin               # Validity bitmap ops + popcount
-│   ├── types.odin                # DataType tagged union + metadata helpers
-│   ├── array.odin                # Central Array type, slice, accessors
-│   ├── builders.odin             # Generic primitive builders (bool, int, float)
-│   ├── var_length.odin           # String/Binary builders + array_get_string
-│   ├── schema.odin               # Field, Schema
-│   ├── record_batch.odin         # RecordBatch (columnar batch)
-│   ├── table.odin                # Table + Chunked_Array
-│   ├── compute.odin              # Serial compute kernels (~583 LOC)
-│   ├── compute_simd.odin         # SIMD inner loops (sum, min/max)
-│   ├── compute_parallel.odin     # Thread-pooled parallel kernels
-│   └── ipc.odin                  # FlatBuffers builder + IPC file I/O (~1041 LOC)
+├── skadi/                              # Core library (25 files, package skadi)
+│   ├── buffer.odin                     # 64-byte aligned allocation, uninit, slice, copy, resize
+│   ├── buffer_pool.odin                # Size-bucketed free-list allocator with 128 MB large-block LRU cap
+│   ├── bitmap.odin                     # Validity bitmap ops, popcount, bitmap_copy_bits
+│   ├── types.odin                      # 16-variant DataType tagged union + metadata helpers
+│   ├── array.odin                      # Central Array type, slice, accessors, Null_Type support, rebased copy
+│   ├── builders.odin                   # Generic Primitive_Builder(T) with lazy bitmaps & zero-copy finish
+│   ├── var_length.odin                 # String/Binary & Large_String/Large_Binary builders + String_Array_View
+│   ├── schema.odin                     # Field, Schema
+│   ├── record_batch.odin               # Record_Batch + refcounted _IPC_Backing
+│   ├── table.odin                      # Table + Chunked_Array with schema validation
+│   ├── umbra.odin                      # Umbra_Array (16-byte German strings + radix/merge sort)
+│   ├── rle.odin                        # RLE_Array(T) (run-end encoding + O(runs) kernels)
+│   ├── dict.odin                       # Str_Dict_Array & Dict_Array(T) (O(n_dict) min/max, histograms)
+│   ├── compute.odin                    # Serial compute, selectivity-hybrid filter, prefetched take, radix sort
+│   ├── compute_simd.odin               # Target-scoped AVX2/SIMD sum, min, max, min_max across numeric widths
+│   ├── compute_parallel.odin           # Thread-pooled parallel sum/min/max/mean/filter/take
+│   ├── compute_fused.odin              # Fused *_where single-pass filter + aggregate kernels
+│   ├── compare.odin                    # Monomorphised comparisons, Selection refinement, L1d u16 morsel ops
+│   ├── selection.odin                  # Lazy Selection vectors, compute_select, selection_take, record_batch_take
+│   ├── fusion.odin                     # Compile-time monomorphised compute_agg_where_compare driver
+│   ├── thread_pool.odin                # Process-lifetime worker pool for *_parallel kernels
+│   ├── hardware_config.odin            # Lock-free cached sysfs L1d/L2/L3 + core:sys/info discovery
+│   ├── ipc.odin                        # Self-contained FlatBuffers, vectored writev, validated file/stream IPC
+│   ├── ipc_mmap_unix.odin              # POSIX mmap zero-copy read + writev scatter-gather
+│   └── ipc_mmap_other.odin             # Non-POSIX fallback writev/read stubs
 │
-├── programs/                     # Standalone CLI tools (not part of library API)
-│   ├── csv_to_parquet_odin/       # Streaming CSV → native Parquet writer
-│   ├── csv_to_parquet_ffi/        # CSV → Parquet via Arrow C++
-│   ├── parquet_to_csv_odin/       # Native Parquet reader → CSV
-│   └── parquet_to_csv_ffi/        # Parquet → CSV via Arrow C++
+├── skadi/pipeline/                     # Optional Sleipnir actor pipeline (package pipeline)
+│   └── sleipnir_pipeline.odin          # Sharded SPSC super-morsel aggs, dict histograms, MSB-bucket sorts
 │
-├── tests/                        # 105 unit/integration tests (no C++ dep)
-├── tests_cpp/                    # FFI layout compatibility tests vs Arrow C++
+├── deps/sleipnir/actor/                # Vendored lock-free actor, MPSC/SPSC & envelope-pool runtime
+│   ├── actor.odin, doc.odin, mpsc.odin, pool.odin, spsc.odin
+│
+├── examples/                           # Standalone CLI tools & demos (not library API)
+│   ├── quickstart/main.odin            # Runnable API + PyArrow IPC round-trip tour
+│   ├── csv_to_parquet/                 # Streaming RFC 4180 CSV -> native Parquet writer
+│   └── parquet_to_csv/                 # Native Parquet reader -> streaming CSV writer
+│
+├── tests/                              # 17 unit & regression test files (224 tests, no C++ dep)
+├── specs/                              # 10 files (Layers 1-3 ATDD executable specs, 22 specs)
+├── tests_cpp/arrow_cpp_test.odin       # 14 FFI layout & IPC parity tests vs Arrow C++
 ├── benchmarks/
-│   ├── odin/bench_main.odin       # Odin perf harness (threaded variants)
-│   ├── python/                   # PyArrow equivalents
-│   ├── cpp/                      # Arrow C++ C API + bench binary
-│   ├── compare.sh                # 3-way markdown table
-│   └── parquet_bench.sh          # CSV↔Parquet pipeline timing
+│   ├── odin/                           # Odin benchmark runner + statistical harness (stats/)
+│   ├── odin_c/                         # C-ABI Odin vs Arrow C++ 1v1 runner
+│   ├── cpp/                            # Arrow C++ C API + standalone C++ benchmarks
+│   ├── python/                         # PyArrow benchmark scripts
+│   ├── csv_to_parquet_ffi/             # CSV -> Parquet via Arrow C++
+│   ├── parquet_to_csv_ffi/             # Parquet -> CSV via Arrow C++
+│   ├── compare_1v1.py                  # Statistical JSONL 1v1 comparator + test_compare_1v1.py (6 tests)
+│   ├── compare.sh, bench_odin_c.sh, parquet_bench.sh
+│   └── RESULTS.md                      # Benchmark methodology, analysis, and 32-row stats table
 │
-├── bin/                          # Built binaries (gitignored artifacts)
-├── lib/                          # Shared libs for FFI (gitignored)
-├── Makefile                      # Build orchestration
-├── PLAN.md                       # Original design doc (partially stale)
-├── roundtrip_test.sh              # 1M-row CSV↔Parquet integration test
-└── README.md                     # One-line description only
+├── docs/                               # Cursor.md, Endeavor.md, Review.md
+├── .github/workflows/ci.yml            # GitHub Actions CI (Ubuntu + macOS)
+├── CHANGELOG.md                        # Release & unreleased change log
+├── ols.json                            # Language server & strict checker profile
+├── Makefile                            # Build, check, test, FFI, and benchmark targets
+├── roundtrip_test.sh                   # 1M-row CSV <-> Parquet integration test
+└── README.md                           # Project overview, quickstart, 1v1 benchmarks, layout
 ```
-
-**Not present (mentioned in PLAN.md but missing):**
-
-- `src/odinarrow.odin` — no single public re-export entry point
-- `examples/quickstart.odin` — no getting-started example
-- Dedicated `bench_ipc.odin` — IPC benchmark lives inside `bench_main.odin`
 
 ---
 
@@ -85,20 +100,22 @@ skadi/
 ### 3.1 Layered Design
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  CLI Programs (CSV↔Parquet, benchmarks)                        │
-├─────────────────────────────────────────────────────────────────┤
-│  Compute Layer   compute.odin + compute_simd + compute_parallel │
-├─────────────────────────────────────────────────┬───────────────┤
-│  Data Model      Schema / RecordBatch / Table  │  IPC (Feather) │
-├───────────────────────────────────────────────┴───────────────┤
-│  Column Layer    Array + Builders + var_length accessors      │
-├───────────────────────────────────────────────────────────────┤
-│  Memory Layer    Buffer (aligned) + Bitmap (validity bits)    │
-└───────────────────────────────────────────────────────────────┘
-         ▲                              ▲
-         │ zero-copy buffer pointers      │ binary-compatible layout
-         └────────── Arrow C++ FFI ──────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Examples & Benchmarks (examples/quickstart, CSV<->Parquet, benchmarks/)   │
+├────────────────────────────────────────────────────────────────────────────┤
+│  Pipeline Layer   skadi/pipeline (Sleipnir actors + Sharded_SPSC_Mailbox)  │
+├────────────────────────────────────────────────────────────────────────────┤
+│  Compute & Query  compute*, compare, selection (u16 morsels), fusion       │
+├──────────────────────────────────────────────────┬─────────────────────────┤
+│  Data Model       Schema / Record_Batch / Table  │  Arrow IPC File/Stream  │
+├──────────────────────────────────────────────────┴─────────────────────────┤
+│  Column & Enc     Array, Builders, var_length, Umbra_Array, RLE, Dict      │
+├────────────────────────────────────────────────────────────────────────────┤
+│  Memory Layer     Buffer (64B aligned), Buffer_Pool, Bitmap, Hardware_Cfg  │
+└────────────────────────────────────────────────────────────────────────────┘
+         ▲                                       ▲
+         │ zero-copy buffer pointers             │ binary-compatible layout
+         └────────────── Arrow C++ FFI ──────────┘
 ```
 
 Design principles (consistent across the codebase):
@@ -106,61 +123,40 @@ Design principles (consistent across the codebase):
 | Principle | Implementation |
 |---|---|
 | Type dispatch | `DataType` tagged union + exhaustive `switch` (no vtables) |
-| Memory ownership | Explicit per-buffer `Allocator`; slice views zero `allocator` |
+| Memory ownership | Explicit per-buffer `Allocator`; slice views zero `allocator`; refcounted `_IPC_Backing` for `mmap` batches |
 | Zero semantics | `offset` + `length` into shared buffers (Arrow contract) |
-| Errors | `(T, mem.Allocator_Error)` or `(T, bool)` — no exceptions |
-| Performance | SIMD hot paths + optional `core:thread` parallel fan-out |
-| Wire compatibility | Buffer layout matches Arrow C Data Interface |
+| Errors | `(T, mem.Allocator_Error)`, `(T, bool)`, or explicit error unions — no exceptions |
+| Performance | Target-scoped AVX2/SIMD loops, byte-coalesced bitmaps, persistent thread pool, L1d `u16` morsels, Sleipnir actors |
+| Wire compatibility | Buffer layout matches Arrow C Data Interface; FlatBuffers IPC matches Feather v2 / PyArrow |
 
 ### 3.2 Memory Layer
 
-#### `Buffer` (`buffer.odin`, 80 LOC)
+- **`Buffer` (`skadi/buffer.odin`):** `ARROW_ALIGNMENT = 64` bytes. Provides `buffer_make` (zero-filled), `buffer_make_uninit` (uninitialized for overwrite paths), `buffer_slice` (zero-copy view with `allocator = {}`), `buffer_copy`, `buffer_resize`, and `buffer_free` (skips non-owning views).
+- **`Bitmap` (`skadi/bitmap.odin`):** Packed little-endian validity bits (`bitmap_get`, `bitmap_set`, `bitmap_clear`, `bitmap_popcount`, `bitmap_set_all`, `bitmap_clear_all`, `bitmap_copy_bits`, and `bitmap_byte_count` padded to 64-byte multiples).
+- **`Buffer_Pool` (`skadi/buffer_pool.odin`):** Single-threaded free-list allocator (`buffer_pool_init`, `buffer_pool_allocator`, `buffer_pool_destroy`) using power-of-two buckets up to 4 MB, 256 KB step alignment above 4 MB, 25% slack reuse on `large_lru`, a 128 MB eviction cap for cached `>4 MB` blocks, and `hits` / `misses` counters.
+- **`Hardware_Config` (`skadi/hardware_config.odin`):** Stack-allocated runtime discovery of physical/logical cores (up to 1,024 Linux sysfs CPU entries with `core:sys/info` fallback) and L1d/L2/L3 cache sizes with lock-free atomic fast-path reads once initialized and deterministic test overrides (`hardware_config_set`, `hardware_config_reset`).
 
-```odin
-Buffer :: struct {
-    data:      [^]u8,
-    size:      int,
-    capacity:  int,
-    allocator: mem.Allocator,
-}
-```
+### 3.3 Type System (`skadi/types.odin`) & Companion Encodings
 
-- **`ARROW_ALIGNMENT = 64`** — matches Arrow spec / AVX-512 friendly padding
-- **`buffer_make`** — allocates via `mem.alloc_aligned`, zero-fills
-- **`buffer_slice`** — zero-copy view; returned buffer has `allocator = {}` (non-owning)
-- **`buffer_free`** — skips non-owning buffers (`allocator.procedure == nil`)
-- **`buffer_resize`** — in-place shrink or realloc+zero on grow
+`DataType` is a 16-variant tagged union of empty struct discriminants:
 
-#### `Bitmap` (`bitmap.odin`, 80 LOC)
+- `Null_Type`, `Bool_Type`
+- `Int8_Type`, `Int16_Type`, `Int32_Type`, `Int64_Type`
+- `UInt8_Type`, `UInt16_Type`, `UInt32_Type`, `UInt64_Type`
+- `Float32_Type`, `Float64_Type`
+- `String_Type`, `Large_String_Type`, `Binary_Type`, `Large_Binary_Type`
 
-Packed little-endian validity bits (bit `i` → byte `i/8`, bit `i%8`).
+Metadata helpers: `type_byte_width`, `type_is_bit_packed`, `type_is_variable_length`, `type_is_integer`, `type_is_signed`, `type_is_floating`, `type_name`.
 
-| Procedure | Role |
-|---|---|
-| `bitmap_get/set/clear` | Per-element validity |
-| `bitmap_popcount` | Count valid bits; masks partial final byte correctly |
-| `bitmap_set_all/clear_all` | Bulk init |
-| `bitmap_byte_count` | Size with 64-byte padding (safe `[^]u64` casts) |
+Companion cache/encoding-aware types (separate from Arrow `Array`, transcoded explicitly at boundaries):
 
----
+- **`Umbra_Array` (`skadi/umbra.odin`):** Fixed 16-byte `Umbra_String` slots `{ length: u32, data: [12]u8 }` — inline up to 12 bytes, 4-byte prefix + `i64` side-buffer offset above 12 bytes — with `umbra_compare`, `umbra_count_eq`, and 4-pass LSD prefix-radix + merge-sort `umbra_sort_indices` / `umbra_sort_range_into`.
+- **`RLE_Array(T)` (`skadi/rle.odin`):** Run-end encoded numeric columns (`run_ends`, `values`, optional `run_valid` bitmask for null runs) with coalescing `RLE_Builder(T)` (`rle_append`, `rle_append_null`), `rle_encode`/`rle_decode`, `rle_is_null`, `rle_get`/`rle_try_get`, and `O(runs)` `rle_sum` / `rle_min_max`.
+- **`Str_Dict_Array` & `Dict_Array(T)` (`skadi/dict.odin`):** `i32` dictionary codes (`DICT_NULL_CODE :: -1` for nulls) with `str_dict_slice`/`dict_slice`, `NaN`-deduplicating `dict_encode`, `O(n_dict)` `dict_min_max`, `dict_sum`, `*_value_counts`, and `*_group_sum`.
 
-### 3.3 Type System (`types.odin`, 133 LOC)
+**Still out of scope in `DataType`:** temporal types (`Date32`/`64`, `Timestamp`), `Decimal128`/`256`, `Float16`, nested types (`List`, `Struct`, `Union`, `Map`).
 
-`DataType` is a tagged union of empty struct discriminants — type identity is the variant tag, no heap metadata.
-
-**Implemented types:**
-
-- Null, Bool
-- Int8/16/32/64, UInt8/16/32/64, Float32/64
-- String, Large_String, Binary, Large_Binary (large variants in type system only — no dedicated builders yet)
-
-**Helper procs:** `type_byte_width`, `type_is_bit_packed`, `type_is_variable_length`, `type_is_integer`, `type_is_signed`, `type_is_floating`, `type_name`
-
-**Not implemented:** temporal types (Date32/64, Timestamp), nested types (List, Struct, FixedSizeList), Dictionary encoding — though `Array.children` and `Array.dictionary` fields exist as stubs in comments/planned structure.
-
----
-
-### 3.4 Array — Central Column Type (`array.odin`, 124 LOC)
+### 3.4 `Array` — Central Column Type (`skadi/array.odin`)
 
 ```odin
 Array :: struct {
@@ -173,267 +169,132 @@ Array :: struct {
 }
 ```
 
-**Buffer layout by column kind:**
-
 | Column kind | `buffers[0]` | `buffers[1]` | `buffers[2]` |
 |---|---|---|---|
+| `Null_Type` | unused | unused | unused |
 | Fixed-width (int/float) | validity bitmap | typed values | unused |
-| Bool | validity bitmap | bit-packed values | unused |
-| String/Binary | validity bitmap | i32 offsets (n+1) | UTF-8 / raw bytes |
+| `Bool_Type` | validity bitmap | bit-packed values | unused |
+| `String_Type` / `Binary_Type` | validity bitmap | `i32` offsets (`n+1`) | UTF-8 / raw bytes |
+| `Large_String_Type` / `Large_Binary_Type` | validity bitmap | `i64` offsets (`n+1`) | UTF-8 / raw bytes |
 
-**Key operations:**
+Key operations: `array_slice` (O(1), clears buffer allocators), `array_get` / `array_try_get`, `array_is_null` / `array_is_valid`, `array_null_count` / `array_recount_nulls`, `array_free`, and `array_copy` (which rebases non-zero slice offsets cleanly, including variable-length offsets and bytes via `_array_copy_rebased`).
 
-- `array_slice` — O(1) zero-copy; clears buffer allocators on result
-- `array_get` / `array_try_get` — typed element access with offset handling
-- `array_is_null` / `array_is_valid` — bitmap lookup
-- `array_null_count` — cached or recount from bitmap
-- `array_free` / `array_copy` — ownership-aware lifecycle
+### 3.5 Builders (`skadi/builders.odin`, `skadi/var_length.odin`)
 
-Variable-length accessors live in `var_length.odin`: `array_get_string`, `array_get_binary` (zero-copy views).
-
----
-
-### 3.5 Builders
-
-#### Primitive builder (`builders.odin`, 158 LOC)
-
-Generic `Primitive_Builder($T)` using raw `[^]T` + `[^]u8` bitmap (not `[dynamic]T`) to reduce append overhead.
-
-```
-builder_make → builder_append / builder_append_null → builder_finish → Array
-              builder_reset / builder_destroy
-```
-
-Supports: `bool`, all integer/float widths. First null triggers retroactive validity marking for prior elements.
-
-#### Variable-length builders (`var_length.odin`, 207 LOC)
-
-- `String_Builder` / `Binary_Builder` — dynamic offsets + data + bitmap
-- Shared `_var_finish` materializes Arrow buffers on finish
-- **Gap:** no `Large_String_Builder` / `Large_Binary_Builder` (i64 offsets)
-
----
+- **`Primitive_Builder(T)` (`skadi/builders.odin`):** Raw `[^]T` + lazy `[^]u8` validity bitmap (`0xFF`-filled on first null) and uninitialized data allocation. `builder_finish` transfers buffers zero-copy when `allocator` matches `b.allocator` (or copies into the target allocator if different), while `bool` bit-packs on finish. Includes `builder_reset` and `builder_destroy`.
+- **Variable-length builders (`skadi/var_length.odin`):** `String_Builder` (`i32` offsets), `Binary_Builder` (`i32` offsets), `Large_String_Builder` (`i64` offsets), and `Large_Binary_Builder` (`i64` offsets) backed by `_Var_Builder(Offset)`, with `*_reserve_data`, `*_reset`, zero-copy `*_finish`, and runtime release-mode 2 GiB `i32` offset overflow panics. Also provides `String_Array_View` and `string_view_sum_lengths`.
 
 ### 3.6 Schema & Tabular Data
 
-#### Schema (`schema.odin`)
+- **`Schema` (`skadi/schema.odin`):** `Field :: struct { name: string, type: DataType, nullable: bool }` and `Schema :: struct { fields: []Field, allocator: mem.Allocator }`. Deep-copies field names in `schema_make`; lookup via `schema_field_index`.
+- **`Record_Batch` (`skadi/record_batch.odin`):** `record_batch_make` validates schema non-nil, column count, uniform column lengths, and per-field `DataType` equality. Zero-copy IPC reads share a refcounted `_IPC_Backing` block (`ref_count` + `release` callback) freed by `record_batch_free` when the last batch drops it.
+- **`Table` (`skadi/table.odin`):** `table_from_record_batches` stacks batches into borrowed `Chunked_Array` columns and validates matching schema field counts, names, and types across all batches. Lookup via `table_column`, `table_column_at`, `chunked_array_get`, and `chunked_array_is_null`.
 
-```odin
-Field  :: struct { name: string, type: DataType, nullable: bool }
-Schema :: struct { fields: []Field, allocator: mem.Allocator }
-```
+### 3.7 Compute, Selection, Fusion & Sleipnir Actor Layer
 
-Deep-copies field names on `schema_make`. Lookup via `schema_field_index`.
-
-#### RecordBatch (`record_batch.odin`)
-
-Row-oriented container: one `Array` per field, uniform `length`.
-
-- `record_batch_make` — validates column count and equal lengths
-- `_owned_backing` — supports zero-copy IPC reads (single backing block for all column views)
-- `record_batch_free` — frees columns + optional backing; does **not** free borrowed schema
-
-#### Table (`table.odin`)
-
-Chunked columns for datasets spanning multiple batches:
-
-```odin
-Chunked_Array :: struct { type: DataType, chunks: []Array, length: int, ... }
-Table        :: struct { schema: ^Schema, columns: []Chunked_Array, length: int, ... }
-```
-
-- `table_from_record_batches` — stacks batches into per-column chunk lists (borrows array data)
-- `chunked_array_get` / `chunked_array_is_null` — logical index across chunks
-
-**Gap:** no schema type validation when stacking batches (only field count checked).
-
----
-
-### 3.7 Compute Layer
-
-#### Serial kernels (`compute.odin`, 583 LOC)
+#### Serial Kernels (`skadi/compute.odin`)
 
 | Kernel | Status | Notes |
 |---|---|---|
-| `compute_sum` | ✅ | f64 result; SIMD for i32/f64 without nulls |
-| `compute_min` / `compute_max` | ✅ | Native-type compare; SIMD unroll for i32 |
-| `compute_min_max` | ✅ | Single-pass combined min+max |
-| `compute_mean` | ✅ | sum / valid_count |
-| `compute_count` | ✅ | total + non-null |
-| `compute_filter` | ✅ | Bool mask; typed + string/binary paths |
-| `compute_take` | ✅ | Index array (i32 indices) |
-| `compute_cast` | ✅ | Safe numeric widening/narrowing |
-| `compute_add/sub/mul/div` | ✅ | Element-wise; null propagation |
-| `sort_indices` | ❌ | Listed in PLAN.md, not implemented |
+| `compute_sum` | ✅ | `f64` result; SIMD across `f32`, `f64`, `i8..i32`, `u8..u32`, unrolled `i64`/`u64`, byte-coalesced `0xFF` null runs |
+| `compute_min` / `compute_max` / `compute_min_max` | ✅ | Native-type SIMD across numeric widths + byte-coalesced null runs |
+| `compute_mean` / `compute_count` | ✅ | `compute_count` supports all 16 types including `Null_Type` |
+| `compute_filter` | ✅ | Selectivity-hybrid `tzcnt` (sparse) / `_BYTE_INDICES_LUT` (dense); primitives, bool, string/binary & large variants |
+| `compute_take` | ✅ | `i32`/`i64` indices; software prefetch on validity-free path; release-mode bounds & `i32` offset guards |
+| `compute_cast` | ✅ | Numeric widening/narrowing, float↔int, signed↔unsigned |
+| `compute_arithmetic` / `compute_add/sub/mul/div` | ✅ | Element-wise with null propagation, zero-divisor / `min(T) / -1` guards |
+| `compute_sort_indices` | ✅ | Packed 8-byte `(key_u32, idx_u32)` LSD radix sort for ints; 8-byte prefix radix + merge sort for strings; stable merge sort (nulls-last, `NaN` handling) for floats/nullable |
 
-Dispatch pattern: top-level `switch` on `arr.type` → typed inner proc. Null-aware paths fall back to scalar loops.
+#### SIMD (`skadi/compute_simd.odin`)
 
-#### SIMD (`compute_simd.odin`, 106 LOC)
+Target-scoped `@(enable_target_feature = _SIMD_TARGET_FEATURE)` (`"avx2"` on `amd64`, portable `#simd` elsewhere) without `#force_inline` so AVX2 stays isolated to vector loops:
 
-Internal `#force_inline` helpers assuming `offset == 0`:
+- `_sum_f64_simd` (4-way `#simd[4]f64`), `_sum_f32_simd` (`#simd[4]f32 -> #simd[4]f64`)
+- `_sum_sint_simd` / `_sum_uint_simd` (`#simd[4]T -> #simd[4]i64/u64` explicit widening across 8/16/32-bit widths)
+- `_min_typed_simd`, `_max_typed_simd`, `_min_max_typed_simd` (2-way unrolled `#simd[K]T` where `K :: 32 / size_of(T)`)
 
-- `_sum_f64_simd` — 4-wide f64 SIMD, 4 unrolled accumulators
-- `_sum_i32_simd` — 8-way i64 accumulation (sign-extend i32)
-- `_min_i32_simd` / `_max_i32_simd` / `_min_max_i32_simd` — 8-way scalar unroll for LLVM vectorization
+#### Comparisons, Selection Vectors & Operator Fusion
 
-#### Parallel (`compute_parallel.odin`, 298 LOC)
+- **Comparisons & Selections (`skadi/compare.odin`, `skadi/selection.odin`):** `compute_compare*` (comptime `$OP` monomorphised), `compute_select` (selectivity-aware `tzcnt` / byte-LUT), `compute_select_compare*`, `selection_refine_compare*`, `compute_sum_selection`, `compute_min_max_selection`, `selection_take` (`Int8..64`, `UInt8..64`, `Float32/64`, `String_Type`), `record_batch_take`, and L1d-resident `u16` morsel ops (`morsel_select_compare_f64_u16`, `morsel_refine_compare_f64_u16`, `morsel_sum_f64_u16`, `morsel_agg_f64_u16`, `compute_sel_2pred_sum`, `compute_sel_2pred_sum_parallel`).
+- **Fused Operators (`skadi/compute_fused.odin`, `skadi/fusion.odin`):** Single-pass mask+aggregate (`compute_sum_where`, `compute_min_where`, `compute_max_where`, `compute_min_max_where`, `compute_mean_where`, `compute_count_where`) and compile-time monomorphised `compute_agg_where_compare*` (`sum`, `count`, `min`, `max` in one pass with zero intermediate arrays).
 
-Uses `core:thread` with zero-copy `array_slice` per chunk.
+#### Parallel & Sleipnir Actor Execution (`skadi/compute_parallel.odin`, `skadi/thread_pool.odin`, `skadi/pipeline/sleipnir_pipeline.odin`)
 
-- `PARALLEL_MIN_LENGTH = 262_144` — below this, serial fallback
-- `_resolve_threads` — caps threads by useful chunk count
-- Parallel variants: `compute_sum_parallel`, `compute_min/max/mean_parallel`, `compute_min_max_parallel`, `compute_filter_parallel`
-- Filter parallel path concatenates fixed-width results; variable-length filter parallel is limited
+- **Persistent thread pool (`skadi/thread_pool.odin`):** Process-lifetime parked worker pool with condition-variable broadcast and raw heap allocations (safe under test tracking allocators). Adaptive morsel sizing via `Hardware_Config` (`PARALLEL_MIN_LENGTH = 262_144`).
+- **Parallel kernels (`skadi/compute_parallel.odin`):** `compute_sum_parallel`, `compute_min_parallel`, `compute_max_parallel`, `compute_mean_parallel`, `compute_min_max_parallel`, `compute_filter_parallel` (fixed-width + `String_Type`/`Binary_Type`), and `compute_take_parallel`.
+- **Sleipnir actor pipeline (`skadi/pipeline/sleipnir_pipeline.odin`):** Lock-free `Envelope_Pool` + `mpsc_push_chain` + per-core `Sharded_SPSC_Mailbox` coordination over `deps/sleipnir/actor/`:
+  - `pipeline_agg_where_f64`, `pipeline_sel_2pred_sum_f64`, `pipeline_record_batch_stream_sum`
+  - `pipeline_dict_value_counts`, `pipeline_dict_group_sum`, `pipeline_dict_sum`
+  - `pipeline_sort_indices` (`i32`, `u32`, `String_Type`) and `pipeline_umbra_sort_indices` via MSB-bucket partitioning with zero merge pass.
 
----
+### 3.8 IPC — Arrow File & Stream Formats (`skadi/ipc.odin`, `ipc_mmap_unix.odin`, `ipc_mmap_other.odin`)
 
-### 3.8 IPC — Arrow File Format (`ipc.odin`, 1041 LOC)
+Self-contained back-to-front FlatBuffers encoder (`FBB`) and bounds-checked decoder:
 
-Self-contained **back-to-front FlatBuffers builder** (`FBB` struct) — no external FlatBuffers dependency.
+- ✅ **File & stream writers:** `ipc_write_file` and `ipc_write_stream` using `_IPC_Vectored_Writer` (`writev` scatter-gather with `max(i32)` Darwin chunking, inline scalar staging, regular-file `.Trunc` avoidance for page-cache reuse + `_ipc_truncate_if_regular`).
+- ✅ **File & stream readers:** `ipc_read_file` and `ipc_read_stream` with `use_mmap := true` (POSIX `mmap` zero-copy views via refcounted `_IPC_Backing`, transparent `os.read_entire_file` fallback when `use_mmap=false` or on non-POSIX targets) and `validate := true` (overflow-safe `_fits`, vtable bounds checks, buffer length checks, and variable-length offset monotonicity validation).
+- ✅ **Supported flat types:** All 16 `DataType` variants including `Null_Type` and `Large_*` variants, nulls, sliced columns, and multi-batch files/streams, cross-validated against PyArrow and Arrow C++.
+- ❌ **Not supported in IPC:** nested types, IPC dictionary batches, IPC body compression (LZ4/ZSTD).
 
-**Supported:**
+### 3.9 CLI Examples & Parquet Subsystem (`examples/`)
 
-- ✅ IPC **file** writer: `ipc_write_file`
-- ✅ IPC **file** reader: `ipc_read_file` (zero-copy column views into file block via `_owned_backing`)
-- ✅ Schema + RecordBatch FlatBuffer encoding/decoding
-- ✅ Types: primitives, utf8/binary, nulls, multi-batch files
-- ✅ Cross-validation tested against PyArrow (per tests + PLAN notes)
+- **`examples/csv_to_parquet/`:** Streaming RFC 4180 CSV parser (`csv_reader.odin`, SIMD 16-byte delimiter scanning, zero-copy unquoted views, strict quote and `os.read` error checks) writing uncompressed PLAIN `BYTE_ARRAY` / `INT32` Parquet row groups bounded by `-m MB` (`parquet_writer.odin`, `thrift_writer.odin`), bypassing the write buffer for large pages.
+- **`examples/parquet_to_csv/`:** Native Parquet reader (`parquet_reader.odin`, `thrift.odin`) supporting `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY`, `REQUIRED`/`OPTIONAL` RLE/bit-packed definition levels, multi-page dictionaries, `os.read_at`, SIMD CSV escaping (`out_csv_field`), lossless `core:strconv` float formatting, and `Parquet_To_CSV_Corrupt_Page_Error` reporting.
 
-**Not supported:**
+### 3.10 Benchmarks & FFI Validation (`benchmarks/`, `tests_cpp/`)
 
-- ❌ IPC **stream** format (sequential messages, no footer)
-- ❌ Nested types, dictionaries in IPC
-- ❌ Memory-mapped I/O (reads full file/block into memory)
-
-File layout (documented in source):
-
-```
-"ARROW1\0\0" → schema message → record batch message(s) → EOS → footer → footer_len → "ARROW1"
-```
+- **`make bench-1v1` (`benchmarks/compare_1v1.py`, `benchmarks/odin_c/`, `benchmarks/odin/stats/`):** Compares Skadi (`Odin ST` and `Odin MT`) against Arrow C++ `25.0.1` (`-O3`) across 26 canonical 1v1 workloads (32 rows including actor variants), computing median of 5 trials, Welch's two-sample z-tests, `GB/s`, CV%, and per-run allocation telemetry (`benchmarks/RESULTS.md`, `odin.jsonl`, `cpp.jsonl`, `history.jsonl`).
+- **`make test-cpp` (`tests_cpp/arrow_cpp_test.odin`):** 14 FFI layout and IPC parity tests validating Skadi buffers (`i32`, `i64`, `u64`, `f32`, `f64`, `bool`, `String_Type`, `Binary_Type`, sliced arrays, and IPC files) directly through `lib/libarrow_capi.so`.
 
 ---
 
-### 3.9 CLI Programs & Parquet Subsystem
-
-These are **application-layer** code importing `../../src` — not exported as library APIs.
-
-#### CSV → Parquet (`programs/csv_to_parquet_odin/`)
-
-| File | Responsibility |
-|---|---|
-| `main.odin` | CLI, memory budget (`-m MB`), chunked conversion loop |
-| `csv_reader.odin` | Streaming RFC 4180 parser with refill buffer |
-| `parquet_writer.odin` | PLAIN BYTE_ARRAY pages, UNCOMPRESSED, multi row-group |
-| `thrift_writer.odin` | Thrift compact encoder for Parquet metadata |
-
-Memory model: derive `max_rows` per chunk from `-m` limit; build Skadi string columns; write row group; free arrays.
-
-#### Parquet → CSV (`programs/parquet_to_csv_odin/`)
-
-| File | Responsibility |
-|---|---|
-| `main.odin` | CLI, buffered CSV output, chunked row processing |
-| `parquet_reader.odin` | Footer parse, per-column page streams, dictionary pages |
-| `thrift.odin` | Thrift compact decoder |
-
-Supports: INT32 columns, BYTE_ARRAY strings, OPTIONAL/REQUIRED, dictionary encoding, multi row-group.
-
-#### FFI wrappers
-
-Thin Odin mains calling C API in `libparquet_capi.so` — same CLI surface as native tools.
-
-#### Integration test (`roundtrip_test.sh`)
-
-Generates 1M × 10 string columns, runs both pipelines, CSV-aware diff (handles quoting differences), timing summary.
-
----
-
-### 3.10 Benchmarks & FFI Validation
-
-#### Odin benchmarks (`benchmarks/odin/bench_main.odin`)
-
-Scenarios (median of 5 trials):
-
-- Array build 10M i32 (1% nulls)
-- Sum / min+max / filter on 10M (threaded variants)
-- String build 1M, string length scan 1M
-- IPC roundtrip 10M i32
-
-Output: `key=nanoseconds` lines consumed by `compare.sh`.
-
-#### C++ shim (`benchmarks/cpp/`)
-
-- `arrow_capi.*` — exposes Arrow compute on raw buffer pointers (layout compatibility proof)
-- `parquet_capi.*` — CSV↔Parquet for FFI programs
-- `bench_arrow_main.cpp` — standalone C++ benchmark binary
-
-#### C++ interop tests (`tests_cpp/test_arrow_cpp.odin`)
-
-Verifies Odin `Array` buffers produce identical results when handed to Arrow C++ for sum, min/max, filter, string scan.
-
----
-
-## 4. Build System (`Makefile`)
+## 4. Build System (`Makefile`) & CI (`.github/workflows/ci.yml`)
 
 | Target | Purpose | Dependencies |
 |---|---|---|
-| `make test` | Run 105 Odin tests | Odin only |
-| `make test-cpp` | FFI layout tests | PyArrow paths, `libarrow_capi.so` |
-| `make bench-odin` | Odin benchmarks | Odin only |
-| `make bench-python` | PyArrow scripts | Python + pyarrow |
-| `make bench-compare` | 3-way table | All above + `bench_arrow_cpp` |
-| `make csv-to-parquet-odin/ffi` | Build converters | FFI needs `libparquet_capi.so` |
-| `make parquet-odin/ffi` | Build readers | Same |
-| `make bench-parquet` | Pipeline timing | Built binaries + `TEST_DATA` path |
+| `make check` | Strict static analysis (`-vet -strict-style -disallow-do -warnings-as-errors`) across 13 Odin packages/targets | Odin only |
+| `make test` | Run 224 unit/regression tests (`tests/`) + 22 ATDD specs (`specs/`) + 6 Python comparator tests | Odin + Python 3 |
+| `make test-specs` | Run 22 ATDD specs + 6 Python comparator tests | Odin + Python 3 |
+| `make test-cpp` | Build `lib/libarrow_capi.so` and run 14 FFI + IPC parity tests | Arrow C++ (`pkg-config` or PyArrow fallback) |
+| `make bench-1v1` | Statistical 1v1 suite (Odin ST/MT vs Arrow C++ `25.0.1`) | Arrow C++ |
+| `make bench-compare` | 3-way Odin / PyArrow / Arrow C++ comparison | Arrow C++ + PyArrow |
+| `make parquet-odin csv-to-parquet-odin` | Build native CSV ↔ Parquet CLI binaries | Odin only |
+| `make parquet-ffi csv-to-parquet-ffi` | Build FFI CSV ↔ Parquet CLI binaries (`lib/libparquet_capi.so`) | Arrow + Parquet C++ |
 
-**External coupling:** Arrow C++ paths resolved from `python3 -c "import pyarrow; ..."`. Hard-coded `ARROW_VER := 2400`. `TEST_DATA` points to `$(HOME)/Work/Projects/Odin/test_data.parquet` (machine-specific).
+CI runs on Ubuntu and macOS (`.github/workflows/ci.yml`), verifying `make check`, `make test`, `odin doc`, quickstart PyArrow IPC verification, native CSV ↔ Parquet round-trip, and on Linux `make test-cpp build-parquet-capi parquet-ffi csv-to-parquet-ffi`.
 
 ---
 
 ## 5. Test Coverage Summary
 
-| Test file | Focus |
-|---|---|
-| `test_buffer.odin` | Alignment, slice, resize, copy |
-| `test_bitmap.odin` | Bit ops, popcount edge cases |
-| `test_array.odin` | Primitives, slice, null handling |
-| `test_strings.odin` | String builder, offsets, unicode |
-| `test_schema.odin` | Schema construction, field lookup |
-| `test_compute.odin` | All serial compute kernels |
-| `test_compute_parallel.odin` | Parallel vs serial equivalence |
-| `test_ipc.odin` | IPC file roundtrip (i32, f64, strings, nulls, multi-batch) |
-
-**Gaps in test coverage:**
-
-- No dedicated tests for `table.odin` / `Chunked_Array`
-- No tests for `record_batch` edge cases beyond IPC usage
-- No unit tests for Parquet reader/writer (only `roundtrip_test.sh` integration)
-- No tests for large string/binary types, cast edge cases, or error paths
-- `tests_cpp/` requires built shared lib (not run by default `make test`)
+- **`tests/` (17 files, 224 tests):** `array_test.odin` (31), `bench_stats_test.odin` (6), `bitmap_test.odin` (12), `buffer_pool_test.odin` (8), `buffer_test.odin` (14), `compute_parallel_test.odin` (8), `compute_test.odin` (46), `core_regressions_test.odin` (21), `dict_test.odin` (6), `hardware_config_test.odin` (2), `ipc_test.odin` (9), `parquet_internals_test.odin` (19), `rle_test.odin` (6), `schema_test.odin` (8), `sleipnir_pipeline_test.odin` (7), `strings_test.odin` (16), `umbra_test.odin` (5).
+- **`specs/` (10 files, 22 ATDD specs):** 4-layer executable specifications split cleanly by domain into `driver_{core,ipc,parquet_csv}_test.odin` (Layer 3), `dsl_{core,ipc,parquet_csv}_test.odin` (Layer 2), and `workflows_spec_test.odin` / `ipc_matrix_spec_test.odin` / `properties_spec_test.odin` / `properties_compute_spec_test.odin` (Layer 1).
+- **`tests_cpp/` (14 tests):** `arrow_cpp_test.odin` (sum, min/max, filter, string scan, sliced arrays, `i64`/`u64`/`f32`/`bool`/`Binary`, IPC round-trip).
+- **`benchmarks/` (6 tests):** `test_compare_1v1.py`.
 
 ---
 
 ## 6. Data Flow Diagrams
 
-### 6.1 Array Construction
+### 6.1 Array Construction & Zero-Copy Lifecycle
 
 ```mermaid
 flowchart LR
     A[builder_make] --> B[builder_append / append_null]
     B --> C[builder_finish]
     C --> D[Array with owned Buffers]
-    D --> E{array consumers}
-    E --> F[compute_*]
+    D --> E{consumers}
+    E --> F[compute_* / *_parallel / pipeline_*]
     E --> G[record_batch_make]
-    E --> H[ipc_write_file]
+    E --> H[ipc_write_file / ipc_write_stream]
     D --> I[array_slice zero-copy view]
 ```
 
-### 6.2 CSV → Parquet (Native)
+### 6.2 CSV -> Parquet (Native)
 
 ```mermaid
 flowchart TD
-    CSV[CSV file] --> SR[csv_stream_open/read_chunk]
+    CSV[CSV file] --> SR[csv_stream_open / read_chunk]
     SR --> SB[string_builder per column]
     SB --> ARR[oa.Array columns]
     ARR --> PW[pw_write_row_group]
@@ -442,15 +303,16 @@ flowchart TD
     ARR --> FREE[array_free per chunk]
 ```
 
-### 6.3 IPC File Read (Zero-Copy)
+### 6.3 IPC File Read (Zero-Copy `mmap` + Refcounting)
 
 ```mermaid
 flowchart TD
     FILE[.arrow file] --> READ[ipc_read_file]
-    READ --> BACKING[_owned_backing block]
-    READ --> VIEWS[Buffer views into backing]
-    VIEWS --> RB[RecordBatch columns]
-    RB --> COMP[compute kernels no copy]
+    READ --> BACKING[Refcounted _IPC_Backing mmap]
+    READ --> VIEWS[Buffer views into mapping]
+    VIEWS --> RB[Record_Batch columns]
+    RB --> COMP[compute / selection / fusion no copy]
+    RB --> DROP[record_batch_free -> munmap when ref_count == 0]
 ```
 
 ---
@@ -459,137 +321,44 @@ flowchart TD
 
 | Area | Maturity | Comment |
 |---|---|---|
-| Core memory/bitmap | **Stable** | Well-tested, spec-aligned |
-| Primitive arrays/builders | **Stable** | Production-quality append path |
-| String/binary columns | **Good** | Builder; large offset variant incomplete |
-| Schema/RecordBatch | **Good** | IPC-integrated |
-| Table/chunked | **Basic** | Minimal API, weak validation |
-| Compute | **Good** | Broad coverage; missing sort |
-| IPC file | **Good** | Largest module; stream format missing |
-| IPC stream | **None** | — |
-| Parquet (native) | **Experimental** | Subset encoding; works for roundtrip |
-| Documentation | **Minimal** | README is one line; PLAN.md partially stale |
-| Packaging | **Ad hoc** | Relative imports `../../src`; no package entry |
+| Core memory, bitmap & `Buffer_Pool` | **Stable** | 64B aligned, size-bucketed pool with 128 MB LRU cap |
+| Primitive, string & large-varlen builders | **Stable** | Zero-copy `finish()`, lazy bitmaps, 2 GiB offset guards |
+| Schema, `Record_Batch`, `Table` / `Chunked_Array` | **Good** | Type/name validated; refcounted `_IPC_Backing` |
+| Encodings (`Umbra_Array`, `RLE_Array`, `Dict_Array`) | **Good** | Encoding-aware `O(runs)`/`O(n_dict)` & actor kernels |
+| Compute, selection, fusion & Sleipnir pipeline | **Strong** | Beats Arrow C++ `25.0.1` on all 26 1v1 ST + MT workloads |
+| Arrow IPC file & stream | **Good** | Vectored `writev`, `mmap` reads, bounds-hardened FlatBuffers |
+| Parquet (native CLI in `examples/`) | **Subset** | Uncompressed PLAIN + dict/RLE reads; full fidelity via FFI |
+| CI & testing | **Strong** | 224 unit + 22 ATDD + 14 FFI + 6 Python tests; Linux/macOS CI |
 
 ---
 
-## 8. Improvement Plan
+## 8. Roadmap & Completed Milestones
 
-Prioritized roadmap. Effort: **S** (<1 day), **M** (1–3 days), **L** (3+ days).
+### Completed from Original Roadmap
 
-### Phase A — Documentation & Developer Experience (Quick Wins)
+- ✅ **A1–A5 Documentation & DX:** `README.md`, `CHANGELOG.md`, `examples/quickstart/main.odin`, ownership docs.
+- ✅ **B1–B7 Core Completeness:** `compute_sort_indices`, `Large_String_Builder`/`Large_Binary_Builder`, `ipc_write_stream`/`ipc_read_stream`, `table_from_record_batches` schema validation, extended `compute_cast`, `Null_Type` support across arrays/compute/IPC, and `Dict_Array(T)`/`Str_Dict_Array` + `RLE_Array(T)` + `Umbra_Array`.
+- ✅ **C1–C6 Performance:** Target-scoped AVX2/SIMD across numeric widths, byte-coalesced null reductions, selectivity-hybrid `filter`, prefetched `take`, persistent `thread_pool.odin`, L1d `u16` morsels, `Buffer_Pool`, and `skadi/pipeline` Sleipnir actor execution.
+- ✅ **D1–D6 Testing & Quality:** `schema_test.odin`, `parquet_internals_test.odin`, IPC & CSV/Thrift fuzz/negative tests, GitHub Actions CI, and `mem.Tracking_Allocator` leak checks across `tests/` and `specs/`.
+- ✅ **E5 / F2 / F4 Tooling:** Broader physical types in native Parquet reader (`BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY`), `pkg-config` Arrow C++ resolution in `Makefile`, and portable `TEST_DATA` handling.
 
-| # | Item | Effort | Rationale |
-|---|---|---|---|
-| A1 | Expand `README.md` with install, `make test`, quick example | S | Onboarding; README currently empty |
-| A2 | Add `examples/quickstart.odin` (build array → compute → IPC) | S | Planned in PLAN.md, still missing |
-| A3 | Add `src/odinarrow.odin` re-export doc block listing public API | S | Single import surface for consumers |
-| A4 | Sync `PLAN.md` checkboxes with reality (Parquet exists, stream still open) | S | Avoid contributor confusion |
-| A5 | Document memory ownership rules (slice vs finish vs IPC read) in README | S | Subtle `allocator == nil` contract |
+### Remaining / Future Directions
 
-### Phase B — Core Library Completeness
-
-| # | Item | Effort | Rationale |
-|---|---|---|---|
-| B1 | **`sort_indices` kernel** | M | Last major PLAN.md compute gap; unlocks order-by workflows |
-| B2 | **Large string/binary builders** + array accessors (i64 offsets) | M | Types exist; builders/accessors missing |
-| B3 | **IPC stream** reader/writer | L | Needed for socket/pipe protocols, Flight prep |
-| B4 | **Schema validation** in `table_from_record_batches` | S | Compare field types/names across batches |
-| B5 | **`compute_cast` extensions** — bool↔int, string parse | M | Real-world ETL needs |
-| B6 | **Null_Type array** support in builders/compute | S | Edge type completeness |
-| B7 | **Dictionary encoding** (array + IPC) | L | Compression + categorical columns |
-| B8 | **Nested types** (List, Struct) | L | Arrow feature parity |
-
-### Phase C — Performance
-
-| # | Item | Effort | Rationale |
-|---|---|---|---|
-| C1 | SIMD null-aware sum/min/max | M | Scalar fallback dominates with nulls |
-| C2 | SIMD filter (compress selected indices) | M | Hot path in analytics |
-| C3 | Parallel `compute_take` / `compute_cast` | M | Symmetry with existing parallel ops |
-| C4 | String scan SIMD (length sum) | M | Benchmark shows gap vs C++ |
-| C5 | Consider `core:sync` thread pool | M | Avoid thread spawn per parallel call |
-| C6 | Profile-guided buffer reuse in builders | M | Reduce alloc pressure on rebuild |
-
-### Phase D — Testing & Quality
-
-| # | Item | Effort | Rationale |
-|---|---|---|---|
-| D1 | **`test_table.odin`** — chunked access, multi-batch | S | Untested module |
-| D2 | **`test_record_batch.odin`** — validation failures, column lookup | S | — |
-| D3 | **Parquet unit tests** (footer parse, single page, dict page) | M | Today only shell integration |
-| D4 | **Fuzz/property tests** for CSV reader + Thrift decoder | M | Binary formats need adversarial input |
-| D5 | **CI workflow** (GitHub Actions: `make test`, optional test-cpp) | S | Prevent regressions |
-| D6 | **Memory leak tests** under `-define:ODIN_TEST_TRACK_MEMORY` | S | Manual memory model |
-
-### Phase E — Parquet Subsystem
-
-| # | Item | Effort | Rationale |
-|---|---|---|---|
-| E1 | **SNAPPY/ZSTD compression** (even decode minimum) | L | Real Parquet files use compression |
-| E2 | **RLE / DELTA encodings** | L | Interop with external files |
-| E3 | **Shared `parquet/` package** extracted from programs | M | Reuse outside CLI tools |
-| E4 | **Schema evolution** across row groups | M | Production datasets vary |
-| E5 | **INT64/FLOAT/DOUBLE column support** in native writer | M | Reader partially supports; writer is string-only |
-| E6 | **Page checksum validation** | S | Data integrity |
-
-### Phase F — Build, Packaging, Interop
-
-| # | Item | Effort | Rationale |
-|---|---|---|---|
-| F1 | **`odin.json` / collection manifest** for package manager | S | Standard Odin project layout |
-| F2 | **Configurable Arrow path** (env var fallback if no PyArrow) | S | Makefile assumes PyArrow install |
-| F3 | **Arrow C Data Interface export** (C headers / `foreign` procs) | L | Zero interop with Python/R/R |
-| F4 | **Remove hard-coded `TEST_DATA` path** | S | Portability |
-| F5 | **Optional `lib/` vendoring** or build-from-source Arrow | L | Reproducible CI |
-
-### Phase G — Future / Out of Scope (Track Separately)
-
-- Apache Arrow Flight (gRPC transport)
-- Dataset API (partitioned scanning)
-- GPU / CUDA compute
-- Full Arrow Compute expression language
-- Full Parquet specification compliance
+- **Format & Type Extensions:** Temporal types (`Date32`/`Date64`, `Timestamp`), `Decimal128`, nested types (`List`, `Struct`), and IPC dictionary batches / LZ4-ZSTD body compression.
+- **C Data Interface Export/Import:** Formal `ArrowSchema` / `ArrowArray` export/import procs beyond raw buffer layout compatibility.
+- **Parquet Compression:** Optional Snappy/ZSTD page decompression in `examples/parquet_to_csv` (or promoting Parquet into a standalone library package).
+- **Out of Scope:** Arrow Flight RPC, partitioned Dataset/Filesystem engine, SQL parser, GPU/CUDA kernels.
 
 ---
 
-## 9. Recommended Implementation Order
-
-For maximum impact with minimal risk, tackle in this sequence:
-
-1. **A1–A5, D5** — docs + CI (low risk, immediate contributor value)
-2. **D1–D2, B4** — fill test gaps on existing stable code
-3. **B1, B2** — close documented API holes (sort, large strings)
-4. **C1–C2** — performance on null-aware paths (benchmark-visible)
-5. **E3, E5** — elevate Parquet from CLI hack to library module
-6. **B3, B7–B8** — larger Arrow parity features as needed
-
----
-
-## 10. Key Files Reference
+## 9. Key Files Reference
 
 | Concern | Primary files |
 |---|---|
-| Memory | `src/buffer.odin`, `src/bitmap.odin` |
-| Columns | `src/array.odin`, `src/builders.odin`, `src/var_length.odin` |
-| Types | `src/types.odin` |
-| Tabular | `src/schema.odin`, `src/record_batch.odin`, `src/table.odin` |
-| Analytics | `src/compute.odin`, `src/compute_simd.odin`, `src/compute_parallel.odin` |
-| Serialization | `src/ipc.odin`, `programs/*/parquet_*.odin`, `programs/*/thrift*.odin` |
-| Validation | `tests/*.odin`, `tests_cpp/test_arrow_cpp.odin`, `roundtrip_test.sh` |
-| Performance | `benchmarks/odin/bench_main.odin`, `benchmarks/compare.sh` |
-
----
-
-## 11. Risks & Technical Debt
-
-1. **Manual memory everywhere** — callers must pair `builder_finish`/`array_free`, `ipc_read_file`/`record_batch_free`, and never free sliced arrays' parent buffers early.
-2. **Relative imports in programs** (`import oa "../../src"`) — fragile if repackaged; no versioned library boundary.
-3. **PLAN.md drift** — claims Parquet out of scope, but substantial Parquet code exists; stream IPC still marked TODO while file IPC is done.
-4. **Parquet subset** — native tools may silently fail on compressed or richly encoded files from other producers.
-5. **Platform assumptions** — FFI gated on `ODIN_OS == .Linux`; no Windows/macOS story.
-6. **Single large IPC module** — `ipc.odin` at 1041 LOC mixes FBB, schema, batch, file I/O; harder to maintain/test in isolation.
-
----
-
-*This document should be updated when major phases land (especially B1 sort, B3 IPC stream, E3 Parquet package extraction).*
+| Memory & hardware | `skadi/buffer.odin`, `skadi/buffer_pool.odin`, `skadi/bitmap.odin`, `skadi/hardware_config.odin` |
+| Columns & encodings | `skadi/types.odin`, `skadi/array.odin`, `skadi/builders.odin`, `skadi/var_length.odin`, `skadi/umbra.odin`, `skadi/rle.odin`, `skadi/dict.odin` |
+| Tabular | `skadi/schema.odin`, `skadi/record_batch.odin`, `skadi/table.odin` |
+| Analytics & pipeline | `skadi/compute*.odin`, `skadi/compare.odin`, `skadi/selection.odin`, `skadi/fusion.odin`, `skadi/thread_pool.odin`, `skadi/pipeline/sleipnir_pipeline.odin` |
+| Serialization | `skadi/ipc.odin`, `skadi/ipc_mmap_*.odin`, `examples/csv_to_parquet/*.odin`, `examples/parquet_to_csv/*.odin` |
+| Validation | `tests/*_test.odin`, `specs/*_test.odin`, `tests_cpp/arrow_cpp_test.odin`, `roundtrip_test.sh` |
+| Performance | `benchmarks/compare_1v1.py`, `benchmarks/odin/`, `benchmarks/odin_c/`, `benchmarks/cpp/`, `benchmarks/RESULTS.md` |

@@ -2,348 +2,239 @@
 
 A review of Skadi with two goals: (1) harden the parts that parse untrusted
 input, and (2) lay out performance work — both Arrow-compatible and
-compatibility-breaking — that could make Skadi faster than Apache Arrow's
+compatibility-breaking — that makes Skadi faster than Apache Arrow's
 own C++ kernels on the operations that matter.
 
 Each item notes **impact**, **effort**, and whether it **breaks Arrow
-compatibility**. File/function references point at the code as it stands today.
+compatibility**. File/function references point at the current codebase in
+`skadi/` and `skadi/pipeline/`.
 
 ---
 
 ## A. Security — the IPC reader is an untrusted-input parser
 
-`ipc_read_file` / `ipc_read_stream` (`src/ipc.odin`) decode attacker-controllable
+`ipc_read_file` / `ipc_read_stream` (`skadi/ipc.odin`) decode attacker-controllable
 bytes: FlatBuffer table/vtable offsets, vector counts, and Arrow buffer
-offsets/lengths. The decoder currently **trusts** almost all of them. Odin's
-default bounds checks turn most of these into a panic (a denial-of-service)
-rather than memory corruption — but the moment the package is built with
-`-no-bounds-check` (tempting for a numeric library), several become genuine
-out-of-bounds reads. The string-offset case is unsafe even **with** bounds
-checks.
+offsets/lengths. Building with `-no-bounds-check` (or relying on multi-pointer
+string slicing) previously exposed out-of-bounds reads or arbitrary memory
+disclosure.
 
-### A1. Unvalidated FlatBuffer offsets → OOB read / panic — ✅ *done*
-The metadata read primitives (`_rd_i32/i16/i64/u32` + `_rd_u8`) are now
-bounds-safe: an out-of-range position (from attacker offsets, incl. a negative
-`vt = tbl - soff`) returns 0 instead of reading out of bounds — free, since they
-only touch the small FlatBuffer metadata. The remaining direct byte-indexes and
-slices in the schema/field/record-batch parsers are guarded by an overflow-safe
-`_fits(data, pos, size)` (written `pos <= len - size`), and the footer block
-bounds are tightened. *(Original finding below for context.)*
-`_rd_i32/_rd_i16/_rd_i64/_rd_u32` indexed `data[pos..]` with no check that `pos`
-is in range. Inputs flow straight from the file: `root_off := _rd_u32(meta, 0)`
-then `_rd_i32(meta, tbl)`; `vt := tbl - int(soff)` can go **negative**
-(`_ipc_decode_record_batch`, `_ipc_read_field`, footer parsing). A crafted
-root/soffset read out of bounds.
-*Fix:* a checked reader (`_rd_i32_safe(data, pos) -> (v, ok)`) that verifies
-`0 <= pos && pos+size <= len(data)`, threaded through every decode path; treat
-any failure as "malformed file → return ok=false".
+### A1. Unvalidated FlatBuffer offsets -> OOB read / panic — ✅ *done*
+The metadata read primitives (`_rd_i32/i16/i64/u32` + `_rd_u8`) are
+bounds-safe: an out-of-range position (from attacker offsets, including a
+negative `vt = tbl - soff`) returns 0 instead of reading out of bounds — free,
+since they only touch the small FlatBuffer metadata. Remaining direct byte
+indexes and slices in schema/field/record-batch parsers are guarded by an
+overflow-safe `_fits(data, pos, size)` (written `pos <= len - size`), and
+footer block bounds are tightened.
 
-### A2. Unvalidated vector counts → resource exhaustion / OOB — ✅ *done*
-`n_nodes` / `n_bufs` are now bounded against the remaining metadata
-(`nv + 4 + n_nodes*16 <= len(meta)`) before the loops, so a bogus count returns
-"malformed" instead of walking off the buffer. (The footer `n_blocks` and the
-fields-vector count are guarded similarly in their readers.)
+### A2. Unvalidated vector counts -> resource exhaustion / OOB — ✅ *done*
+`n_nodes` / `n_bufs` are bounded against remaining metadata
+(`nv + 4 + n_nodes*16 <= len(meta)`) before loops run, so bogus counts return
+"malformed" instead of walking off the buffer. Footer `n_blocks` and
+fields-vector counts are guarded similarly.
 
 ### A3. Integer overflow bypasses the body bounds check — ✅ *done*
 Size/offset arithmetic that could overflow (`(col_len+1)*off_w`, `n_nodes*16`,
-`n_fields*4`, block bounds) is rewritten in division/subtraction form
-(`count > (len - pos - 4)/stride`, `col_len >= size/width`) so a hostile
-count/length can't wrap past a bounds check. Added per-column buffer-size
-validation — validity bitmap covers `col_len` bits, fixed-width/bool data holds
-`col_len` elements, plus the A4 offset check — so `col_len` can't exceed its
-buffers and make a later `array_get` read out of the view. Both A1 and A3 are
-covered by `test_ipc_fuzz_no_crash` (1500 random mutations + every truncation
-length read without crashing or leaking).
+`n_fields*4`, block bounds) is rewritten in division/subtraction form so a
+hostile count/length cannot wrap past a bounds check. Per-column buffer-size
+validation ensures the validity bitmap covers `col_len` bits and fixed-width/bool
+data holds `col_len` elements. Covered by `test_ipc_fuzz_no_crash` in
+`tests/ipc_test.odin` (1,500 random mutations + every truncation length read
+without crashing or leaking).
 
-### A4. Offset buffers are never validated → memory disclosure — ✅ *done*
-The serious one: `array_get_string` slices `buffers[2].data[start:end]` through a
-**multi-pointer** (unchecked), so a crafted non-monotonic/out-of-range offset
-read arbitrary memory back as a string — exploitable even in a bounds-checked
-build. Fixed: `_ipc_offsets_valid` checks variable-length offset buffers
-(`offsets[0] == 0`, monotonic, `<= data_buffer_len`) before the column is
-returned, gated by `validate` on `ipc_read_file`/`ipc_read_stream` (default ON;
-`validate=false` for self-produced files). A crafted file with an OOB string
-offset is now rejected; valid PyArrow files still read. Covered by
-`test_ipc_rejects_bad_offsets`.
+### A4. Offset buffers are never validated -> memory disclosure — ✅ *done*
+`array_get_string` slices `buffers[2].data[start:end]` through a multi-pointer,
+so crafted non-monotonic or out-of-range offsets previously leaked arbitrary
+memory. Fixed: `_ipc_offsets_valid` verifies variable-length offset buffers
+(`offsets[0] == 0`, monotonic, `<= data_buffer_len`) before returning a column,
+gated by `validate` on `ipc_read_file`/`ipc_read_stream` (default ON;
+`validate=false` for self-produced files). Covered by `test_ipc_rejects_bad_offsets`.
 
-### A5. mmap lifetime / concurrent truncation → SIGBUS — ✅ *done*
-A memory-mapped file truncated by another process faults (SIGBUS) on access of
-the vanished pages. Fixed by adding `use_mmap` to `ipc_read_file`/`ipc_read_stream`
-(default true = the zero-copy fast path, assumes a stable file); `use_mmap=false`
-reads the file into a private heap buffer, so a concurrent truncation can't fault
-a mapping that no longer exists. The default is documented as assuming a stable
-file. (`test_ipc_copy_mode`.)
+### A5. `mmap` lifetime, truncation & overwrite safety — ✅ *done*
+A memory-mapped file truncated underneath by another process faults (`SIGBUS`)
+on access of vanished pages. `use_mmap` on `ipc_read_file`/`ipc_read_stream`
+defaults to `true` (zero-copy via POSIX `mmap` in `skadi/ipc_mmap_unix.odin`,
+assuming a stable file); `use_mmap=false` reads into a private heap buffer via
+`os.read_entire_file` so concurrent truncation cannot fault. Zero-copy batches
+share an atomically refcounted `Record_Batch._ipc_backing` (`_IPC_Backing` with
+`release`), unmapping only when the last batch is freed. On the write path,
+`ipc_write_file` / `ipc_write_stream` intentionally omit `.Trunc` on open so
+overwriting existing regular files reuses page-cache pages, using
+`_ipc_truncate_if_regular` to shrink shorter outputs without failing on pipes,
+sockets, or `/dev/null`, and chunking `writev` under `max(i32)` bytes for Darwin
+safety.
 
-> **Status: the whole A-section is done.** A2/A4 added a `validate` flag (default
-> on, additive, wire-format-unchanged); A1/A3 made the metadata reads bounds-safe
-> and the structural arithmetic overflow-safe (no OOB/panic on crafted or
-> truncated input, even under `-no-bounds-check`, verified by a structural fuzz
-> test); A5 added `use_mmap=false` for a truncation-safe copy read. The IPC reader
-> is now hardened against malformed and adversarially-mutated files.
+> **Status: the entire A-section is done.** The IPC reader and writer are
+> hardened against malformed, truncated, or adversarially mutated inputs and
+> verified by unit, fuzz, and ATDD matrix specs.
 
 ---
 
 ## B. Performance — compatible (keep full Arrow interop)
 
-### B1. Build with an actual SIMD target — *investigated: no win here (memory-bound)*
-Builds use `-o:speed` only (no `-microarch:`), so codegen targets the baseline
-x86-64 (SSE2, 128-bit); the 256-bit `#simd[4]f64` and the AVX2 min/max patterns
-in `compute_simd.odin` are split to 128-bit. The hypothesis was that
-`-microarch:native` would widen these for free.
-
-**Measured (i7-7700HQ, interleaved median-of-5, threaded kernels):**
-
-| kernel | baseline (SSE2) | `-microarch:native` (AVX2) |
-|---|---:|---:|
-| sum 10M f64   | ~3.13 ms | ~3.15 ms (flat) |
-| sum 10M i32   | ~2.0 ms  | **~4.9 ms (2.5× slower)** |
-| min+max 10M i32 | ~1.95 ms | ~1.93 ms (flat) |
-| filter 10M i32  | ~11.5 ms | ~11.5 ms (flat) |
-
-So at 10M elements the threaded reductions are **memory-bandwidth-bound**, not
-compute-bound — eight cores already saturate DRAM, so a wider vector adds
-nothing. Worse, AVX2 codegen for the i32→i64 widening sum is a regression
-(likely the sign-extend/accumulate sequence and/or AVX frequency licensing on
-this µarch). Enabling `-microarch:native` was therefore **reverted** — it
-regresses the suite and helps nothing measurable.
-
-**Revised conclusion:** SIMD width is not the lever for large-array aggregation;
-**reducing memory traffic is.** That redirects the effort to B2 (don't make extra
-passes for null handling), C3 (fuse pipelines so the data is read once), and C4
-(operate on compressed/encoded data so there are fewer bytes to move). A
-narrower, still-real B1 remains for the *compute-bound, in-cache* regime
-(small/medium arrays, or fused kernels that are no longer DRAM-limited): there,
-per-element SIMD width does matter, and **runtime CPU dispatch** (detect AVX2/
-AVX-512 once, pick the widest kernel) is worth it — but only after a kernel is
-demonstrably not bandwidth-limited. The i32-sum AVX2 regression should be fixed
-(rewrite `_sum_i32_simd` with explicit `#simd` widening) before any dispatch so
-the wide path is never slower than the narrow one.
+### B1. Target-scoped AVX2 + explicit `#simd` widening — ✅ *done*
+Early builds with `-microarch:native` regressed `sum_10m_i32` (`2.0 ms -> 4.9 ms`
+on i7-7700HQ) due to poor `i32 -> i64` sign-extend/accumulate codegen. Rewriting
+`_sum_sint_simd` and `_sum_uint_simd` in `skadi/compute_simd.odin` with explicit
+`#simd[4]T -> #simd[4]i64/u64` widening and scoping AVX2 to the vector loops via
+`@(enable_target_feature = _SIMD_TARGET_FEATURE)` (`"avx2"` on `amd64`, without
+`#force_inline`) eliminated the regression. On Ryzen 7 7735U (`-o:speed -microarch:native`),
+`sum_10m_i32` now runs in **2.45 ms ST / 1.45 ms MT** vs **3.29 ms** in Arrow
+C++ `25.0.1` (**1.34× ST / 2.26× MT**).
 
 ### B2. Null-aware bulk aggregation — ✅ *done*
-~~The null path of `_sum_typed`/`_min_typed`/`_max_typed` is a per-element
-`array_is_valid` branch.~~ Implemented: the null path now walks the validity
-bitmap a **byte at a time** — an all-valid byte (`0xFF`) is coalesced into a run
-and reduced with the SIMD kernel; all-null bytes are skipped; only mixed bytes
-fall back to bit testing (`_sum_run`/`_min_run`/`_max_run`/`_min_max_run` in
-`compute.odin`). Parallel chunk boundaries are rounded to multiples of 8 so the
-bulk path (which needs `offset % 8 == 0`) stays active inside every worker.
+The null path in `skadi/compute.odin` walks the validity bitmap a **byte at a
+time** (`_sum_typed`, `_min_typed`, `_max_typed`, `_min_max_typed`): an all-valid
+byte (`0xFF`) coalesces into a run and dispatches to the SIMD kernels
+(`_sum_run`, `_min_run`, `_max_run`, `_min_max_run`), all-null bytes (`0x00`) are
+skipped, and only mixed bytes bit-test elements. Parallel chunk boundaries align
+to multiples of 64 rows so the bulk path remains active in every worker.
 
-**Measured (i7-7700HQ):**
-- Null overhead on the 10M f64 sum dropped to **+9%** (3.18 → 3.48 ms) vs Arrow
-  C++'s **+42%** (6.01 → 8.54 ms) and PyArrow's +21% — so the threaded null-sum
-  is ~2.4× faster than both.
-- **Cache-resident** null-sum (1.6 MB, tight loop): **245 µs → 75 µs/call (3.3×)**.
+**Measured:**
+- Cache-resident null-sum (i7-7700HQ, 1.6 MB): **245 us -> 75 us/call (3.3×)**.
+- `sum_10m_f64_nulls` (Ryzen 7 7735U, 1% nulls): **5.22 ms ST / 2.55 ms MT** vs
+  **8.20 ms** in Arrow C++ `25.0.1` (**1.57× ST / 3.22× MT**, `0` allocs).
 
-The end-to-end gain at 10M is "only" ~13% because that case is DRAM-bound (the
-B1 lesson); the 3.3× shows up once the data fits in cache and the per-element
-branch is no longer hidden behind memory latency. **Next:** extend the same
-byte-coalescing to `compute_mean` is automatic (it calls sum), but the *mask*
-kernels (filter/take) still branch per element — see B4. A future refinement is
-moving from byte (8-wide) to `u64` word (64-wide) coalescing for even longer
-all-valid runs.
+### B3. Widen SIMD coverage — ✅ *done*
+`skadi/compute_simd.odin` now provides target-scoped SIMD kernels across all
+numeric widths:
+- `_sum_f64_simd` (4-way `#simd[4]f64`) and `_sum_f32_simd` (`#simd[4]f32 -> #simd[4]f64`).
+- `_sum_sint_simd` and `_sum_uint_simd` covering `i8`/`i16`/`i32` and `u8`/`u16`/`u32`.
+- 4-way unrolled `f64` accumulators for `i64`/`u64` (avoiding FP chain stalls).
+- Generic `_min_typed_simd`, `_max_typed_simd`, and `_min_max_typed_simd`
+  (`#simd[K]T`, `K :: 32 / size_of(T)`) across every integer and float type.
 
-### B3. Widen SIMD coverage — *medium*
-Only `f64` and `i32` have hand-written SIMD; `f32`, `i64`, `i16`, and the
-unsigned types fall back to scalar loops that may or may not auto-vectorise.
-`f32` sum in particular wants an 8-wide `#simd[8]f32`. Generic-over-`T` SIMD
-helpers would cover the lot.
+### B4. Selectivity-hybrid `filter` & prefetched `take` — ✅ *done*
+- **`compute_filter` (`skadi/compute.odin`)** uses a selectivity-hybrid strategy on
+  unaligned/null-free masks: sparse masks (`out_count * 4 < n`) run a 64-bit
+  **`tzcnt`** loop visiting only set bits (`filter_10m_i32_sparse`: **0.45 ms ST**
+  vs **1.49 ms** Arrow C++ `25.0.1`, **3.28×**); dense masks walk bytes via the
+  256-entry `_BYTE_INDICES_LUT` (`filter_10m_i32` 50% pass: **5.25 ms ST /
+  2.47 ms MT** vs **40.02 ms** Arrow C++, **7.63× ST / 16.17× MT**).
+  `compute_filter_parallel` handles both fixed-width and variable-length
+  (`String_Type`/`Binary_Type`, **0.65 ms MT** vs **4.82 ms** C++, **7.44×**).
+- **`compute_take` & `compute_take_parallel`** use a validity-free fast path with
+  explicit software prefetching (`intrinsics.prefetch_read_data` at distance 12)
+  and unconditional release-mode bounds enforcement (`take_1m_i32`: **7.36 ms ST /
+  2.01 ms MT** vs **9.02 ms** Arrow C++, **1.22× ST / 4.49× MT**).
 
-### B4. SIMD filter / take — *high*
-`_filter_typed` is byte-at-a-time bit testing (`compute.odin`). Replace with a
-vectorised compress: AVX-512 `vpcompressd`, or on AVX2 a per-mask-byte shuffle
-table (256-entry LUT) to pack matching lanes. `compute_take` likewise wants a
-SIMD gather (`vpgatherdd`). These are the kernels where vectorised engines pull
-furthest ahead of scalar code.
+### B5. Persistent thread pool, `Hardware_Config` & Sleipnir actors — ✅ *done*
+- **`skadi/thread_pool.odin`:** Process-lifetime parked worker pool woken via
+  condition-variable broadcast using raw heap allocations so the singleton never
+  trips test tracking allocators (`PARALLEL_MIN_LENGTH = 262_144`).
+- **`skadi/hardware_config.odin`:** Runtime sysfs discovery (up to 1,024 CPUs +
+  `core:sys/info` fallback) of `L1d`/`L2`/`L3` cache sizes with lock-free atomic
+  fast-path reads for adaptive morsel sizing.
+- **`skadi/pipeline/sleipnir_pipeline.odin` (`deps/sleipnir/actor/`):** Lock-free
+  work-stealing actors using pooled MPSC work batches (`Envelope_Pool`) and
+  per-core `Sharded_SPSC_Mailbox` coordination for zero-alloc parallel reductions,
+  dictionary histograms, and race-free MSB-bucket sorting.
 
-### B5. Reuse a persistent thread pool — ✅ *done*
-~~`compute_*_parallel` spawns + joins + destroys threads every invocation.~~
-Implemented (`thread_pool.odin`): a process-lifetime pool of parked workers
-woken by a condition-variable broadcast (one partition per worker, barrier on
-completion); a submit mutex serialises whole jobs so concurrent callers (the
-multi-threaded test runner) take the pool in turn; pool allocations use the raw
-heap so the singleton never trips a tracking allocator.
-
-**Measured:** per-call parallel overhead **95 µs → 60 µs (~36%)** on a 300 K
-sum loop. But a second measurement reset expectations: parallel only beats
-serial **above ~256 K** (256 K → 1.45×, 512 K → 1.95×; 32–128 K parallel is
-*slower*). So at the margin the cost is **thread wakeup + barrier latency**
-(~15–25 µs to fan out to 8 cores and rejoin), not spawn — which means
-`PARALLEL_MIN_LENGTH` (262 144) is already well-placed and was **kept**. The pool
-still wins for workloads that make many parallel calls (the spawn churn is gone)
-and is the right foundation, but it does *not* let the cutoff drop. Headline 10M
-numbers are unchanged (work ≫ overhead there). Same recurring lesson as B1/B2:
-the bottleneck is rarely the thing you'd guess — measure it.
-
-### B6. Inlining + prefetch in scans — *low/medium*
-`builder_append` is a normal (non-`#force_inline`) proc on the hot construction
-path; mark it (and the string append) `#force_inline`. For large sequential
-scans (`string_scan`, gather) a software prefetch of the offset/value stream a
-few iterations ahead hides memory latency.
+### B6. Inlining, prefetch & vectored IPC — ✅ *done*
+- Hot builder paths (`builder_append`, `builder_append_null`,
+  `string_builder_append`, `string_builder_reserve_data`) are `#force_inline` on
+  raw `[^]T` / `[^]u8` buffers with uninitialized data allocations and
+  `Buffer_Pool` recycling (`array_build_10m_i32`: **13.78 ms** vs **33.24 ms**,
+  **2.41×**; `string_build_1m`: **3.49 ms** vs **4.66 ms**, **1.34×**).
+- `compute_take` / `selection_take` use `intrinsics.prefetch_read_data`.
+- `ipc_write_file` / `ipc_write_stream` use scatter-gather `writev`
+  (`_IPC_Vectored_Writer`), cutting `ipc_write_10m_i32` to **12.53 ms** vs
+  **36.42 ms** (**2.91×**) and `ipc_roundtrip_10m_i32` to **13.07 ms** vs
+  **46.97 ms** (**3.59×**, `0.0 MB` vs `38.1 MB` payload copies).
 
 ---
 
 ## C. Performance — at the expense of compatibility (the path to "superior")
 
-These break the Arrow in-memory/wire contract, so they'd live behind a
-conversion boundary (convert to/from Arrow at IPC edges) — but they're how
-DuckDB / Velox / Umbra beat textbook Arrow kernels.
+These live outside the standard Arrow buffer layout or behind explicit boundaries,
+using DuckDB / Velox / Umbra techniques to move fewer bytes and avoid pointer
+chasing.
 
 ### C1. German-style ("Umbra") short-string inlining — ✅ *done*
-Implemented (`umbra.odin`): a 16-byte slot `{ length:u32, data:[12]u8 }` —
-inline for length ≤ 12, 4-byte prefix + side-buffer offset otherwise — with a
-builder, zero-copy accessor, a prefix-fast-path `umbra_compare`, `umbra_count_eq`,
-and `umbra_sort_indices`. The prefix lives in the slot, so comparisons resolve in
-registers without chasing into the data buffer.
+Implemented (`skadi/umbra.odin`): fixed 16-byte `Umbra_String` slot
+`{ length: u32, data: [12]u8 }` — inline for `length <= 12`, 4-byte prefix +
+`i64` side-buffer offset otherwise — with `Umbra_Builder`, `umbra_get`,
+`umbra_compare`, `umbra_count_eq`, 4-pass LSD prefix-radix + merge-sort
+`umbra_sort_indices`, and `umbra_sort_range_into` for parallel buckets.
 
-**Measured:** sorting 1M ~20-char strings — Umbra **272 ms** vs Skadi's
-Arrow-layout sort **518 ms (1.9×)** and PyArrow's `pc.sort_indices` **415 ms
-(1.5×)**, identical ordering. Cost: ~30% more memory (fixed 16-byte slots). A
-smaller-but-real win than C4 because the data access during a sort, while
-random, still hits a warm-ish buffer; the prefix mainly saves the compare itself.
+**Measured (100K random strings, `umbra_sort_100k_str` vs Arrow C++ `25.0.1`):**
+- `umbra_sort_indices` (ST): **2.58 ms** vs **9.80 ms** C++ (**3.80×**).
+- `pipeline_umbra_sort_indices` (Sleipnir actor MT): **0.27 ms** (**36.40×** vs
+  C++, **9.57×** MT scale).
 
-*Still open under C1:* SIMD/bulk equality + range filters over the prefix
-column, join-key hashing on the inline bytes, and a transcoder to/from Arrow Utf8
-at the IPC boundary.
+*Still open under C1:* SIMD prefix range filters and join-key hashing on inline slots.
 
-### C2. Selection vectors instead of materialising filter/take — ✅ *done*
-Implemented (`selection.odin`): `Selection` (surviving row indices),
-`compute_select(mask)`, `compute_sum_selection` (aggregate through a selection),
-`selection_take` (materialise one column lazily), and `record_batch_take` (the
-eager batch materialisation, for comparison).
+### C2. Selection vectors & L1d `u16` morsels — ✅ *done*
+Implemented (`skadi/selection.odin`, `skadi/compare.odin`): `Selection`
+(surviving `i32` row indices), `compute_select`, comptime-`$OP`-monomorphised
+`compute_compare*`, `compute_select_compare*`, `selection_refine_compare*`,
+`compute_sum_selection`, `compute_min_max_selection`, `selection_take` (`Int8..64`,
+`UInt8..64`, `Float32/64`, `String_Type`), and `record_batch_take`.
 
-**Measured:** filtering a 4-column batch (10% pass) and summing 2 columns —
-**13.2 ms** keeping a selection and gathering only those 2 columns, vs **43.7 ms**
-materialising the whole filtered batch first (**3.3×**). As predicted, the win is
-multi-column: the selection never copies the 2 unused columns or allocates a
-batch. (A single filter→aggregate is a wash — that case is better served by C3.)
+For L1d cache residency, `morsel_select_compare_f64_u16` and
+`morsel_refine_compare_f64_u16` keep surviving row indices in `u16` sub-morsels
+(`MORSEL_MAX_ROWS`), feeding `compute_sel_2pred_sum`,
+`compute_sel_2pred_sum_parallel`, and Sleipnir actor `pipeline_sel_2pred_sum_f64`.
 
-**Chained predicates — ✅ done** (`compare.odin`): `compute_compare`,
-`compute_select_compare` (first predicate → selection, single pass) and
-`selection_refine_compare` (AND another predicate, evaluated only at the
-surviving rows). `WHERE c0..c3 > 50 SUM(pay)` on 10M: **2.24×** (89.5 vs
-200.8 ms) at 4 predicates — but a *2-predicate* query is a wash (first 10M scan
-dominates, and PyArrow's SIMD compares are faster there). The win **grows with
-the number of conjuncts**, since materialise-between re-copies every carried
-column per predicate while the selection just shrinks an index list.
+**Measured (`sel_2pred_sum_10m_f64` vs Arrow C++ `25.0.1`, `0` vs `4` allocs / `25.4 MB`):**
+- Single-threaded: **13.93 ms** vs **21.92 ms** C++ (**1.57×**).
+- Sleipnir actor (`pipeline_sel_2pred_sum_f64`): **5.76 ms** (**3.80×** vs C++).
+- Thread-pool parallel (`compute_sel_2pred_sum_parallel`): **4.38 ms** (**5.00×** vs C++).
 
-**Vectorisable compares — ✅ done.** The comparison is now monomorphised on the
-operator (comptime `$OP`), so the inner loop is a single branchless vectorisable
-compare instead of a runtime `op` switch. The 2-predicate chained query went
-33 → **21 ms, now faster than PyArrow** (25.1 ms) where it had been losing.
-(`-microarch:native` regresses it — B1 again — so baseline stands.)
+*Still open:* `selection_take` support for `Bool_Type`, `Binary_Type`, and `Large_*` types.
 
-**Compress — ✅ done.** `compute_select` now picks a strategy by selectivity (it
-already counts survivors): sparse uses a 64-bit-word **tzcnt** loop that visits
-only the set bits; dense uses the byte-at-a-time loop. 10M mask: 1% pass **4.2×**
-(841→200 µs), 10% **1.8×**, 50% unchanged. (A pure tzcnt compress regressed dense
-~1.5× — the `bits &= bits-1` chain serialises — hence the selectivity hybrid.)
+### C3. Operator fusion & Sleipnir super-morsels — ✅ *done (hand-fused + comptime monomorphisation)*
+- **Single-pass mask fusion (`skadi/compute_fused.odin`):** `compute_sum_where`
+  (**6.17 ms ST** vs **39.02 ms** Arrow C++ `25.0.1`, **6.32×**, `0` vs `38.1 MB`
+  allocs), `compute_min_where`, `compute_max_where`, `compute_min_max_where`,
+  `compute_mean_where`, `compute_count_where`.
+- **Compile-time `$OP` fusion (`skadi/fusion.odin`, `skadi/compare.odin`, `skadi/pipeline/sleipnir_pipeline.odin`):**
+  `compute_agg_where_compare` computes `sum, count, min, max` in one pass under
+  a predicate with `0` mask/intermediate allocations (**10.32 ms ST** vs **39.39 ms**
+  C++, **3.82×**). In parallel, `pipeline_agg_where_f64` drives 4-way unrolled
+  `morsel_agg_f64_u16` across Sleipnir super-morsels in **4.46 ms** (**8.82×**
+  vs C++, `0` allocs).
 
-`compute_filter` got the same hybrid (gathering values instead of indices):
-10M i32, 1% pass **2.26×** (2129→943 µs), 10% 1.14×, 50% unchanged — a smaller
-win than select since filter also pays the scattered value gather.
+*Still open:* multi-predicate + heterogeneous predicate/value column fusion inside `fusion.odin` and a declarative expression planner.
 
-`compute_select_compare` (predicate→selection) now routes through the vectorised
-compare → temp bitmap → the same selectivity-aware compress, dropping the
-per-element `[dynamic]` append (whose reallocations dominated when many rows
-passed): 10M f64 50% pass **2.25×** (31.6→14.0 ms). This cascaded into the
-4-predicate chained query: **89.5→54.8 ms** (now **3.66×** over materialise).
+### C4. Encoding-aware kernels (RLE & dictionary) — ✅ *done*
+- **Run-end encoding (`skadi/rle.odin`):** `RLE_Array(T)` (with `run_ends`,
+  `values`, and optional `run_valid` bitmask for null runs), coalescing
+  `RLE_Builder(T)` (`rle_append`, `rle_append_null`, `NaN` run coalescing),
+  `rle_encode`/`rle_decode`, `rle_is_null`, `rle_get`/`rle_try_get`, and
+  `O(runs)` `rle_sum` / `rle_min_max`.
+  - **Measured (`rle_sum_10m_f64`, 10K runs):** **0.01 ms (~12 us)** vs **6.43 ms**
+    Arrow C++ `25.0.1` (**532.62×**, ~117 KB vs 76.3 MB, `0` allocs).
+- **Dictionary encoding (`skadi/dict.odin` + `skadi/pipeline/sleipnir_pipeline.odin`):**
+  `Str_Dict_Array` and generic `Dict_Array(T)` (`DICT_NULL_CODE :: -1` for nulls,
+  `NaN`-deduplicating `dict_encode`, `str_dict_slice`/`dict_slice`, `O(n_dict)`
+  `dict_min_max`, `dict_sum`, `*_value_counts`, `*_group_sum`), plus zero-alloc
+  Sleipnir actor variants (`pipeline_dict_value_counts`, `pipeline_dict_group_sum`,
+  `pipeline_dict_sum`).
+  - **Measured (`dict_vc_1m_str`, 100 distinct):** **0.79 ms ST** (**7.73×** vs
+    Arrow C++ `6.09 ms`) and **0.16 ms** Sleipnir actor (**37.95×** vs C++).
 
-*Still open:* selection-aware take for all types.
-
-### C3. Operator fusion — ✅ *hand-fused kernels done* (general codegen still open)
-Implemented (`compute_fused.odin`): `compute_sum_where(values, mask)` and
-`compute_count_where` — filter+aggregate in a single pass with no intermediate
-array. **Measured:** `sum_where` **7.6 ms** vs `filter` then `sum` **34.2 ms
-(4.5×)**, and **5.5×** faster than PyArrow's `sum(filter(...))` (41.6 ms) — the
-intermediate array's allocation, dense copy, and re-read are all eliminated.
-
-**General fusion — ✅ done** (`fusion.odin`): `compute_agg_where_compare`
-computes sum/count/min/max in one pass under a predicate, no mask or filtered
-array. The "codegen" is Odin's **monomorphisation** — one generic driver
-parameterised on the value type and a comptime `$OP` is specialised by the
-compiler into a tight fused kernel per combination, which is the compile-time
-equivalent of a query engine generating the loop at runtime.
-`SELECT sum,count,min,max WHERE pred>50` on 10M: fused **16.8 ms** vs unfused
-27.6 ms (1.64×) and PyArrow 70.2 ms (**4.2×**).
-
-*Still open:* fusing multi-predicate conjunctions and predicate-on-a-different-
-type-than-values into the same driver (currently same-type), and a small
-expression layer that builds these fused plans from a query description.
-
-### C4. Encoding-aware kernels (dictionary / RLE) — ✅ *run-end encoding done*
-Run aggregates over the **encoded** form instead of decoding first. Implemented
-(`rle.odin`): `RLE_Array(T)` (run_ends + per-run values), a coalescing builder,
-`rle_encode`/`rle_decode`, and `rle_sum`/`rle_min_max` that run in **O(runs)**.
-
-**Measured (10M f64, 10K runs, single-thread):** `rle_sum` 11.8 µs vs Skadi's
-plain sum 4541 µs (**385×**) and PyArrow's `pc.sum` 6045 µs (**510×**), on
-**667× less memory** (117 KB vs 78 MB). PyArrow has **no** REE sum kernel at all
-(`pc.sum` rejects `run_end_encoded`), so this is something the reference cannot
-do — the clearest "superior to the original" win so far, and a direct payoff of
-the move-fewer-bytes thesis.
-
-**Dictionary encoding — ✅ done** (`dict.odin`): `Str_Dict_Array` (a string
-dictionary + i32 codes), `str_dict_value_counts` (an integer histogram over the
-codes) and `str_dict_group_sum` (grouped aggregation). `value_counts` on 10M
-strings / 100 distinct: **6.6 ms** vs PyArrow **190 ms** plain (29×) and **62.6
-ms** even on a dictionary array (9.5×) — the codes are the group ids, so there is
-no string hashing. Encode is a one-time 196 ms, amortised when the column arrives
-encoded from storage.
-
-**Generic numeric dictionary — ✅ done** (`Dict_Array(T)` in `dict.odin`):
-`dict_value_counts`, `dict_min_max`, `dict_sum`, encode/decode. `dict_min_max`
-is **~126,000×** (O(n_dict): the column min/max is the tiny dictionary's). Honest
-counter: `dict_sum` is 0.80× — the histogram increment is compute-bound and loses
-to SIMD sum despite the narrower codes.
-
-*Still open under C4:* REE with nulls (run-level validity) and multi-key group-by.
+*Still open under C4:* multi-key hash group-by.
 
 ### C5. Drop the optional validity bitmap for declared non-null columns — *medium*
-Arrow always allows a validity buffer. A type-system flag for "non-nullable"
-columns lets every kernel skip null handling entirely (no B2 needed there) and
-lets the builder skip bitmap bookkeeping. Minor layout divergence, broad small
-wins.
+Runtime null checks are already skipped whenever `arr.buffers[0].data == nil`,
+so kernels pay zero overhead on non-null arrays today; a schema-enforced
+non-nullable static invariant could further simplify builder dispatch.
 
 ### C6. Native, FlatBuffer-free container format — *medium*
-The hand-rolled FlatBuffer encode/decode has real per-message cost and is the
-A-section attack surface. A bespoke, directly-mmappable layout (fixed-offset
-header, no offset-chasing metadata) would read/write faster and validate
-trivially — at the price of needing a converter for Arrow interop. Keep Arrow
-IPC as the interchange format; use the native one for Skadi-to-Skadi.
+Keep Arrow IPC as the interchange wire format; a fixed-offset native Skadi-to-Skadi
+format remains a future option if FlatBuffers encoding overhead ever dominates
+small-batch workloads.
 
 ---
 
-## Suggested ordering
+## Summary Status
 
-Updated after the B1 and B2 measurements. B1 showed large-array aggregation is
-bandwidth-bound (SIMD width is not the lever); B2 confirmed the flip side —
-removing per-element work is a 3.3× win once a kernel is cache-resident rather
-than DRAM-bound:
+- ✅ **A1–A5** (IPC bounds, integer overflow, offset validation, `mmap`/overwrite/Darwin safety) — **done**
+- ✅ **B1–B6** (target-scoped AVX2/SIMD across numeric widths, byte-coalesced null reductions, `tzcnt`/LUT filter, prefetched take, persistent thread pool + `Hardware_Config` + Sleipnir actors, `#force_inline` builders + vectored `writev`) — **done**
+- ✅ **C1–C4** (Umbra strings, `Selection` + L1d `u16` morsels, operator fusion + super-morsels, RLE with null runs + numeric/string dictionary + actor histograms) — **done**
 
-- ✅ **B2** (null-aware aggregation) — done; +9% null overhead, 3.3× in-cache.
-- ✅ **B5** (persistent thread pool) — done; ~36% less per-call overhead (the
-  cutoff stays — wakeup latency, not spawn, sets the margin).
-1. **A1–A4** (reader hardening behind a `trusted` flag) — correctness/safety
-   before any of this is pointed at real files.
-2. **B4** (SIMD filter/take), **B3** (wider SIMD coverage) — filter/take are not
-   purely bandwidth-bound (branchy / scatter-gather), so vectorising them should
-   pay off where the reductions didn't.
-3. **C-items** — the structural changes that cut memory traffic and move
-   Skadi from "matches Arrow C++" to "beats it."
-   - ✅ **C4 (run-end encoding)** — 385–510× on runny data; PyArrow can't do it.
-   - ✅ **C4 (dictionary)** — value_counts 29× / 9.5× vs PyArrow (integer histogram).
-   - ✅ **C1 (Umbra strings)** — 1.9× on string sort vs the Arrow layout.
-   - ✅ **C3 (fusion)** — sum_where 4.5× over filter+sum, 5.5× over PyArrow.
-   - ✅ **C2 (selection vectors)** — 3.3× on multi-column filter+aggregate.
-   The structural C-items are in. What remains are *extensions* (generic numeric
-   dictionary, REE/selection for all types, and the hard one — **general operator
-   fusion via codegen** rather than hand-written `*_where` kernels).
-   These attacked the bottleneck every experiment surfaced: bytes moved, not width.
-4. **B1, narrowed** — runtime CPU dispatch only for kernels proven to be
-   compute-bound (small/in-cache or post-fusion), and only after fixing the
-   `_sum_i32_simd` AVX2 regression so a wide path never loses to the narrow one.
-
-> Recurring theme across B1/B2/B5: the headline 10M kernels are **memory-bound**,
-> so micro-optimisations (vector width, branch removal, spawn cost) only show up
-> once the data is cache-resident or the call is small. The durable wins are the
-> ones that **move fewer bytes** (C2/C3/C4), not the ones that compute faster.
+**Result:** Across all **26 canonical 1v1 workloads** in `benchmarks/RESULTS.md`,
+Skadi beats Apache Arrow C++ `25.0.1` (`-O3`) single-threaded (`1.05×`–`532.62×`)
+and scales to `2.26×`–`37.95×` with thread pools and Sleipnir actors.

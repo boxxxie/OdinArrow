@@ -29,25 +29,35 @@ Arrow project has accomplished.
   encoding), and [`Dict_Array(T)` / `Str_Dict_Array`](skadi/dict.odin) (dictionary
   encoding).
 - **Builders** — raw-buffer, zero-copy `finish()`, pre-reserved capacity
-  (`string_builder_reserve_data`), lazy validity bitmaps, plus a reusable
-  [`Buffer_Pool`](skadi/buffer_pool.odin) that recycles freed blocks.
+  (`string_builder_reserve_data`), lazy validity bitmaps, release-mode 2 GiB `i32`
+  offset overflow checks, plus a reusable [`Buffer_Pool`](skadi/buffer_pool.odin)
+  with power-of-two/256 KB bucketing, 25% large-block slack reuse, hit/miss
+  telemetry, and a 128 MB LRU cap for `>4 MB` blocks.
 - **Compute kernels, fusion & selection vectors** — `sum`, `min`/`max`, `mean`,
-  `count`, `filter`, `take`, `cast`, element-wise arithmetic, and `sort_indices`
-  (packed `u32` LSD radix sort for integers, prefix radix + tie-break merge
-  sort for strings/Umbra); fused operators (`compute_sum_where`,
-  `compute_agg_where_compare`) and lazy [`Selection`](skadi/selection.odin)
-  vectors with L1d-resident `u16` morsel kernels
-  ([`skadi/hardware_config.odin`](skadi/hardware_config.odin)).
+  `count`, selectivity-hybrid `filter` (256-entry byte-mask LUT / `tzcnt`),
+  software-prefetched `take` (with release-mode bounds guards), `cast`,
+  element-wise arithmetic, comparisons, and `sort_indices` (packed `u32` LSD
+  radix sort for integers, prefix radix + tie-break merge sort for
+  strings/Umbra); target-scoped AVX2/SIMD reductions across numeric widths;
+  fused operators (`compute_sum_where`, `compute_agg_where_compare`) and lazy
+  [`Selection`](skadi/selection.odin) vectors with L1d-resident `u16` morsel
+  kernels ([`skadi/hardware_config.odin`](skadi/hardware_config.odin)).
 - **Parallel & Sleipnir actor execution** — work-stealing `*_parallel` kernels
-  ([`skadi/thread_pool.odin`](skadi/thread_pool.odin)) and the cache-resident
-  **Sleipnir actor & sharded SPSC morsel pipeline**
+  ([`skadi/thread_pool.odin`](skadi/thread_pool.odin)), including
+  `compute_filter_parallel` (fixed-width + variable-length strings/binary),
+  `compute_take_parallel`, and `compute_sel_2pred_sum_parallel`, plus the
+  cache-resident **Sleipnir actor & sharded SPSC morsel pipeline**
   ([`skadi/pipeline/sleipnir_pipeline.odin`](skadi/pipeline/sleipnir_pipeline.odin))
-  for super-morsel fused aggregations, dictionary histograms, and MSB-bucket
-  parallel radix/string/Umbra sorting.
+  for super-morsel fused aggregations (`pipeline_agg_where_f64`,
+  `pipeline_sel_2pred_sum_f64`), dictionary histograms (`pipeline_dict_value_counts`,
+  `pipeline_dict_group_sum`, `pipeline_dict_sum`), and MSB-bucket parallel
+  radix/string/Umbra sorting (`pipeline_sort_indices`, `pipeline_umbra_sort_indices`).
 - **Arrow IPC** — file (random batch access) and stream (sequential) formats,
-  **vectored `writev` zero-copy writes**, **memory-mapped (`mmap`) zero-copy
-  reads**, hand-rolled FlatBuffers encoder/decoder, bidirectional PyArrow and
-  Arrow C++ interop.
+  **vectored `writev` zero-copy writes** (with Darwin `max(i32)` chunking and
+  overwrite-safe regular-file truncation), **memory-mapped (`mmap`) zero-copy
+  reads** (`use_mmap=false` copy fallback), refcounted `Record_Batch._ipc_backing`
+  lifetime, FlatBuffers/offset validation (`validate=true`), hand-rolled
+  FlatBuffers encoder/decoder, and bidirectional PyArrow / Arrow C++ interop.
 
 ## Quick example
 
@@ -167,9 +177,11 @@ Reproduce:
 Requires the [Odin compiler](https://odin-lang.org/docs/install/).
 
 ```sh
-make test                              # unit tests + ATDD specs + benchmark comparator tests
-make check                             # strict static analysis across all packages (-vet -strict-style -disallow-do -warnings-as-errors)
-make test-cpp                          # Arrow C++ FFI layout compatibility tests (requires Arrow C++)
+make test                              # 224 unit/regression tests + 22 ATDD specs + 6 Python comparator tests
+make test-specs                        # 22 4-layer ATDD specs + 6 Python comparator tests
+make check                             # strict static analysis across all 13 Odin targets (-vet -strict-style -disallow-do -warnings-as-errors)
+make test-cpp                          # 14 Arrow C++ FFI layout & IPC parity tests (requires Arrow C++)
+make parquet-odin csv-to-parquet-odin  # build native streaming Parquet <-> CSV CLI tools into bin/
 odin run examples/quickstart -out:/tmp/quickstart   # run the runnable demo
 odin build skadi -build-mode:static -out:libskadi.a       # build the package
 ```
@@ -216,8 +228,11 @@ package (either via a relative path or `-collection:skadi=...`). A complete, run
 | IPC file & stream formats (pyarrow-compatible)                       | ✅           |
 | Vectored `writev` zero-copy IPC writes + `mmap` zero-copy reads      | ✅           |
 | Reusable buffer-pool allocator                                       | ✅           |
+| 4-layer ATDD specs & property suite (`specs/`, `make test-specs`)    | ✅           |
+| GitHub Actions CI (Linux + macOS, PyArrow + Arrow C++ FFI)           | ✅           |
+| Streaming CSV ↔ Parquet subset CLI tools (`examples/`)               | ✅ (examples) |
 | Statistical 1v1 JSONL benchmark suite (`make bench-1v1`)             | ✅           |
-| Parquet, Flight RPC, GPU kernels                                     | out of scope |
+| Full Parquet spec, Flight RPC, GPU kernels                           | out of scope |
 
 
 ## Project layout
@@ -229,9 +244,11 @@ skadi/                   the skadi package (buffers, types, arrays, builders,
 skadi/pipeline/          Sleipnir actor & sharded SPSC morsel pipeline
                          (sleipnir_pipeline.odin)
 deps/sleipnir/actor/     Sleipnir lock-free actor & SPSC/MPSC runtime
-tests/                   the unit & regression test suite (*_test.odin, run with `make test`)
-specs/                   4-layer ATDD executable specifications (`make test-specs` / `make test`)
-tests_cpp/               Arrow C++ FFI layout compatibility tests (`make test-cpp`)
+docs/                    Cursor.md, Endeavor.md, Review.md — architecture review,
+                         security/performance notes, and Arrow capability gap matrix
+tests/                   unit & regression test suite (224 tests, `make test`)
+specs/                   4-layer ATDD executable specifications (22 specs, `make test-specs`)
+tests_cpp/               Arrow C++ FFI layout & IPC parity tests (14 tests, `make test-cpp`)
 examples/quickstart/     a runnable tour of the API
 examples/csv_to_parquet/ native CSV -> Parquet CLI example
 examples/parquet_to_csv/ native Parquet -> CSV CLI example
