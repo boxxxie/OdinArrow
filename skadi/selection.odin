@@ -346,7 +346,9 @@ _selection_take_string :: proc(arr: ^Array, sel: ^Selection, allocator: mem.Allo
 		} else {
 			a_idx := arr_off + i
 			slen := int(src_off[a_idx + 1] - src_off[a_idx])
-			assert(slen <= int(max(i32)) - total_bytes, "_selection_take_string: data exceeds i32 offset limit")
+			if slen > int(max(i32)) - total_bytes {
+				panic("_selection_take_string: data exceeds i32 offset limit")
+			}
 			total_bytes += slen
 		}
 	}

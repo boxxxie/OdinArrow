@@ -284,7 +284,9 @@ compute_filter_parallel :: proc(arr, mask: ^Array, num_threads := 0, allocator :
 			m.byte_start = total_bytes
 			total_len   += m.out_count
 			total_nulls += m.null_count
-			assert(m.out_bytes <= int(max(i32)) - total_bytes, "compute_filter_parallel: data exceeds i32 offset limit")
+			if m.out_bytes > int(max(i32)) - total_bytes {
+				panic("compute_filter_parallel: data exceeds i32 offset limit")
+			}
 			total_bytes += m.out_bytes
 		}
 
@@ -741,15 +743,10 @@ _take_scatter_job :: proc($T, $Idx: typeid) -> proc(ctx: rawptr, idx: int) {
 			j5 := int(idxs[i + 5])
 			j6 := int(idxs[i + 6])
 			j7 := int(idxs[i + 7])
-			when ODIN_DEBUG {
-				assert(j0 >= 0 && j0 < tctx.arr.length, "compute_take_parallel: index out of bounds")
-				assert(j1 >= 0 && j1 < tctx.arr.length, "compute_take_parallel: index out of bounds")
-				assert(j2 >= 0 && j2 < tctx.arr.length, "compute_take_parallel: index out of bounds")
-				assert(j3 >= 0 && j3 < tctx.arr.length, "compute_take_parallel: index out of bounds")
-				assert(j4 >= 0 && j4 < tctx.arr.length, "compute_take_parallel: index out of bounds")
-				assert(j5 >= 0 && j5 < tctx.arr.length, "compute_take_parallel: index out of bounds")
-				assert(j6 >= 0 && j6 < tctx.arr.length, "compute_take_parallel: index out of bounds")
-				assert(j7 >= 0 && j7 < tctx.arr.length, "compute_take_parallel: index out of bounds")
+			arr_u := u64(tctx.arr.length)
+			if u64(j0) >= arr_u || u64(j1) >= arr_u || u64(j2) >= arr_u || u64(j3) >= arr_u ||
+			   u64(j4) >= arr_u || u64(j5) >= arr_u || u64(j6) >= arr_u || u64(j7) >= arr_u {
+				panic("compute_take_parallel: index out of bounds")
 			}
 			dst[i]     = src[j0]
 			dst[i + 1] = src[j1]
@@ -762,8 +759,8 @@ _take_scatter_job :: proc($T, $Idx: typeid) -> proc(ctx: rawptr, idx: int) {
 		}
 		for ; i < to; i += 1 {
 			j := int(idxs[i])
-			when ODIN_DEBUG {
-				assert(j >= 0 && j < tctx.arr.length, "compute_take_parallel: index out of bounds")
+			if u64(j) >= u64(tctx.arr.length) {
+				panic("compute_take_parallel: index out of bounds")
 			}
 			dst[i] = src[j]
 		}

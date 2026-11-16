@@ -584,7 +584,9 @@ _filter_varlen :: proc(arr, mask: ^Array, dt: DataType, allocator: mem.Allocator
 				for k in 0..<cnt {
 					a_idx := in_base + int(positions[k])
 					slen  := int(src_off[a_idx + 1] - src_off[a_idx])
-					assert(slen <= int(max(i32)) - total_bytes, "_filter_varlen: data exceeds i32 offset limit")
+					if slen > int(max(i32)) - total_bytes {
+						panic("_filter_varlen: data exceeds i32 offset limit")
+					}
 					total_bytes += slen
 				}
 			} else {
@@ -596,7 +598,9 @@ _filter_varlen :: proc(arr, mask: ^Array, dt: DataType, allocator: mem.Allocator
 				for k in 0..<v_cnt {
 					a_idx := in_base + int(v_pos[k])
 					slen  := int(src_off[a_idx + 1] - src_off[a_idx])
-					assert(slen <= int(max(i32)) - total_bytes, "_filter_varlen: data exceeds i32 offset limit")
+					if slen > int(max(i32)) - total_bytes {
+						panic("_filter_varlen: data exceeds i32 offset limit")
+					}
 					total_bytes += slen
 				}
 			}
@@ -612,7 +616,9 @@ _filter_varlen :: proc(arr, mask: ^Array, dt: DataType, allocator: mem.Allocator
 			} else {
 				a_idx := arr_off + i
 				slen  := int(src_off[a_idx + 1] - src_off[a_idx])
-				assert(slen <= int(max(i32)) - total_bytes, "_filter_varlen: data exceeds i32 offset limit")
+				if slen > int(max(i32)) - total_bytes {
+					panic("_filter_varlen: data exceeds i32 offset limit")
+				}
 				total_bytes += slen
 			}
 		}
@@ -806,15 +812,10 @@ _take_primitive :: proc(arr, indices: ^Array, $T, $Idx: typeid, allocator: mem.A
 			j5 := int(idx[i + 5])
 			j6 := int(idx[i + 6])
 			j7 := int(idx[i + 7])
-			when ODIN_DEBUG {
-				assert(j0 >= 0 && j0 < arr.length, "compute_take: index out of bounds")
-				assert(j1 >= 0 && j1 < arr.length, "compute_take: index out of bounds")
-				assert(j2 >= 0 && j2 < arr.length, "compute_take: index out of bounds")
-				assert(j3 >= 0 && j3 < arr.length, "compute_take: index out of bounds")
-				assert(j4 >= 0 && j4 < arr.length, "compute_take: index out of bounds")
-				assert(j5 >= 0 && j5 < arr.length, "compute_take: index out of bounds")
-				assert(j6 >= 0 && j6 < arr.length, "compute_take: index out of bounds")
-				assert(j7 >= 0 && j7 < arr.length, "compute_take: index out of bounds")
+			arr_u := u64(arr.length)
+			if u64(j0) >= arr_u || u64(j1) >= arr_u || u64(j2) >= arr_u || u64(j3) >= arr_u ||
+			   u64(j4) >= arr_u || u64(j5) >= arr_u || u64(j6) >= arr_u || u64(j7) >= arr_u {
+				panic("compute_take: index out of bounds")
 			}
 			dst[i]     = src[j0]
 			dst[i + 1] = src[j1]
@@ -827,8 +828,8 @@ _take_primitive :: proc(arr, indices: ^Array, $T, $Idx: typeid, allocator: mem.A
 		}
 		for ; i < n; i += 1 {
 			j := int(idx[i])
-			when ODIN_DEBUG {
-				assert(j >= 0 && j < arr.length, "compute_take: index out of bounds")
+			if u64(j) >= u64(arr.length) {
+				panic("compute_take: index out of bounds")
 			}
 			dst[i] = src[j]
 		}
@@ -846,8 +847,8 @@ _take_primitive :: proc(arr, indices: ^Array, $T, $Idx: typeid, allocator: mem.A
 				continue
 			}
 			j := int(idx[i])
-			when ODIN_DEBUG {
-				assert(j >= 0 && j < arr.length, "compute_take: index out of bounds")
+			if u64(j) >= u64(arr.length) {
+				panic("compute_take: index out of bounds")
 			}
 			dst[i] = src[j]
 			if src_bm == nil || bitmap_get(src_bm, arr.offset + j) {
@@ -915,15 +916,17 @@ _take_varlen :: proc(arr, indices: ^Array, dt: DataType, $Idx: typeid, allocator
 			continue
 		}
 		j := int(idx_data[i])
-		when ODIN_DEBUG {
-			assert(j >= 0 && j < arr.length, "compute_take: index out of bounds")
+		if u64(j) >= u64(arr.length) {
+			panic("compute_take: index out of bounds")
 		}
 		if src_bm != nil && !bitmap_get(src_bm, arr_off + j) {
 			null_count += 1
 		} else {
 			a_idx := arr_off + j
 			slen  := int(src_off[a_idx + 1] - src_off[a_idx])
-			assert(slen <= int(max(i32)) - total_bytes, "_take_varlen: data exceeds i32 offset limit")
+			if slen > int(max(i32)) - total_bytes {
+				panic("_take_varlen: data exceeds i32 offset limit")
+			}
 			total_bytes += slen
 		}
 	}

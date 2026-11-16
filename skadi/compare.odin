@@ -1273,6 +1273,7 @@ _sel2pred_range :: proc(
 // Evaluate `sum(col_a) WHERE col_a <op1> s1 AND col_b <op2> s2` over L1d/L2-resident
 // morsels using a 32 KB `u16` L1d workspace on null-free `f64` columns (falling back
 // to `i32` `Selection` for nullable/other types) with 0 heap allocations.
+// Note: `allocator` is retained for API compatibility and is unused.
 compute_sel_2pred_sum :: proc(
 	col_a:     ^Array,
 	op1:       Compare_Op,
