@@ -20,57 +20,117 @@ import oa "../skadi"
 
 // ── FFI declarations ──────────────────────────────────────────────────────────
 
-when ODIN_OS == .Linux {
-    foreign import libarrow_capi "../lib/libarrow_capi.so"
-}
-
 Arrow_Scalar :: struct {
     value:       f64,
     valid_count: i64,
 }
 
-@(default_calling_convention = "c")
-foreign libarrow_capi {
-    arrow_capi_sum_i32  :: proc(validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar ---
-    arrow_capi_sum_f64  :: proc(validity: [^]u8, data: [^]f64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_min_i32  :: proc(validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar ---
-    arrow_capi_max_i32  :: proc(validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar ---
-    arrow_capi_filter_i32 :: proc(
+when ODIN_OS == .Linux {
+    foreign import libarrow_capi "../lib/libarrow_capi.so"
+
+    @(default_calling_convention = "c")
+    foreign libarrow_capi {
+        arrow_capi_sum_i32  :: proc(validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar ---
+        arrow_capi_sum_f64  :: proc(validity: [^]u8, data: [^]f64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_min_i32  :: proc(validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar ---
+        arrow_capi_max_i32  :: proc(validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar ---
+        arrow_capi_filter_i32 :: proc(
+            src_validity: [^]u8, src_data: [^]i32,
+            mask_validity: [^]u8, mask_bits: [^]u8,
+            n: i64,
+        ) -> i64 ---
+        arrow_capi_filter_i32_materialize :: proc(
+            src_validity: [^]u8, src_data: [^]i32,
+            mask_validity: [^]u8, mask_bits: [^]u8,
+            n: i64,
+            out_values: [^]i32,
+            out_valid: [^]u8,
+            out_cap: i64,
+        ) -> i64 ---
+        arrow_capi_string_scan :: proc(
+            validity: [^]u8,
+            offsets:  [^]i32,
+            utf8_data: [^]u8,
+            n: i64,
+        ) -> i64 ---
+        arrow_capi_sum_i64_slice  :: proc(validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_min_i64_slice  :: proc(validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_max_i64_slice  :: proc(validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_sum_u64_slice  :: proc(validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_min_u64_slice  :: proc(validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_max_u64_slice  :: proc(validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_sum_f32_slice  :: proc(validity: [^]u8, data: [^]f32, offset: i64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_mean_f32_slice :: proc(validity: [^]u8, data: [^]f32, offset: i64, n: i64) -> Arrow_Scalar ---
+        arrow_capi_bool_stats_slice :: proc(
+            validity: [^]u8,
+            bits: [^]u8,
+            offset: i64,
+            n: i64,
+            out_true_count: ^i64,
+            out_null_count: ^i64,
+        ) -> c.int ---
+        arrow_capi_binary_stats_slice :: proc(
+            validity: [^]u8,
+            offsets: [^]i32,
+            data: [^]u8,
+            total_elems: i64,
+            data_bytes: i64,
+            offset: i64,
+            n: i64,
+            out_valid_bytes: ^i64,
+            out_null_count: ^i64,
+        ) -> c.int ---
+        arrow_capi_ipc_write_sample :: proc(path: cstring, is_stream: c.int) -> c.int ---
+        arrow_capi_ipc_verify_roundtrip :: proc(
+            path: cstring,
+            is_stream: c.int,
+            expected_rows: i64,
+            expected_cols: i32,
+            out_i64_sum: ^i64,
+            out_bin_bytes: ^i64,
+        ) -> c.int ---
+    }
+} else {
+    arrow_capi_sum_i32  :: proc "c" (validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_sum_f64  :: proc "c" (validity: [^]u8, data: [^]f64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_min_i32  :: proc "c" (validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_max_i32  :: proc "c" (validity: [^]u8, data: [^]i32, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_filter_i32 :: proc "c" (
         src_validity: [^]u8, src_data: [^]i32,
         mask_validity: [^]u8, mask_bits: [^]u8,
         n: i64,
-    ) -> i64 ---
-    arrow_capi_filter_i32_materialize :: proc(
+    ) -> i64 { return -1 }
+    arrow_capi_filter_i32_materialize :: proc "c" (
         src_validity: [^]u8, src_data: [^]i32,
         mask_validity: [^]u8, mask_bits: [^]u8,
         n: i64,
         out_values: [^]i32,
         out_valid: [^]u8,
         out_cap: i64,
-    ) -> i64 ---
-    arrow_capi_string_scan :: proc(
+    ) -> i64 { return -1 }
+    arrow_capi_string_scan :: proc "c" (
         validity: [^]u8,
         offsets:  [^]i32,
         utf8_data: [^]u8,
         n: i64,
-    ) -> i64 ---
-    arrow_capi_sum_i64_slice  :: proc(validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_min_i64_slice  :: proc(validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_max_i64_slice  :: proc(validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_sum_u64_slice  :: proc(validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_min_u64_slice  :: proc(validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_max_u64_slice  :: proc(validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_sum_f32_slice  :: proc(validity: [^]u8, data: [^]f32, offset: i64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_mean_f32_slice :: proc(validity: [^]u8, data: [^]f32, offset: i64, n: i64) -> Arrow_Scalar ---
-    arrow_capi_bool_stats_slice :: proc(
+    ) -> i64 { return -1 }
+    arrow_capi_sum_i64_slice  :: proc "c" (validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_min_i64_slice  :: proc "c" (validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_max_i64_slice  :: proc "c" (validity: [^]u8, data: [^]i64, offset: i64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_sum_u64_slice  :: proc "c" (validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_min_u64_slice  :: proc "c" (validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_max_u64_slice  :: proc "c" (validity: [^]u8, data: [^]u64, offset: i64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_sum_f32_slice  :: proc "c" (validity: [^]u8, data: [^]f32, offset: i64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_mean_f32_slice :: proc "c" (validity: [^]u8, data: [^]f32, offset: i64, n: i64) -> Arrow_Scalar { return {} }
+    arrow_capi_bool_stats_slice :: proc "c" (
         validity: [^]u8,
         bits: [^]u8,
         offset: i64,
         n: i64,
         out_true_count: ^i64,
         out_null_count: ^i64,
-    ) -> c.int ---
-    arrow_capi_binary_stats_slice :: proc(
+    ) -> c.int { return 0 }
+    arrow_capi_binary_stats_slice :: proc "c" (
         validity: [^]u8,
         offsets: [^]i32,
         data: [^]u8,
@@ -80,16 +140,16 @@ foreign libarrow_capi {
         n: i64,
         out_valid_bytes: ^i64,
         out_null_count: ^i64,
-    ) -> c.int ---
-    arrow_capi_ipc_write_sample :: proc(path: cstring, is_stream: c.int) -> c.int ---
-    arrow_capi_ipc_verify_roundtrip :: proc(
+    ) -> c.int { return 0 }
+    arrow_capi_ipc_write_sample :: proc "c" (path: cstring, is_stream: c.int) -> c.int { return 0 }
+    arrow_capi_ipc_verify_roundtrip :: proc "c" (
         path: cstring,
         is_stream: c.int,
         expected_rows: i64,
         expected_cols: i32,
         out_i64_sum: ^i64,
         out_bin_bytes: ^i64,
-    ) -> c.int ---
+    ) -> c.int { return 0 }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
