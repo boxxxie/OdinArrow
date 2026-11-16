@@ -1,7 +1,7 @@
 # Skadi (`package skadi`)
 
 [![CI](https://github.com/boxxxie/skadi/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/skadi/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.2-blue.svg)](CHANGELOG.md)
 [![Odin](https://img.shields.io/badge/Odin-lang-3882D2.svg)](https://odin-lang.org/)
 [![License: Zlib](https://img.shields.io/badge/License-Zlib-lightgrey.svg)](LICENSE)
 [![Arrow IPC](https://img.shields.io/badge/Arrow%20IPC-Feather%20v2-orange.svg)](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc)
