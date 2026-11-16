@@ -874,7 +874,7 @@ group_ipc :: proc(ctx: ^Bench_Context) {
 	// Do not call record_batch_free(&rb) here because columns shares `arr` above (freed by defer).
 	defer delete(rb.columns)
 
-	ipc_path := "/tmp/odinarrow_bench_ipc_1v1.arrow"
+	ipc_path := "/tmp/skadi_bench_ipc_1v1.arrow"
 	defer _ = os.remove(ipc_path)
 
 	bytes := _array_bytes(&arr)

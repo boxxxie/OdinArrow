@@ -943,7 +943,7 @@ col_stream_load_page :: proc(cs: ^Col_Stream) -> bool {
 	return true
 }
 
-// col_stream_to_string_array reads up to n string values into an OdinArrow Array.
+// col_stream_to_string_array reads up to n string values into a Skadi Array.
 // The caller owns the returned Array and must call oa.array_free when done.
 col_stream_to_string_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 	b := oa.string_builder_make(n)
@@ -1052,28 +1052,28 @@ _col_stream_to_fixed_array :: proc(cs: ^Col_Stream, n: int, $T: typeid, dict_ptr
 	return arr
 }
 
-// col_stream_to_i32_array reads up to n INT32 values into an OdinArrow Array.
+// col_stream_to_i32_array reads up to n INT32 values into a Skadi Array.
 // The caller owns the returned Array and must call oa.array_free when done.
 col_stream_to_i32_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 	return _col_stream_to_fixed_array(cs, n, i32, &cs.dict_i32s)
 }
 
-// col_stream_to_i64_array reads up to n INT64 values into an OdinArrow Array.
+// col_stream_to_i64_array reads up to n INT64 values into a Skadi Array.
 col_stream_to_i64_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 	return _col_stream_to_fixed_array(cs, n, i64, &cs.dict_i64s)
 }
 
-// col_stream_to_f32_array reads up to n FLOAT values into an OdinArrow Array.
+// col_stream_to_f32_array reads up to n FLOAT values into a Skadi Array.
 col_stream_to_f32_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 	return _col_stream_to_fixed_array(cs, n, f32, &cs.dict_f32s)
 }
 
-// col_stream_to_f64_array reads up to n DOUBLE values into an OdinArrow Array.
+// col_stream_to_f64_array reads up to n DOUBLE values into a Skadi Array.
 col_stream_to_f64_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 	return _col_stream_to_fixed_array(cs, n, f64, &cs.dict_f64s)
 }
 
-// col_stream_to_bool_array reads up to n PLAIN bit-packed BOOLEAN values into an OdinArrow Array.
+// col_stream_to_bool_array reads up to n PLAIN bit-packed BOOLEAN values into a Skadi Array.
 col_stream_to_bool_array :: proc(cs: ^Col_Stream, n: int) -> oa.Array {
 	b := oa.builder_make(bool, n)
 	defer oa.builder_destroy(&b)

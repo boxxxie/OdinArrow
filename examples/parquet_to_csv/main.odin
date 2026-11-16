@@ -407,7 +407,7 @@ parquet_to_csv_stream :: proc(
 		initialized += 1
 	}
 
-	// OdinArrow arrays for the current chunk; one per column, freed after each chunk.
+	// Skadi arrays for the current chunk; one per column, freed after each chunk.
 	chunk_arrays := make([]oa.Array, n_cols)
 	defer delete(chunk_arrays)
 

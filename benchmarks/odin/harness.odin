@@ -145,7 +145,7 @@ print_header :: proc(cfg: ^bs.Bench_Config) {
 	if cfg.legacy { return }
 	hw := oa.hardware_config_get()
 	fmt.printf(
-		"OdinArrow Benchmarks (commit=%s, runs=%d, warmup=%d, lang=%s)\n",
+		"Skadi Benchmarks (commit=%s, runs=%d, warmup=%d, lang=%s)\n",
 		cfg.commit, cfg.runs, cfg.warmup, cfg.lang,
 	)
 	fmt.printf(

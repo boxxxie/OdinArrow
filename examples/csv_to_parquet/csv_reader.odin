@@ -234,7 +234,7 @@ csv_consume_sep :: proc(cs: ^CSV_Stream) -> (eor: bool) {
 	return true
 }
 
-// csv_stream_read_chunk reads up to max_rows rows and returns one OdinArrow
+// csv_stream_read_chunk reads up to max_rows rows and returns one Skadi
 // String_Type Array per column.  Returns nil arrays and n=0 at EOF.
 // The caller owns the returned slice and each Array; free with:
 //   for ci in 0..<csv.n_cols { oa.array_free(&arrays[ci]) }
