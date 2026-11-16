@@ -3,7 +3,7 @@
 // TRIALS), parsed by benchmarks/bench_odin_c.sh.
 //
 // Single-threaded on both sides: this isolates per-core implementation
-// efficiency (OdinArrow also ships threaded *_parallel kernels — see the 3-way
+// efficiency (Skadi also ships threaded *_parallel kernels — see the 3-way
 // compare.sh — but those are excluded here for an apples-to-apples comparison).
 #include <arrow/api.h>
 #include <arrow/compute/api.h>

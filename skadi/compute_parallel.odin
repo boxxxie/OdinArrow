@@ -351,6 +351,7 @@ compute_filter_parallel :: proc(arr, mask: ^Array, num_threads := 0, allocator :
 		case Float32_Type: scatter_job = _filter_scatter_job(f32)
 		case Float64_Type: scatter_job = _filter_scatter_job(f64)
 		}
+		assert(scatter_job != nil, "compute_filter_parallel: unhandled DataType")
 		_pool_run(nt, scatter_job, &fctx, n_morsels)
 	}
 
@@ -690,6 +691,7 @@ compute_take_parallel :: proc(arr, indices: ^Array, num_threads := 0, allocator 
 	}
 
 	take_job := _resolve_take_scatter_job(arr.type, i64) if is_i64 else _resolve_take_scatter_job(arr.type, i32)
+	assert(take_job != nil, "compute_take_parallel: unhandled DataType")
 	_pool_run(nt, take_job, &tctx, n_morsels)
 
 	result = Array{

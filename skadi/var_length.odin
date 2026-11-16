@@ -300,8 +300,12 @@ _vb_finish :: proc(b: ^_Var_Builder($Offset), data_type: DataType, allocator: me
 		bm_size := bitmap_byte_count(b.length)
 		bitmap_buf = buffer_make(bm_size, allocator) or_return
 		active_bytes := (b.length + 7) / 8
-		if active_bytes > 0 && b.bitmap != nil {
-			mem.copy_non_overlapping(rawptr(bitmap_buf.data), rawptr(b.bitmap), active_bytes)
+		copy_bytes := min(active_bytes, b.bm_cap)
+		if copy_bytes > 0 && b.bitmap != nil {
+			mem.copy_non_overlapping(rawptr(bitmap_buf.data), rawptr(b.bitmap), copy_bytes)
+		}
+		if active_bytes > copy_bytes {
+			mem.set(rawptr(bitmap_buf.data[copy_bytes:]), 0xFF, active_bytes - copy_bytes)
 		}
 		rem := uint(b.length) & 7
 		if rem != 0 && active_bytes > 0 {

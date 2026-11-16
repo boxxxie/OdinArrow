@@ -99,7 +99,7 @@ test_bench_stats_git_commit_resolution :: proc(t: ^testing.T) {
 	}
 
 	seq := sync.atomic_add(&g_bench_stats_test_seq, 1)
-	tmp_dir := fmt.aprintf("%s/odinarrow_git_test_repo_%d_%d", os.temp_dir(context.temp_allocator), os.get_pid(), seq)
+	tmp_dir := fmt.aprintf("%s/skadi_git_test_repo_%d_%d", os.temp_dir(context.temp_allocator), os.get_pid(), seq)
 	git_dir := fmt.aprintf("%s/.git", tmp_dir)
 	refs_dir := fmt.aprintf("%s/refs/heads", git_dir)
 	head_path := fmt.aprintf("%s/HEAD", git_dir)

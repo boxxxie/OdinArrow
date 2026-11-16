@@ -1,4 +1,4 @@
-// OdinArrow quickstart — build arrays, run compute kernels, and round-trip an
+// Skadi quickstart — build arrays, run compute kernels, and round-trip an
 // Arrow IPC file (which PyArrow / Arrow C++ can read directly).
 //
 // Run from the repo root with:
@@ -10,7 +10,7 @@ import "core:fmt"
 import "core:os"
 
 main :: proc() {
-	fmt.println("== OdinArrow quickstart ==")
+	fmt.println("== Skadi quickstart ==")
 
 	primitives()
 	strings_demo()
@@ -101,7 +101,7 @@ sorting :: proc() {
 
 ipc_roundtrip :: proc() {
 	fmt.println("\n-- Arrow IPC file round-trip --")
-	path := "/tmp/odinarrow_quickstart.arrow"
+	path := "/tmp/skadi_quickstart.arrow"
 	defer os.remove(path)
 
 	// A two-column schema: an Int32 id and a Utf8 name.

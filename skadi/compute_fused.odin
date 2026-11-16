@@ -140,12 +140,20 @@ _min_max_where_typed :: #force_inline proc(values, mask: ^Array, $T: typeid) -> 
 	v_nulls := values.buffers[0].data != nil
 	m_nulls := mask.buffers[0].data != nil
 
-	lo, hi: T
+	lo, hi, last_nan: T
+	when T != f32 && T != f64 {
+		_ = last_nan
+	}
 	seen := false
 
-	consider :: #force_inline proc(v: T, lo, hi: ^T, seen: ^bool, vc: ^int) {
-		if seen^ { if v < lo^ { lo^ = v }; if v > hi^ { hi^ = v } } else { lo^ = v; hi^ = v; seen^ = true }
+	consider :: #force_inline proc(v: T, lo, hi, last_nan: ^T, seen: ^bool, vc: ^int) {
 		vc^ += 1
+		when T == f32 || T == f64 {
+			if v != v { last_nan^ = v; return }
+		} else {
+			_ = last_nan
+		}
+		if seen^ { if v < lo^ { lo^ = v }; if v > hi^ { hi^ = v } } else { lo^ = v; hi^ = v; seen^ = true }
 	}
 
 	if !v_nulls && !m_nulls && moff == 0 {
@@ -154,20 +162,28 @@ _min_max_where_typed :: #force_inline proc(values, mask: ^Array, $T: typeid) -> 
 			b := mbits[i >> 3]
 			if b == 0 { continue }
 			for bit in u8(0)..<8 {
-				if (b >> bit) & 1 == 1 { consider(data[voff + i + int(bit)], &lo, &hi, &seen, &valid_count) }
+				if (b >> bit) & 1 == 1 { consider(data[voff + i + int(bit)], &lo, &hi, &last_nan, &seen, &valid_count) }
 			}
 		}
 		for i := n_full; i < n; i += 1 {
-			if bitmap_get(mbits, i) { consider(data[voff + i], &lo, &hi, &seen, &valid_count) }
+			if bitmap_get(mbits, i) { consider(data[voff + i], &lo, &hi, &last_nan, &seen, &valid_count) }
 		}
 	} else {
 		for i in 0..<n {
 			if m_nulls && !array_is_valid(mask, i) { continue }
 			if !bitmap_get(mbits, moff + i) { continue }
 			if v_nulls && !array_is_valid(values, i) { continue }
-			consider(data[voff + i], &lo, &hi, &seen, &valid_count)
+			consider(data[voff + i], &lo, &hi, &last_nan, &seen, &valid_count)
 		}
 	}
-	if seen { min_val = f64(lo); max_val = f64(hi) }
+	if seen {
+		min_val = f64(lo)
+		max_val = f64(hi)
+	} else if valid_count > 0 {
+		when T == f32 || T == f64 {
+			min_val = f64(last_nan)
+			max_val = f64(last_nan)
+		}
+	}
 	return
 }

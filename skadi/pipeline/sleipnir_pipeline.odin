@@ -1,7 +1,18 @@
+/*
+Package `pipeline` provides a cache-resident Sleipnir actor execution pipeline
+(`Morsel_Pipeline`) for Skadi columnar analytics, built on `deps/sleipnir/actor`.
+
+It dispatches coarsened super-morsels over pooled MPSC work batches
+(`Envelope_Pool` + `mpsc_push_chain`), processes L1d/L2-resident `u16` morsel
+selection vectors, and aggregates partial results through wait-free
+`Sharded_SPSC_Mailbox` lanes with zero steady-state heap allocations for fused
+predicates, dictionary histograms, and MSB-bucket parallel sorting.
+*/
 package pipeline
 
 import "base:intrinsics"
 import "core:mem"
+import "core:sync"
 import oa ".."
 import actor "../../deps/sleipnir/actor"
 
@@ -153,8 +164,8 @@ _agg_subtotal_handler :: proc(state: ^_Agg_State, msg: ^Morsel_Subtotal) {
 	state.valid_count += msg.count
 	if msg.valid {
 		if state.valid {
-			if msg.min_val < state.min_val { state.min_val = msg.min_val }
-			if msg.max_val > state.max_val { state.max_val = msg.max_val }
+			if state.min_val != state.min_val || msg.min_val < state.min_val { state.min_val = msg.min_val }
+			if state.max_val != state.max_val || msg.max_val > state.max_val { state.max_val = msg.max_val }
 		} else {
 			state.min_val = msg.min_val
 			state.max_val = msg.max_val
@@ -198,8 +209,8 @@ _worker_agg_where_fallback_range :: proc(msg: ^Morsel_Work, step: int, sub: ^Mor
 			sub.sum   += part.sum
 			sub.count += part.count
 			if sub.valid {
-				if part.min_val < sub.min_val { sub.min_val = part.min_val }
-				if part.max_val > sub.max_val { sub.max_val = part.max_val }
+				if sub.min_val != sub.min_val || part.min_val < sub.min_val { sub.min_val = part.min_val }
+				if sub.max_val != sub.max_val || part.max_val > sub.max_val { sub.max_val = part.max_val }
 			} else {
 				sub.min_val = part.min_val
 				sub.max_val = part.max_val
@@ -407,8 +418,8 @@ _worker_receive :: proc(ctx: ^actor.Context, self: ^actor.Actor(_Worker_State, M
 					sub.sum   += msum
 					sub.count += k1
 					if sub.valid {
-						if mmin < sub.min_val { sub.min_val = mmin }
-						if mmax > sub.max_val { sub.max_val = mmax }
+						if sub.min_val != sub.min_val || mmin < sub.min_val { sub.min_val = mmin }
+						if sub.max_val != sub.max_val || mmax > sub.max_val { sub.max_val = mmax }
 					} else {
 						sub.min_val = mmin
 						sub.max_val = mmax
@@ -1489,7 +1500,12 @@ _sort_send_one :: proc(p: ^Morsel_Pipeline, w: int, msg: Sort_Bucket_Work, acc: 
 @(private="file")
 _sort_begin_unparked :: proc(p: ^Morsel_Pipeline) -> bool {
 	if p == nil || p.sched == nil { return false }
-	return actor.scheduler_set_parking(p.sched, false)
+	prev := intrinsics.atomic_exchange_explicit(&p.sched.enable_parking, false, .Seq_Cst)
+	if prev {
+		intrinsics.atomic_add_explicit((^u32)(&p.sched.wake_futex), 1, .Seq_Cst)
+		sync.futex_broadcast(&p.sched.wake_futex)
+	}
+	return prev
 }
 
 @(private="file")
@@ -1497,7 +1513,7 @@ _sort_end_unparked :: proc(p: ^Morsel_Pipeline, was_parking: bool) {
 	if p == nil || p.sched == nil { return }
 	actor.scheduler_wait_idle(p.sched)
 	if was_parking {
-		actor.scheduler_set_parking(p.sched, true)
+		intrinsics.atomic_store_explicit(&p.sched.enable_parking, true, .Seq_Cst)
 	}
 }
 

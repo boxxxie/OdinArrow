@@ -1517,3 +1517,19 @@ test_csv_to_parquet_rejects_malformed_quotes :: proc(t: ^testing.T) {
 		testing.expectf(t, !os.exists(pq_path), "%s must remove partial output file", tc.label)
 	}
 }
+
+@(test)
+test_thrift_binary_length_overflow_rejected :: proc(t: ^testing.T) {
+	// 9-byte Thrift Compact varint encoding max(i64) = 0x7FFF_FFFF_FFFF_FFFF.
+	payload := []u8{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x00}
+
+	tr := p2c.thrift_make(payload)
+	bin := p2c.thrift_read_binary(&tr)
+	testing.expect(t, tr.err, "thrift_read_binary must flag overflow varint length")
+	testing.expect(t, bin == nil, "thrift_read_binary must return nil on overflow")
+
+	ts := p2c.thrift_make(payload)
+	p2c.thrift_skip(&ts, p2c.THRIFT_BINARY)
+	testing.expect(t, ts.err, "thrift_skip must flag overflow THRIFT_BINARY length")
+	testing.expect(t, ts.pos >= 0 && ts.pos == len(payload), "thrift_skip must clamp pos without negative wraparound")
+}

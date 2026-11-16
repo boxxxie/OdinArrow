@@ -92,7 +92,8 @@ buffer_resize :: proc(buf: ^Buffer, new_size: int) -> mem.Allocator_Error {
 	old_cap := buf.capacity
 	new_raw := mem.resize(rawptr(buf.data), buf.capacity, new_cap, ARROW_ALIGNMENT, buf.allocator) or_return
 	new_data := cast([^]u8)new_raw
-	mem.zero(rawptr(new_data[old_cap:]), new_cap - old_cap)
+	zero_start := min(buf.size, old_cap)
+	mem.zero(rawptr(new_data[zero_start:]), new_cap - zero_start)
 	buf.data     = new_data
 	buf.size     = new_size
 	buf.capacity = new_cap

@@ -217,6 +217,8 @@ _agg_where_float_mono :: proc(values, pred: ^Array, scalar: $S, $T: typeid, $OP:
 	lo, hi: T
 	seen := false
 	if !p_nulls && !v_nulls {
+		// Phase 1: advance to the first matching non-NaN value to seed lo/hi.
+		// Any preceding matching NaNs still accumulate into sum/count.
 		i := 0
 		for ; i < n; i += 1 {
 			when S == i64 {
@@ -225,14 +227,19 @@ _agg_where_float_mono :: proc(values, pred: ^Array, scalar: $S, $T: typeid, $OP:
 				if !_agg_cmp(f64(pdata[poff + i]), scalar, OP) { continue }
 			}
 			v := vdata[voff + i]
-			lo = v
-			hi = v
-			a.sum = f64(v)
-			a.count = 1
-			seen = true
-			i += 1
-			break
+			a.sum += f64(v)
+			a.count += 1
+			if v == v {
+				lo = v
+				hi = v
+				seen = true
+				i += 1
+				break
+			}
 		}
+		// Phase 2: hot loop without per-row `v == v` or `seen` branches.
+		// Because Phase 1 guarantees lo/hi are non-NaN, IEEE 754 `<` and `>`
+		// evaluate to false for any subsequent NaN, preserving finite bounds.
 		for ; i < n; i += 1 {
 			when S == i64 {
 				if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
@@ -246,7 +253,8 @@ _agg_where_float_mono :: proc(values, pred: ^Array, scalar: $S, $T: typeid, $OP:
 			if v > hi { hi = v }
 		}
 	} else {
-		for i in 0..<n {
+		i := 0
+		for ; i < n; i += 1 {
 			if p_nulls && !array_is_valid(pred, i) { continue }
 			when S == i64 {
 				if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
@@ -257,17 +265,40 @@ _agg_where_float_mono :: proc(values, pred: ^Array, scalar: $S, $T: typeid, $OP:
 			v := vdata[voff + i]
 			a.sum += f64(v)
 			a.count += 1
-			if seen {
-				if v < lo { lo = v }
-				if v > hi { hi = v }
-			} else {
+			if v == v {
 				lo = v
 				hi = v
 				seen = true
+				i += 1
+				break
 			}
 		}
+		// Phase 2: lo/hi are guaranteed non-NaN from Phase 1; NaN comparisons are false.
+		for ; i < n; i += 1 {
+			if p_nulls && !array_is_valid(pred, i) { continue }
+			when S == i64 {
+				if !_cmp_f64_vs_i64(f64(pdata[poff + i]), OP, scalar) { continue }
+			} else {
+				if !_agg_cmp(f64(pdata[poff + i]), scalar, OP) { continue }
+			}
+			if v_nulls && !array_is_valid(values, i) { continue }
+			v := vdata[voff + i]
+			a.sum += f64(v)
+			a.count += 1
+			if v < lo { lo = v }
+			if v > hi { hi = v }
+		}
 	}
-	if seen { a.min_val = f64(lo); a.max_val = f64(hi); a.valid = true }
+	if a.count > 0 {
+		a.valid = true
+		if seen {
+			a.min_val = f64(lo)
+			a.max_val = f64(hi)
+		} else {
+			a.min_val = a.sum
+			a.max_val = a.sum
+		}
+	}
 	return a
 }
 

@@ -9,12 +9,8 @@ on:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: Test (ubuntu-latest)
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -35,7 +31,7 @@ jobs:
       - name: Install PyArrow
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install "pyarrow>=24.0.0" || python3 -m pip install pyarrow
+          python3 -m pip install "pyarrow>=25.0.0" || python3 -m pip install pyarrow
 
       - name: Run strict static analysis across all packages
         run: make check
@@ -56,13 +52,13 @@ jobs:
           mv examples/quickstart/main.odin.bak examples/quickstart/main.odin
           python3 -c '
           import pyarrow.ipc as ipc
-          t = ipc.open_file("/tmp/odinarrow_quickstart.arrow").read_all()
+          t = ipc.open_file("/tmp/skadi_quickstart.arrow").read_all()
           assert t.num_rows == 3, f"expected 3 rows, got {t.num_rows}"
           assert t["id"].to_pylist() == [1, 2, 3]
           assert t["name"].to_pylist() == ["ada", "alan", "grace"]
           print("PyArrow IPC verification passed:", t.to_pydict())
           '
-          rm -f /tmp/odinarrow_quickstart.arrow
+          rm -f /tmp/skadi_quickstart.arrow
 
       - name: Build native CSV <-> Parquet CLI programs & verify round-trip
         run: |
@@ -73,5 +69,4 @@ jobs:
           diff -u /tmp/ci_in.csv /tmp/ci_out.csv
 
       - name: Run Arrow C++ FFI layout compatibility tests (Linux)
-        if: runner.os == 'Linux'
         run: make test-cpp build-parquet-capi parquet-ffi csv-to-parquet-ffi

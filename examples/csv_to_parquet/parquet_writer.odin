@@ -110,7 +110,7 @@ pw_open :: proc(file: ^os.File, col_names: []string) -> Parquet_Writer {
 	return pw
 }
 
-// pw_write_row_group writes one row group from a slice of OdinArrow String_Type arrays.
+// pw_write_row_group writes one row group from a slice of Skadi String_Type arrays.
 pw_write_row_group :: proc(pw: ^Parquet_Writer, cols: []oa.Array) {
 	rg: RG_Meta
 	rg.cols     = make([]Col_Write_Meta, pw.n_cols)
@@ -124,7 +124,7 @@ pw_write_row_group :: proc(pw: ^Parquet_Writer, cols: []oa.Array) {
 	append(&pw.row_groups, rg)
 }
 
-// pw_write_column writes one OdinArrow String_Type Array as a PLAIN BYTE_ARRAY page.
+// pw_write_column writes one Skadi String_Type Array as a PLAIN BYTE_ARRAY page.
 pw_write_column :: proc(pw: ^Parquet_Writer, arr: ^oa.Array) -> Col_Write_Meta {
 	meta: Col_Write_Meta
 	meta.data_page_off = pw.offset

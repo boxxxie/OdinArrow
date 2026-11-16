@@ -1,4 +1,4 @@
-// Comprehensive single-threaded OdinArrow benchmark, paired 1:1 with the Arrow
+// Comprehensive single-threaded Skadi benchmark, paired 1:1 with the Arrow
 // C++ benchmark in benchmarks/cpp/bench_odin_c.cpp. Output: `key=nanoseconds`
 // per line (median of TRIALS), parsed by benchmarks/bench_odin_c.sh.
 //
@@ -117,7 +117,7 @@ main :: proc() {
 	build_inputs() // inputs allocated on the default heap (untimed)
 
 	// Route all timed allocations through a recycling buffer pool — the
-	// OdinArrow analogue of arrow::MemoryPool, which Arrow C++ uses by default.
+	// Skadi analogue of arrow::MemoryPool, which Arrow C++ uses by default.
 	// Without this, each kernel call mmap/munmaps its large output buffer and
 	// re-faults fresh pages, an allocator artefact rather than kernel cost.
 	pool: oa.Buffer_Pool

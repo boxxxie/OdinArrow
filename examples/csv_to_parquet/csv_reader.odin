@@ -234,7 +234,7 @@ csv_consume_sep :: proc(cs: ^CSV_Stream) -> (eor: bool) {
 	return true
 }
 
-// csv_stream_read_chunk reads up to max_rows rows and returns one OdinArrow
+// csv_stream_read_chunk reads up to max_rows rows and returns one Skadi
 // String_Type Array per column.  Returns nil arrays and n=0 at EOF.
 // The caller owns the returned slice and each Array; free with:
 //   for ci in 0..<csv.n_cols { oa.array_free(&arrays[ci]) }
@@ -286,7 +286,9 @@ csv_stream_read_chunk :: proc(cs: ^CSV_Stream, max_rows: int) -> (arrays: []oa.A
 
 	arrays = make([]oa.Array, cs.n_cols)
 	for ci in 0..<cs.n_cols {
-		arrays[ci], _ = oa.string_builder_finish(&builders[ci])
+		arr, finish_err := oa.string_builder_finish(&builders[ci])
+		assert(finish_err == nil, "csv_stream_read_chunk: string_builder_finish failed")
+		arrays[ci] = arr
 		oa.string_builder_destroy(&builders[ci])
 	}
 	delete(builders)

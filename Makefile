@@ -15,7 +15,7 @@ PARQUET_LINK_FLAGS := $(shell pkg-config --libs arrow parquet) -Wl,-rpath,$(ARRO
 else
 ARROW_IDIR := $(shell python3 -c "import pyarrow; print(pyarrow.get_include())" 2>/dev/null)
 ARROW_LDIR := $(shell python3 -c "import pyarrow; print(pyarrow.get_library_dirs()[0])" 2>/dev/null)
-ARROW_VER  ?= $(shell python3 -c "import pyarrow, glob, os; d = pyarrow.get_library_dirs()[0]; m = sorted(glob.glob(os.path.join(d, 'libarrow.so.*'))); print(os.path.basename(m[0]).split('libarrow.so.')[1] if m else '2400')" 2>/dev/null)
+ARROW_VER  ?= $(shell python3 -c "import pyarrow, glob, os; d = pyarrow.get_library_dirs()[0]; m = sorted(glob.glob(os.path.join(d, 'libarrow.so.*'))); print(os.path.basename(m[0]).split('libarrow.so.')[1] if m else '2500')" 2>/dev/null)
 ARROW_COMPUTE_LIB := $(shell python3 -c "import pyarrow, glob, os; d = pyarrow.get_library_dirs()[0]; m = sorted(glob.glob(os.path.join(d, 'libarrow_compute.so.*'))); print('-l:' + os.path.basename(m[0]) if m else '')" 2>/dev/null)
 
 ARROW_CPP_FLAGS  := -std=c++20 -O3 -I$(ARROW_IDIR)

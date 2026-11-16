@@ -14,7 +14,7 @@ parse_cli_args :: proc(args: []string) -> (max_mb: int, in_path: string, out_pat
 		if arg == "-m" {
 			if i + 1 >= len(args) { return 0, "", "", false }
 			v, v_ok := strconv.parse_int(args[i + 1])
-			if !v_ok || v <= 0 { return 0, "", "", false }
+			if !v_ok || v <= 0 || i64(v) > max(i64) / (1024 * 1024) { return 0, "", "", false }
 			max_mb = v
 			i += 2
 			continue
@@ -205,6 +205,9 @@ csv_to_parquet_stream :: proc(
 	}
 
 	pw_finish(&pw)
+	if pw.page_overflow {
+		return 0, 0, CSV_To_Parquet_Page_Overflow_Error{}
+	}
 	if pw.write_err != nil {
 		return 0, 0, CSV_To_Parquet_Write_Output_Error{err = pw.write_err}
 	}

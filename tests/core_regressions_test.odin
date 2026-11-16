@@ -1699,3 +1699,313 @@ test_ipc_vectored_write_wide_multibatch_and_partial_iovec :: proc(t: ^testing.T)
 		testing.expect(t, bytes.equal(ov_s, fr_s), "overwritten IPC stream must match fresh stream byte-for-byte")
 	}
 }
+
+@(test)
+test_builder_cross_allocator_bitmap_growth_no_overread :: proc(t: ^testing.T) {
+	main_track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&main_track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &main_track)
+	}
+
+	alt_track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&alt_track, saved_alloc)
+	defer check_no_leaks(t, &alt_track)
+	alt_alloc := mem.tracking_allocator(&alt_track)
+
+	// Primitive_Builder: 1 null allocates 64-byte bitmap (512 bits), then 1024 non-null appends exceed bm_cap.
+	{
+		b := oa.builder_make(i32, 8)
+		defer oa.builder_destroy(&b)
+		oa.builder_append_null(&b)
+		for i in 1..=1024 {
+			oa.builder_append(&b, i32(i))
+		}
+		arr, err := oa.builder_finish(&b, alt_alloc)
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer oa.array_free(&arr)
+
+		testing.expect_value(t, arr.length, 1025)
+		testing.expect_value(t, arr.null_count, 1)
+		testing.expect(t, oa.array_is_null(&arr, 0), "row 0 must be null")
+		for i in 1..<1025 {
+			testing.expectf(t, oa.array_is_valid(&arr, i), "row %d must be valid after cross-allocator finish", i)
+			testing.expect_value(t, oa.array_get(&arr, i, i32), i32(i))
+		}
+	}
+
+	// String_Builder (_Var_Builder): 1 null followed by 1024 non-null strings exceeding bm_cap.
+	{
+		sb := oa.string_builder_make(8)
+		defer oa.string_builder_destroy(&sb)
+		oa.string_builder_append_null(&sb)
+		for i in 1..=1024 {
+			oa.string_builder_append(&sb, "v" if (i & 1) == 0 else "val")
+		}
+		arr, err := oa.string_builder_finish(&sb, alt_alloc)
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer oa.array_free(&arr)
+
+		testing.expect_value(t, arr.length, 1025)
+		testing.expect_value(t, arr.null_count, 1)
+		testing.expect(t, oa.array_is_null(&arr, 0), "string row 0 must be null")
+		for i in 1..<1025 {
+			testing.expectf(t, oa.array_is_valid(&arr, i), "string row %d must be valid after cross-allocator finish", i)
+			want := "v" if (i & 1) == 0 else "val"
+			testing.expect_value(t, oa.array_get_string(&arr, i), want)
+		}
+	}
+}
+
+@(test)
+test_buffer_resize_realloc_zeroes_shrunk_and_uninit_tail :: proc(t: ^testing.T) {
+	// 1. Shrink then grow past original capacity must zero [new_shrunk_size ..< new_size].
+	buf, err := oa.buffer_make(128)
+	testing.expect_value(t, err, mem.Allocator_Error.None)
+	defer oa.buffer_free(&buf)
+	for i in 0..<128 {
+		buf.data[i] = 0xAA
+	}
+	testing.expect_value(t, oa.buffer_resize(&buf, 16), mem.Allocator_Error.None)
+	testing.expect_value(t, oa.buffer_resize(&buf, 256), mem.Allocator_Error.None)
+	for i in 0..<16 {
+		testing.expect_value(t, buf.data[i], u8(0xAA))
+	}
+	for i in 16..<256 {
+		testing.expectf(t, buf.data[i] == 0, "stale byte at %d was not zeroed after reallocating resize", i)
+	}
+
+	// 2. Grow uninit buffer past its initial 64-byte capacity must zero [orig_size ..< new_size].
+	ubuf, uerr := oa.buffer_make_uninit(16)
+	testing.expect_value(t, uerr, mem.Allocator_Error.None)
+	defer oa.buffer_free(&ubuf)
+	for i in 0..<ubuf.capacity {
+		ubuf.data[i] = 0xBB
+	}
+	testing.expect_value(t, oa.buffer_resize(&ubuf, 128), mem.Allocator_Error.None)
+	for i in 0..<16 {
+		testing.expect_value(t, ubuf.data[i], u8(0xBB))
+	}
+	for i in 16..<128 {
+		testing.expectf(t, ubuf.data[i] == 0, "uninit tail byte at %d was not zeroed after reallocating resize", i)
+	}
+}
+
+@(test)
+test_dict_min_max_on_sliced_dict_array :: proc(t: ^testing.T) {
+	b := oa.builder_make(i64, 6)
+	defer oa.builder_destroy(&b)
+	oa.builder_append(&b, i64(5))
+	oa.builder_append_null(&b)
+	oa.builder_append(&b, i64(100))
+	oa.builder_append(&b, i64(200))
+	oa.builder_append_null(&b)
+	oa.builder_append(&b, i64(1))
+	src, err := oa.builder_finish(&b)
+	testing.expect_value(t, err, mem.Allocator_Error.None)
+	defer oa.array_free(&src)
+
+	d := oa.dict_encode(&src, i64)
+	defer oa.dict_free(&d)
+
+	sub := oa.dict_slice(d, 2, 4) // [100, 200]
+	lo, hi, ok := oa.dict_min_max(&sub)
+	testing.expect(t, ok, "non-empty non-null slice must have min/max")
+	testing.expect_value(t, lo, 100.0)
+	testing.expect_value(t, hi, 200.0)
+
+	empty_sub := oa.dict_slice(d, 2, 2)
+	_, _, empty_ok := oa.dict_min_max(&empty_sub)
+	testing.expect(t, !empty_ok, "empty dict slice must return ok=false")
+
+	null_sub := oa.dict_slice(d, 1, 2)
+	_, _, null_ok := oa.dict_min_max(&null_sub)
+	testing.expect(t, !null_ok, "all-null dict slice must return ok=false")
+}
+
+@(test)
+test_ipc_preserves_non_nullable_and_unsigned_types :: proc(t: ^testing.T) {
+	fpath := ipc_test_temp_path("nonnull_uint", "arrow")
+	spath := ipc_test_temp_path("nonnull_uint", "arrows")
+	defer {
+		_ = os.remove(fpath); delete(fpath)
+		_ = os.remove(spath); delete(spath)
+	}
+
+	fields := []oa.Field{
+		oa.field_make("u8",  oa.UInt8_Type{},  nullable = false),
+		oa.field_make("u16", oa.UInt16_Type{}, nullable = false),
+		oa.field_make("u32", oa.UInt32_Type{}, nullable = false),
+		oa.field_make("u64", oa.UInt64_Type{}, nullable = false),
+		oa.field_make("i32", oa.Int32_Type{},  nullable = true),
+	}
+	sc, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, mem.Allocator_Error.None)
+	defer oa.schema_free(&sc)
+
+	c0 := build_array([]u8{1, 255})
+	c1 := build_array([]u16{2, 65535})
+	c2 := build_array([]u32{3, 4_000_000_000})
+	c3 := build_array([]u64{4, max(u64)})
+	c4 := build_array([]i32{-5, 42})
+	rb, rb_ok := oa.record_batch_make(&sc, []oa.Array{c0, c1, c2, c3, c4})
+	testing.expect(t, rb_ok)
+	defer oa.record_batch_free(&rb)
+
+	testing.expect(t, oa.ipc_write_file(fpath, &sc, []oa.Record_Batch{rb}))
+	testing.expect(t, oa.ipc_write_stream(spath, &sc, []oa.Record_Batch{rb}))
+
+	verify_schema :: proc(t: ^testing.T, out_sc: ^oa.Schema) {
+		testing.expect_value(t, len(out_sc.fields), 5)
+		if len(out_sc.fields) != 5 { return }
+		testing.expect_value(t, out_sc.fields[0].nullable, false)
+		testing.expect_value(t, out_sc.fields[1].nullable, false)
+		testing.expect_value(t, out_sc.fields[2].nullable, false)
+		testing.expect_value(t, out_sc.fields[3].nullable, false)
+		testing.expect_value(t, out_sc.fields[4].nullable, true)
+		testing.expect_value(t, oa.type_name(out_sc.fields[0].type), "uint8")
+		testing.expect_value(t, oa.type_name(out_sc.fields[1].type), "uint16")
+		testing.expect_value(t, oa.type_name(out_sc.fields[2].type), "uint32")
+		testing.expect_value(t, oa.type_name(out_sc.fields[3].type), "uint64")
+		testing.expect_value(t, oa.type_name(out_sc.fields[4].type), "int32")
+	}
+
+	sc_f, bs_f, ok_f := oa.ipc_read_file(fpath, use_mmap = false)
+	testing.expect(t, ok_f)
+	if ok_f {
+		verify_schema(t, sc_f)
+		oa.schema_free(sc_f); free(sc_f)
+		for &b in bs_f { oa.record_batch_free(&b) }
+		delete(bs_f)
+	}
+
+	sc_s, bs_s, ok_s := oa.ipc_read_stream(spath, use_mmap = false)
+	testing.expect(t, ok_s)
+	if ok_s {
+		verify_schema(t, sc_s)
+		oa.schema_free(sc_s); free(sc_s)
+		for &b in bs_s { oa.record_batch_free(&b) }
+		delete(bs_s)
+	}
+}
+
+@(test)
+test_selection_sum_len_and_order_independent_nan_minmax :: proc(t: ^testing.T) {
+	nan := math.nan_f64()
+	arr_first := build_array([]f64{nan, 3.0, -2.0, 5.0})
+	defer oa.array_free(&arr_first)
+	arr_last := build_array([]f64{3.0, -2.0, 5.0, nan})
+	defer oa.array_free(&arr_last)
+	arr_all_nan := build_array([]f64{nan, nan})
+	defer oa.array_free(&arr_all_nan)
+
+	// 1. compute_sum_selection must iterate sel.length, not len(sel.indices).
+	vals := build_array([]f64{10.0, 20.0, 1000.0, 2000.0})
+	defer oa.array_free(&vals)
+	idx_buf := [4]i32{0, 1, 2, 3}
+	short_sel := oa.Selection{indices = idx_buf[:], length = 2}
+	s_val, s_vc := oa.compute_sum_selection(&vals, &short_sel)
+	testing.expect_value(t, s_val, 30.0)
+	testing.expect_value(t, s_vc, 2)
+
+	// Nullable array with len(sel.indices) > sel.length.
+	nb := oa.builder_make(f64, 4)
+	defer oa.builder_destroy(&nb)
+	oa.builder_append(&nb, 10.0)
+	oa.builder_append_null(&nb)
+	oa.builder_append(&nb, 1000.0)
+	oa.builder_append(&nb, 2000.0)
+	nvals, n_err := oa.builder_finish(&nb)
+	testing.expect_value(t, n_err, mem.Allocator_Error.None)
+	defer oa.array_free(&nvals)
+	ns_val, ns_vc := oa.compute_sum_selection(&nvals, &short_sel)
+	testing.expect_value(t, ns_val, 10.0)
+	testing.expect_value(t, ns_vc, 1)
+
+	// 2. compute_min_max_selection order-independent NaN handling.
+	full_sel := oa.Selection{indices = idx_buf[:], length = 4}
+	nan2_idx := [2]i32{0, 1}
+	nan2_sel := oa.Selection{indices = nan2_idx[:], length = 2}
+
+	lo1, hi1, vc1 := oa.compute_min_max_selection(&arr_first, &full_sel)
+	lo2, hi2, vc2 := oa.compute_min_max_selection(&arr_last, &full_sel)
+	testing.expect_value(t, vc1, 4)
+	testing.expect_value(t, vc2, 4)
+	testing.expect_value(t, lo1, -2.0)
+	testing.expect_value(t, hi1, 5.0)
+	testing.expect_value(t, lo2, -2.0)
+	testing.expect_value(t, hi2, 5.0)
+
+	alo, ahi, avc := oa.compute_min_max_selection(&arr_all_nan, &nan2_sel)
+	testing.expect_value(t, avc, 2)
+	testing.expect(t, math.is_nan(alo) && math.is_nan(ahi))
+
+	// 3. compute_min_max_where order-independent NaN handling.
+	mask4 := build_array([]bool{true, true, true, true})
+	defer oa.array_free(&mask4)
+	mask2 := build_array([]bool{true, true})
+	defer oa.array_free(&mask2)
+
+	wlo1, whi1, wvc1 := oa.compute_min_max_where(&arr_first, &mask4)
+	wlo2, whi2, wvc2 := oa.compute_min_max_where(&arr_last, &mask4)
+	testing.expect_value(t, wvc1, 4)
+	testing.expect_value(t, wvc2, 4)
+	testing.expect_value(t, wlo1, -2.0)
+	testing.expect_value(t, whi1, 5.0)
+	testing.expect_value(t, wlo2, -2.0)
+	testing.expect_value(t, whi2, 5.0)
+
+	walo, wahi, wavc := oa.compute_min_max_where(&arr_all_nan, &mask2)
+	testing.expect_value(t, wavc, 2)
+	testing.expect(t, math.is_nan(walo) && math.is_nan(wahi))
+
+	// 4. compute_agg_where_compare order-independent NaN handling.
+	pred4 := build_array([]f64{1.0, 2.0, 3.0, 4.0})
+	defer oa.array_free(&pred4)
+	pred2 := build_array([]f64{1.0, 2.0})
+	defer oa.array_free(&pred2)
+
+	agg1 := oa.compute_agg_where_compare(&arr_first, &pred4, .Gt, 0.0)
+	agg2 := oa.compute_agg_where_compare(&arr_last, &pred4, .Gt, 0.0)
+	testing.expect(t, agg1.valid && agg2.valid)
+	testing.expect_value(t, agg1.count, 4)
+	testing.expect_value(t, agg2.count, 4)
+	testing.expect_value(t, agg1.min_val, -2.0)
+	testing.expect_value(t, agg1.max_val, 5.0)
+	testing.expect_value(t, agg2.min_val, -2.0)
+	testing.expect_value(t, agg2.max_val, 5.0)
+
+	agga := oa.compute_agg_where_compare(&arr_all_nan, &pred2, .Gt, 0.0)
+	testing.expect(t, agga.valid)
+	testing.expect_value(t, agga.count, 2)
+	testing.expect(t, math.is_nan(agga.min_val) && math.is_nan(agga.max_val))
+
+	// 5. Nullable branches of _agg_where_float_mono and _min_max_selection_typed with NaN + nulls.
+	nb_nan := oa.builder_make(f64, 5)
+	defer oa.builder_destroy(&nb_nan)
+	oa.builder_append_null(&nb_nan)
+	oa.builder_append(&nb_nan, nan)
+	oa.builder_append(&nb_nan, 3.0)
+	oa.builder_append(&nb_nan, -2.0)
+	oa.builder_append(&nb_nan, 5.0)
+	arr_null_nan, nn_err := oa.builder_finish(&nb_nan)
+	testing.expect_value(t, nn_err, mem.Allocator_Error.None)
+	defer oa.array_free(&arr_null_nan)
+
+	pred5 := build_array([]f64{1.0, 2.0, 3.0, 4.0, 5.0})
+	defer oa.array_free(&pred5)
+	agg_null := oa.compute_agg_where_compare(&arr_null_nan, &pred5, .Gt, 0.0)
+	testing.expect(t, agg_null.valid)
+	testing.expect_value(t, agg_null.count, 4)
+	testing.expect_value(t, agg_null.min_val, -2.0)
+	testing.expect_value(t, agg_null.max_val, 5.0)
+
+	idx5 := [5]i32{0, 1, 2, 3, 4}
+	sel5 := oa.Selection{indices = idx5[:], length = 5}
+	nlo, nhi, nvc := oa.compute_min_max_selection(&arr_null_nan, &sel5)
+	testing.expect_value(t, nvc, 4)
+	testing.expect_value(t, nlo, -2.0)
+	testing.expect_value(t, nhi, 5.0)
+}
