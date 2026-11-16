@@ -250,7 +250,9 @@ _min_max_selection_typed :: #force_inline proc(arr: ^Array, sel: ^Selection, $T:
 		_ = last_nan
 	}
 	seen := false
-	for j in 0..<sel.length {
+	// Phase 1: seed lo/hi with the first valid non-NaN element.
+	j := 0
+	for ; j < sel.length; j += 1 {
 		i := int(sel.indices[j])
 		if has_nulls && !array_is_valid(arr, i) { continue }
 		v := data[off + i]
@@ -258,7 +260,22 @@ _min_max_selection_typed :: #force_inline proc(arr: ^Array, sel: ^Selection, $T:
 		when T == f32 || T == f64 {
 			if v != v { last_nan = v; continue }
 		}
-		if seen { if v < lo { lo = v }; if v > hi { hi = v } } else { lo = v; hi = v; seen = true }
+		lo = v
+		hi = v
+		seen = true
+		j += 1
+		break
+	}
+	// Phase 2: hot loop without per-row `v != v` or `seen` branches.
+	// Phase 1 guarantees lo/hi are non-NaN for floats, so IEEE 754 `<`/`>`
+	// evaluate to false for any subsequent NaN.
+	for ; j < sel.length; j += 1 {
+		i := int(sel.indices[j])
+		if has_nulls && !array_is_valid(arr, i) { continue }
+		v := data[off + i]
+		valid_count += 1
+		if v < lo { lo = v }
+		if v > hi { hi = v }
 	}
 	if seen {
 		min_val = f64(lo)

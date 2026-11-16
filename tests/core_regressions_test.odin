@@ -1981,4 +1981,31 @@ test_selection_sum_len_and_order_independent_nan_minmax :: proc(t: ^testing.T) {
 	testing.expect(t, agga.valid)
 	testing.expect_value(t, agga.count, 2)
 	testing.expect(t, math.is_nan(agga.min_val) && math.is_nan(agga.max_val))
+
+	// 5. Nullable branches of _agg_where_float_mono and _min_max_selection_typed with NaN + nulls.
+	nb_nan := oa.builder_make(f64, 5)
+	defer oa.builder_destroy(&nb_nan)
+	oa.builder_append_null(&nb_nan)
+	oa.builder_append(&nb_nan, nan)
+	oa.builder_append(&nb_nan, 3.0)
+	oa.builder_append(&nb_nan, -2.0)
+	oa.builder_append(&nb_nan, 5.0)
+	arr_null_nan, nn_err := oa.builder_finish(&nb_nan)
+	testing.expect_value(t, nn_err, mem.Allocator_Error.None)
+	defer oa.array_free(&arr_null_nan)
+
+	pred5 := build_array([]f64{1.0, 2.0, 3.0, 4.0, 5.0})
+	defer oa.array_free(&pred5)
+	agg_null := oa.compute_agg_where_compare(&arr_null_nan, &pred5, .Gt, 0.0)
+	testing.expect(t, agg_null.valid)
+	testing.expect_value(t, agg_null.count, 4)
+	testing.expect_value(t, agg_null.min_val, -2.0)
+	testing.expect_value(t, agg_null.max_val, 5.0)
+
+	idx5 := [5]i32{0, 1, 2, 3, 4}
+	sel5 := oa.Selection{indices = idx5[:], length = 5}
+	nlo, nhi, nvc := oa.compute_min_max_selection(&arr_null_nan, &sel5)
+	testing.expect_value(t, nvc, 4)
+	testing.expect_value(t, nlo, -2.0)
+	testing.expect_value(t, nhi, 5.0)
 }
