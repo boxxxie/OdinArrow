@@ -556,3 +556,21 @@ test_ipc_rejects_unknown_type_discriminant_no_leak :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+@(test)
+test_ipc_write_stream_chardev :: proc(t: ^testing.T) {
+	when ODIN_OS == .Linux {
+		fields := []oa.Field{oa.field_make("v", oa.Int32_Type{})}
+		schema, sc_err := oa.schema_make(fields)
+		testing.expect_value(t, sc_err, nil)
+		defer oa.schema_free(&schema)
+
+		col := make_i32_array([]i32{10, 20, 30})
+		batch, rb_ok := oa.record_batch_make(&schema, []oa.Array{col})
+		testing.expect(t, rb_ok)
+		defer oa.record_batch_free(&batch)
+
+		testing.expect(t, oa.ipc_write_stream("/dev/null", &schema, []oa.Record_Batch{batch}),
+			"ipc_write_stream must succeed on character devices without failing on ftruncate")
+	}
+}

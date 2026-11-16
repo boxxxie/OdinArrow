@@ -640,8 +640,9 @@ _ipc_encode_footer :: proc(schema: ^Schema, blocks: []IPC_Block, allocator := co
 
 // ── Vectored writer ───────────────────────────────────────────────────────────
 
-_IPC_IOV_MAX    :: 1024
-_IPC_INLINE_CAP :: 8192
+_IPC_IOV_MAX       :: 1024
+_IPC_INLINE_CAP    :: 8192
+_IPC_MAX_IOV_BYTES :: 1 << 30 // 1 GiB chunk cap keeps Darwin writev sum <= INT32_MAX
 
 @(private="file", rodata)
 _ipc_zero_pad := [8]u8{}
@@ -654,12 +655,13 @@ _ipc_magic_tail_bytes := [6]u8{'A', 'R', 'R', 'O', 'W', '1'}
 
 @(private="file")
 _IPC_Vectored_Writer :: struct {
-	f:          ^os.File,
-	iovs:       [_IPC_IOV_MAX]_IPC_IOVec,
-	iov_count:  int,
-	inline_buf: [_IPC_INLINE_CAP]u8,
-	inline_pos: int,
-	file_pos:   i64,
+	f:            ^os.File,
+	iovs:         [_IPC_IOV_MAX]_IPC_IOVec,
+	iov_count:    int,
+	queued_bytes: i64,
+	inline_buf:   [_IPC_INLINE_CAP]u8,
+	inline_pos:   int,
+	file_pos:     i64,
 }
 
 _ipc_advance_iovecs :: proc "contextless" (iovs: []_IPC_IOVec, written: int) -> []_IPC_IOVec {
@@ -684,6 +686,7 @@ _ipc_vw_flush :: proc(w: ^_IPC_Vectored_Writer) -> bool {
 	if !ok { return false }
 	w.file_pos += written
 	w.iov_count = 0
+	w.queued_bytes = 0
 	w.inline_pos = 0
 	return true
 }
@@ -691,25 +694,38 @@ _ipc_vw_flush :: proc(w: ^_IPC_Vectored_Writer) -> bool {
 // Queue a byte slice whose backing memory remains valid until the next flush.
 @(private="file")
 _ipc_vw_write :: proc(w: ^_IPC_Vectored_Writer, data: []u8) -> bool {
-	if len(data) == 0 { return true }
-	if w.iov_count > 0 {
-		prev := &w.iovs[w.iov_count - 1]
-		prev_end := uintptr(prev.iov_base) + uintptr(prev.iov_len)
-		if prev_end == uintptr(raw_data(data)) &&
-			uint(prev.iov_len) <= uint(max(i32)) &&
-			uint(len(data)) <= uint(max(i32)) - uint(prev.iov_len) {
-			prev.iov_len += _IPC_IOVec_Len(len(data))
-			return true
+	rem := data
+	for len(rem) > 0 {
+		chunk_len := min(len(rem), _IPC_MAX_IOV_BYTES)
+		chunk := rem[:chunk_len]
+		if w.queued_bytes + i64(chunk_len) > i64(max(i32)) {
+			if !_ipc_vw_flush(w) { return false }
 		}
+		coalesced := false
+		if w.iov_count > 0 {
+			prev := &w.iovs[w.iov_count - 1]
+			prev_end := uintptr(prev.iov_base) + uintptr(prev.iov_len)
+			if prev_end == uintptr(raw_data(chunk)) &&
+			   uint(prev.iov_len) <= uint(max(i32)) &&
+			   uint(chunk_len) <= uint(max(i32)) - uint(prev.iov_len) {
+				prev.iov_len += _IPC_IOVec_Len(chunk_len)
+				w.queued_bytes += i64(chunk_len)
+				coalesced = true
+			}
+		}
+		if !coalesced {
+			if w.iov_count >= _IPC_IOV_MAX {
+				if !_ipc_vw_flush(w) { return false }
+			}
+			w.iovs[w.iov_count] = _IPC_IOVec{
+				iov_base = raw_data(chunk),
+				iov_len  = _IPC_IOVec_Len(chunk_len),
+			}
+			w.iov_count += 1
+			w.queued_bytes += i64(chunk_len)
+		}
+		rem = rem[chunk_len:]
 	}
-	if w.iov_count >= _IPC_IOV_MAX {
-		if !_ipc_vw_flush(w) { return false }
-	}
-	w.iovs[w.iov_count] = _IPC_IOVec{
-		iov_base = raw_data(data),
-		iov_len  = _IPC_IOVec_Len(len(data)),
-	}
-	w.iov_count += 1
 	return true
 }
 
@@ -718,7 +734,9 @@ _ipc_vw_write :: proc(w: ^_IPC_Vectored_Writer, data: []u8) -> bool {
 _ipc_vw_write_inline :: proc(w: ^_IPC_Vectored_Writer, data: []u8) -> bool {
 	if len(data) == 0 { return true }
 	if len(data) > _IPC_INLINE_CAP { return false }
-	if w.inline_pos + len(data) > _IPC_INLINE_CAP || w.iov_count >= _IPC_IOV_MAX {
+	if w.inline_pos + len(data) > _IPC_INLINE_CAP ||
+	   w.iov_count >= _IPC_IOV_MAX ||
+	   w.queued_bytes + i64(len(data)) > i64(max(i32)) {
 		if !_ipc_vw_flush(w) { return false }
 	}
 	dst := w.inline_buf[w.inline_pos : w.inline_pos + len(data)]
@@ -744,17 +762,18 @@ _ipc_vw_i32 :: proc(w: ^_IPC_Vectored_Writer, v: i32) -> bool {
 ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
-	f, err := os.open(path, {.Write, .Create}, os.Permissions_Default_File)
+	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
 	if err != nil { return false }
 	write_ok := false
 	defer {
-		if !write_ok { _ = os.truncate(f, 0) }
 		os.close(f)
+		if !write_ok { _ = os.remove(path) }
 	}
 
 	w: _IPC_Vectored_Writer = ---
 	w.f = f
 	w.iov_count = 0
+	w.queued_bytes = 0
 	w.inline_pos = 0
 	w.file_pos = 0
 
@@ -795,7 +814,6 @@ ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -
 	// Tail magic
 	if !_ipc_vw_write(&w, _ipc_magic_tail_bytes[:]) { return false }
 	if !_ipc_vw_flush(&w) { return false }
-	_ = os.truncate(f, w.file_pos)
 	write_ok = true
 	return true
 }
@@ -968,17 +986,14 @@ ipc_read_file :: proc(path: string, allocator := context.allocator, validate := 
 ipc_write_stream :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
-	f, err := os.open(path, {.Write, .Create}, os.Permissions_Default_File)
+	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
 	if err != nil { return false }
-	write_ok := false
-	defer {
-		if !write_ok { _ = os.truncate(f, 0) }
-		os.close(f)
-	}
+	defer os.close(f)
 
 	w: _IPC_Vectored_Writer = ---
 	w.f = f
 	w.iov_count = 0
+	w.queued_bytes = 0
 	w.inline_pos = 0
 	w.file_pos = 0
 	offset := i64(0)
@@ -997,8 +1012,6 @@ ipc_write_stream :: proc(path: string, schema: ^Schema, batches: []Record_Batch)
 	if !_ipc_vw_u32(&w, 0xFFFF_FFFF) { return false }
 	if !_ipc_vw_u32(&w, 0)           { return false }
 	if !_ipc_vw_flush(&w)            { return false }
-	_ = os.truncate(f, w.file_pos)
-	write_ok = true
 	return true
 }
 
