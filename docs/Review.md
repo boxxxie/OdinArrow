@@ -310,11 +310,11 @@ Skadi separates **library (`skadi/`)** from **CLI examples (`examples/`)** and *
 
 | Area | Skadi | Apache Arrow |
 |---|---|---|
-| Unit & regression tests | ✅ **224 tests** across 17 files (`tests/` via `make test`) | ✅ extensive |
+| Unit & regression tests | ✅ **230 tests** across 17 files (`tests/` via `make test`) | ✅ extensive |
 | 4-layer ATDD specs & property tests | ✅ **22 specs** (`specs/` via `make test-specs`) + 6 Python tests | — |
 | C++ interop & layout parity tests | ✅ **14 tests** (`tests_cpp/` via `make test-cpp`) | — |
 | Statistical 1v1 benchmark suite vs C++ `25.0.1` | ✅ **26 workloads / 32 rows** (`make bench-1v1`) | ✅ (conbench) |
-| CI (GitHub Actions) | ✅ [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (Linux + macOS) | ✅ |
+| CI (GitHub Actions) | ✅ [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (Linux) | ✅ |
 | Repo layout & IDE tooling | ✅ idiomatic `skadi/` + `skadi/pipeline/` + `ols.json` | ✅ |
 | Documentation | ✅ `README.md`, `CHANGELOG.md`, `docs/`, `benchmarks/RESULTS.md` | ✅ arrow.apache.org |
 
@@ -390,4 +390,4 @@ Multi-language bindings                         ░░░░░░░░░░  
 
 ---
 
-*This review reflects the repository state at update time (**224 unit tests + 22 ATDD specs + 6 Python comparator tests + 14 C++ FFI tests**).*
+*This review reflects the repository state at update time (**230 unit tests + 22 ATDD specs + 6 Python comparator tests + 14 C++ FFI tests**).*

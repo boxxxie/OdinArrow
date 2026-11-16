@@ -2,7 +2,7 @@
 
 > Updated: 2026-11-16  
 > Scope: full repository review (`skadi/`, `skadi/pipeline/`, `deps/sleipnir/actor/`, `examples/`, `tests/`, `specs/`, `tests_cpp/`, `benchmarks/`, `.github/workflows/ci.yml`)  
-> Test status: **224 unit/regression tests + 22 ATDD specs + 6 Python comparator tests passing** (`make test`), plus **14 Arrow C++ FFI parity tests** (`make test-cpp`) and strict static checks across 13 Odin targets (`make check`)
+> Test status: **230 unit/regression tests + 22 ATDD specs + 6 Python comparator tests passing** (`make test`), plus **14 Arrow C++ FFI parity tests** (`make test-cpp`) and strict static checks across 13 Odin targets (`make check`)
 
 ---
 
@@ -63,14 +63,14 @@ skadi/
 │   └── sleipnir_pipeline.odin          # Sharded SPSC super-morsel aggs, dict histograms, MSB-bucket sorts
 │
 ├── deps/sleipnir/actor/                # Vendored lock-free actor, MPSC/SPSC & envelope-pool runtime
-│   ├── actor.odin, doc.odin, mpsc.odin, pool.odin, spsc.odin
+│   ├── actor.odin, doc.odin, mpsc.odin, pool.odin, spsc.odin, supervision.odin
 │
 ├── examples/                           # Standalone CLI tools & demos (not library API)
 │   ├── quickstart/main.odin            # Runnable API + PyArrow IPC round-trip tour
 │   ├── csv_to_parquet/                 # Streaming RFC 4180 CSV -> native Parquet writer
 │   └── parquet_to_csv/                 # Native Parquet reader -> streaming CSV writer
 │
-├── tests/                              # 17 unit & regression test files (224 tests, no C++ dep)
+├── tests/                              # 17 unit & regression test files (230 tests, no C++ dep)
 ├── specs/                              # 10 files (Layers 1-3 ATDD executable specs, 22 specs)
 ├── tests_cpp/arrow_cpp_test.odin       # 14 FFI layout & IPC parity tests vs Arrow C++
 ├── benchmarks/
@@ -85,7 +85,7 @@ skadi/
 │   └── RESULTS.md                      # Benchmark methodology, analysis, and 32-row stats table
 │
 ├── docs/                               # Cursor.md, Endeavor.md, Review.md
-├── .github/workflows/ci.yml            # GitHub Actions CI (Ubuntu + macOS)
+├── .github/workflows/ci.yml            # GitHub Actions CI (Ubuntu Linux)
 ├── CHANGELOG.md                        # Release & unreleased change log
 ├── ols.json                            # Language server & strict checker profile
 ├── Makefile                            # Build, check, test, FFI, and benchmark targets
@@ -253,7 +253,7 @@ Self-contained back-to-front FlatBuffers encoder (`FBB`) and bounds-checked deco
 | Target | Purpose | Dependencies |
 |---|---|---|
 | `make check` | Strict static analysis (`-vet -strict-style -disallow-do -warnings-as-errors`) across 13 Odin packages/targets | Odin only |
-| `make test` | Run 224 unit/regression tests (`tests/`) + 22 ATDD specs (`specs/`) + 6 Python comparator tests | Odin + Python 3 |
+| `make test` | Run 230 unit/regression tests (`tests/`) + 22 ATDD specs (`specs/`) + 6 Python comparator tests | Odin + Python 3 |
 | `make test-specs` | Run 22 ATDD specs + 6 Python comparator tests | Odin + Python 3 |
 | `make test-cpp` | Build `lib/libarrow_capi.so` and run 14 FFI + IPC parity tests | Arrow C++ (`pkg-config` or PyArrow fallback) |
 | `make bench-1v1` | Statistical 1v1 suite (Odin ST/MT vs Arrow C++ `25.0.1`) | Arrow C++ |
@@ -261,13 +261,13 @@ Self-contained back-to-front FlatBuffers encoder (`FBB`) and bounds-checked deco
 | `make parquet-odin csv-to-parquet-odin` | Build native CSV ↔ Parquet CLI binaries | Odin only |
 | `make parquet-ffi csv-to-parquet-ffi` | Build FFI CSV ↔ Parquet CLI binaries (`lib/libparquet_capi.so`) | Arrow + Parquet C++ |
 
-CI runs on Ubuntu and macOS (`.github/workflows/ci.yml`), verifying `make check`, `make test`, `odin doc`, quickstart PyArrow IPC verification, native CSV ↔ Parquet round-trip, and on Linux `make test-cpp build-parquet-capi parquet-ffi csv-to-parquet-ffi`.
+CI runs on Ubuntu Linux (`.github/workflows/ci.yml`), verifying `make check`, `make test`, `odin doc`, quickstart PyArrow IPC verification, native CSV ↔ Parquet round-trip, and `make test-cpp build-parquet-capi parquet-ffi csv-to-parquet-ffi`.
 
 ---
 
 ## 5. Test Coverage Summary
 
-- **`tests/` (17 files, 224 tests):** `array_test.odin` (31), `bench_stats_test.odin` (6), `bitmap_test.odin` (12), `buffer_pool_test.odin` (8), `buffer_test.odin` (14), `compute_parallel_test.odin` (8), `compute_test.odin` (46), `core_regressions_test.odin` (21), `dict_test.odin` (6), `hardware_config_test.odin` (2), `ipc_test.odin` (9), `parquet_internals_test.odin` (19), `rle_test.odin` (6), `schema_test.odin` (8), `sleipnir_pipeline_test.odin` (7), `strings_test.odin` (16), `umbra_test.odin` (5).
+- **`tests/` (17 files, 230 tests):** `array_test.odin` (31), `bench_stats_test.odin` (6), `bitmap_test.odin` (12), `buffer_pool_test.odin` (8), `buffer_test.odin` (14), `compute_parallel_test.odin` (8), `compute_test.odin` (46), `core_regressions_test.odin` (26), `dict_test.odin` (6), `hardware_config_test.odin` (2), `ipc_test.odin` (9), `parquet_internals_test.odin` (20), `rle_test.odin` (6), `schema_test.odin` (8), `sleipnir_pipeline_test.odin` (7), `strings_test.odin` (16), `umbra_test.odin` (5).
 - **`specs/` (10 files, 22 ATDD specs):** 4-layer executable specifications split cleanly by domain into `driver_{core,ipc,parquet_csv}_test.odin` (Layer 3), `dsl_{core,ipc,parquet_csv}_test.odin` (Layer 2), and `workflows_spec_test.odin` / `ipc_matrix_spec_test.odin` / `properties_spec_test.odin` / `properties_compute_spec_test.odin` (Layer 1).
 - **`tests_cpp/` (14 tests):** `arrow_cpp_test.odin` (sum, min/max, filter, string scan, sliced arrays, `i64`/`u64`/`f32`/`bool`/`Binary`, IPC round-trip).
 - **`benchmarks/` (6 tests):** `test_compare_1v1.py`.
@@ -328,7 +328,7 @@ flowchart TD
 | Compute, selection, fusion & Sleipnir pipeline | **Strong** | Beats Arrow C++ `25.0.1` on all 26 1v1 ST + MT workloads |
 | Arrow IPC file & stream | **Good** | Vectored `writev`, `mmap` reads, bounds-hardened FlatBuffers |
 | Parquet (native CLI in `examples/`) | **Subset** | Uncompressed PLAIN + dict/RLE reads; full fidelity via FFI |
-| CI & testing | **Strong** | 224 unit + 22 ATDD + 14 FFI + 6 Python tests; Linux/macOS CI |
+| CI & testing | **Strong** | 230 unit + 22 ATDD + 14 FFI + 6 Python tests; Ubuntu Linux CI |
 
 ---
 

@@ -1,4 +1,4 @@
-# Skadi
+# Skadi (`package skadi`)
 
 [![CI](https://github.com/boxxxie/skadi/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/skadi/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](CHANGELOG.md)
@@ -6,60 +6,22 @@
 [![License: Zlib](https://img.shields.io/badge/License-Zlib-lightgrey.svg)](LICENSE)
 [![Arrow IPC](https://img.shields.io/badge/Arrow%20IPC-Feather%20v2-orange.svg)](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc)
 
-A native [Apache Arrow](https://arrow.apache.org/) implementation in the
-[Odin](https://odin-lang.org/) language — columnar in-memory format, compute
-kernels, and the Arrow IPC format (Feather v2), with zero-overhead abstractions
-and explicit memory management.
+A native [Apache Arrow](https://arrow.apache.org/) implementation in [Odin](https://odin-lang.org/) (`package skadi` and optional `package pipeline` in [`skadi/pipeline/`](skadi/pipeline/sleipnir_pipeline.odin)) — providing a columnar in-memory format, SIMD and parallel compute kernels, companion compressed encodings, and Arrow IPC (Feather v2) serialization with explicit memory management.
 
-Files written by Skadi are readable directly by **PyArrow** and **Apache Arrow
-C++**, and vice-versa.
+Files and streams written by Skadi are readable directly by **PyArrow** and **Apache Arrow C++**, and vice-versa.
 
-We aim to be faster than the original - with our appreciation of what the Apache
-Arrow project has accomplished.
+## Features
 
-## Highlights
+- **Spec-Aligned Columnar Memory** — 64-byte aligned buffers ([`Buffer`](skadi/buffer.odin)), packed little-endian validity bitmaps ([`bitmap.odin`](skadi/bitmap.odin)), `O(1)` zero-copy slicing, Arrow C Data Interface buffer layout, and a single-threaded [`Buffer_Pool`](skadi/buffer_pool.odin) allocator with power-of-two/256 KB bucketing, 25% large-block slack reuse, hit/miss telemetry, and a 128 MB LRU eviction cap for `>4 MB` blocks.
+- **Type System & Companion Encodings** — 16-variant tagged-union `DataType` ([`types.odin`](skadi/types.odin)): `Null_Type`, `Bool_Type`, `Int8`–`Int64`, `UInt8`–`UInt64`, `Float32`/`Float64`, `String_Type`/`Binary_Type` (`i32` offsets), and `Large_String_Type`/`Large_Binary_Type` (`i64` offsets), paired with cache-optimized companion structures: [`Umbra_Array`](skadi/umbra.odin) (16-byte German strings with 12-byte inline / 4-byte prefix fast paths), [`RLE_Array(T)`](skadi/rle.odin) (run-end encoding with `O(runs)` kernels), and [`Dict_Array(T)` / `Str_Dict_Array`](skadi/dict.odin) (dictionary encoding with `O(n_dict)` min/max and integer-histogram aggregations).
+- **Zero-Copy Builders** — raw-buffer [`Primitive_Builder(T)`](skadi/builders.odin) and variable-length builders ([`var_length.odin`](skadi/var_length.odin)) with uninitialized data allocation, lazy validity bitmaps, `string_builder_reserve_data`, `O(1)` buffer-ownership transfer on `finish()`, `Buffer_Pool` integration, and `i32` offset overflow checks.
+- **SIMD Compute, Selection Vectors & Operator Fusion** — reductions (`sum`, `min`/`max`, `mean`, `count`), selectivity-hybrid `filter` (64-bit `tzcnt` + 256-entry byte-mask LUT), software-prefetched `take`, numeric `cast`, element-wise arithmetic, monomorphised comparisons, and `sort_indices` (packed 8-byte `(key_u32, idx_u32)` LSD radix sort for integers; prefix radix + tie-break merge sort for strings and Umbra arrays); target-scoped AVX2/SIMD reductions ([`compute_simd.odin`](skadi/compute_simd.odin)); lazy [`Selection`](skadi/selection.odin) vectors with L1d-resident `u16` morsels ([`hardware_config.odin`](skadi/hardware_config.odin)); and zero-allocation single-pass fused operators (`compute_sum_where`, `compute_agg_where_compare`).
+- **Parallel Thread Pool & Sleipnir Actor Pipeline** — persistent work-stealing `*_parallel` kernels ([`compute_parallel.odin`](skadi/compute_parallel.odin), [`thread_pool.odin`](skadi/thread_pool.odin)), plus the cache-resident [`Morsel_Pipeline`](skadi/pipeline/sleipnir_pipeline.odin) backed by [`deps/sleipnir/actor/`](deps/sleipnir/actor/doc.odin) (`Envelope_Pool` + wait-free `Sharded_SPSC_Mailbox`) for super-morsel fused aggregations, dictionary histograms, and zero-merge-pass MSB-bucket parallel sorting.
+- **Zero-Copy Arrow IPC (Feather v2)** — file (random batch access) and stream (sequential) readers and writers ([`ipc.odin`](skadi/ipc.odin)) using a self-contained FlatBuffers encoder/decoder, vectored `writev` zero-copy writes, POSIX `mmap` zero-copy reads (`use_mmap=false` heap-copy fallback), atomically refcounted `Record_Batch._ipc_backing` lifetimes, and bounds/offset validation (`validate=true`).
 
-- **Columnar memory** — 64-byte-aligned buffers, packed validity bitmaps,
-  zero-copy slicing, the Arrow C Data Interface buffer layout.
-- **Type system & compressed encodings** — a tagged union of Arrow types (no
-  vtables): `Bool`, `Int8…64`, `UInt8…64`, `Float32/64`, `Utf8`/`Binary`
-  (`i32` offsets), `LargeUtf8`/`LargeBinary` (`i64` offsets), `Null` — plus
-  encoding-aware arrays: [`Umbra_Array`](skadi/umbra.odin) (16-byte German strings
-  with inline/prefix fast paths), [`RLE_Array(T)`](skadi/rle.odin) (run-end
-  encoding), and [`Dict_Array(T)` / `Str_Dict_Array`](skadi/dict.odin) (dictionary
-  encoding).
-- **Builders** — raw-buffer, zero-copy `finish()`, pre-reserved capacity
-  (`string_builder_reserve_data`), lazy validity bitmaps, release-mode 2 GiB `i32`
-  offset overflow checks, plus a reusable [`Buffer_Pool`](skadi/buffer_pool.odin)
-  with power-of-two/256 KB bucketing, 25% large-block slack reuse, hit/miss
-  telemetry, and a 128 MB LRU cap for `>4 MB` blocks.
-- **Compute kernels, fusion & selection vectors** — `sum`, `min`/`max`, `mean`,
-  `count`, selectivity-hybrid `filter` (256-entry byte-mask LUT / `tzcnt`),
-  software-prefetched `take` (with release-mode bounds guards), `cast`,
-  element-wise arithmetic, comparisons, and `sort_indices` (packed `u32` LSD
-  radix sort for integers, prefix radix + tie-break merge sort for
-  strings/Umbra); target-scoped AVX2/SIMD reductions across numeric widths;
-  fused operators (`compute_sum_where`, `compute_agg_where_compare`) and lazy
-  [`Selection`](skadi/selection.odin) vectors with L1d-resident `u16` morsel
-  kernels ([`skadi/hardware_config.odin`](skadi/hardware_config.odin)).
-- **Parallel & Sleipnir actor execution** — work-stealing `*_parallel` kernels
-  ([`skadi/thread_pool.odin`](skadi/thread_pool.odin)), including
-  `compute_filter_parallel` (fixed-width + variable-length strings/binary),
-  `compute_take_parallel`, and `compute_sel_2pred_sum_parallel`, plus the
-  cache-resident **Sleipnir actor & sharded SPSC morsel pipeline**
-  ([`skadi/pipeline/sleipnir_pipeline.odin`](skadi/pipeline/sleipnir_pipeline.odin))
-  for super-morsel fused aggregations (`pipeline_agg_where_f64`,
-  `pipeline_sel_2pred_sum_f64`), dictionary histograms (`pipeline_dict_value_counts`,
-  `pipeline_dict_group_sum`, `pipeline_dict_sum`), and MSB-bucket parallel
-  radix/string/Umbra sorting (`pipeline_sort_indices`, `pipeline_umbra_sort_indices`).
-- **Arrow IPC** — file (random batch access) and stream (sequential) formats,
-  **vectored `writev` zero-copy writes** (with Darwin `max(i32)` chunking and
-  overwrite-safe regular-file truncation), **memory-mapped (`mmap`) zero-copy
-  reads** (`use_mmap=false` copy fallback), refcounted `Record_Batch._ipc_backing`
-  lifetime, FlatBuffers/offset validation (`validate=true`), hand-rolled
-  FlatBuffers encoder/decoder, and bidirectional PyArrow / Arrow C++ interop.
+## Quick Start
 
-## Quick example
+Import the `skadi` package via a relative path or `-collection:skadi=...` (and `skadi/pipeline` for Sleipnir actor execution).
 
 ```odin
 package main
@@ -79,10 +41,10 @@ main :: proc() {
     total, valid := oa.compute_sum(&arr)
     fmt.printfln("sum=%.0f over %d non-null values", total, valid)
 
-    // Wrap it in a schema + record batch and write a (pyarrow-readable) IPC file.
+    // Wrap it in a schema + record batch and write a PyArrow-compatible IPC file.
     schema, _ := oa.schema_make([]oa.Field{ oa.field_make("v", oa.Float64_Type{}) })
     defer oa.schema_free(&schema)
-    batch, _ := oa.record_batch_make(&schema, []oa.Array{arr})  // batch now owns arr's buffers
+    batch, _ := oa.record_batch_make(&schema, []oa.Array{arr})  // batch owns arr's buffers
     defer oa.record_batch_free(&batch)
     oa.ipc_write_file("data.arrow", &schema, []oa.Record_Batch{batch})
 
@@ -100,6 +62,57 @@ Reading the same file in Python:
 ```python
 import pyarrow.ipc as ipc
 table = ipc.open_file("data.arrow").read_all()
+```
+
+### Core API Overview
+
+| Domain | Primary Types & Procedures | Source |
+|---|---|---|
+| Memory & Hardware | `Buffer`, `Buffer_Pool`, `bitmap_*`, `hardware_config_get` | [`buffer.odin`](skadi/buffer.odin), [`buffer_pool.odin`](skadi/buffer_pool.odin), [`bitmap.odin`](skadi/bitmap.odin), [`hardware_config.odin`](skadi/hardware_config.odin) |
+| Types & Containers | `DataType`, `Array`, `Schema`, `Record_Batch`, `Table`, `Chunked_Array` | [`types.odin`](skadi/types.odin), [`array.odin`](skadi/array.odin), [`schema.odin`](skadi/schema.odin), [`record_batch.odin`](skadi/record_batch.odin), [`table.odin`](skadi/table.odin) |
+| Builders | `builder_make`, `string_builder_make`, `binary_builder_make`, `large_string_builder_make`, `large_binary_builder_make` | [`builders.odin`](skadi/builders.odin), [`var_length.odin`](skadi/var_length.odin) |
+| Serial & Parallel Compute | `compute_sum`, `compute_min_max`, `compute_mean`, `compute_count`, `compute_filter`, `compute_take`, `compute_sort_indices`, `compute_cast`, `compute_arithmetic`, `*_parallel` | [`compute.odin`](skadi/compute.odin), [`compute_simd.odin`](skadi/compute_simd.odin), [`compute_parallel.odin`](skadi/compute_parallel.odin) |
+| Selection & Fusion | `Selection`, `compute_compare`, `compute_select_compare`, `selection_refine_compare`, `compute_sum_where`, `compute_agg_where_compare`, `compute_sel_2pred_sum` | [`selection.odin`](skadi/selection.odin), [`compare.odin`](skadi/compare.odin), [`compute_fused.odin`](skadi/compute_fused.odin), [`fusion.odin`](skadi/fusion.odin) |
+| Companion Encodings | `Umbra_Array`, `RLE_Array(T)`, `Dict_Array(T)`, `Str_Dict_Array` | [`umbra.odin`](skadi/umbra.odin), [`rle.odin`](skadi/rle.odin), [`dict.odin`](skadi/dict.odin) |
+| Sleipnir Actor Pipeline | `Morsel_Pipeline`, `pipeline_init`, `pipeline_agg_where_f64`, `pipeline_sel_2pred_sum_f64`, `pipeline_dict_value_counts`, `pipeline_dict_group_sum`, `pipeline_sort_indices`, `pipeline_umbra_sort_indices` | [`sleipnir_pipeline.odin`](skadi/pipeline/sleipnir_pipeline.odin) |
+| Arrow IPC | `ipc_write_file`, `ipc_write_stream`, `ipc_read_file`, `ipc_read_stream` | [`ipc.odin`](skadi/ipc.odin), [`ipc_mmap_unix.odin`](skadi/ipc_mmap_unix.odin) |
+
+## Building & Testing
+
+Requires the [Odin compiler](https://odin-lang.org/docs/install/).
+
+```sh
+make test                              # 230 unit/regression tests + 22 ATDD specs + 6 Python comparator tests
+make test-specs                        # 22 4-layer ATDD specs + 6 Python comparator tests
+make check                             # strict static analysis across all 13 Odin targets (-vet -strict-style -disallow-do -warnings-as-errors)
+make test-cpp                          # 14 Arrow C++ FFI layout & IPC parity tests (requires Arrow C++)
+make parquet-odin csv-to-parquet-odin  # build native streaming Parquet <-> CSV CLI tools into bin/
+odin run examples/quickstart -out:/tmp/quickstart   # run the runnable demo
+odin build skadi -build-mode:static -out:libskadi.a # build the core package as a static library
+```
+
+A complete, runnable tour of the API lives in [`examples/quickstart/main.odin`](examples/quickstart/main.odin); running it prints:
+
+```text
+== Skadi quickstart ==
+
+-- primitives + compute --
+  length=10  null_count=1
+  sum=42 (over 9 non-null)  min=0  max=9  mean=4.67
+  even values: [0, 2, 4, 6, 8]
+
+-- strings --
+  4 strings, 17 total bytes; arr[1]="arrow"
+
+-- sort_indices + take --
+  sorted: [10, 20, 30, 40, 50]
+
+-- Arrow IPC file round-trip --
+  wrote /tmp/skadi_quickstart.arrow (readable by pyarrow.ipc.open_file)
+  read back 3 row(s):
+    id=1 name="ada"
+    id=2 name="alan"
+    id=3 name="grace"
 ```
 
 ## Benchmarks
@@ -172,46 +185,6 @@ Reproduce:
 - `bash benchmarks/compare.sh` — 3-way Skadi / PyArrow / Arrow C++ comparison
   (requires `pyarrow`).
 
-## Building & testing
-
-Requires the [Odin compiler](https://odin-lang.org/docs/install/).
-
-```sh
-make test                              # 224 unit/regression tests + 22 ATDD specs + 6 Python comparator tests
-make test-specs                        # 22 4-layer ATDD specs + 6 Python comparator tests
-make check                             # strict static analysis across all 13 Odin targets (-vet -strict-style -disallow-do -warnings-as-errors)
-make test-cpp                          # 14 Arrow C++ FFI layout & IPC parity tests (requires Arrow C++)
-make parquet-odin csv-to-parquet-odin  # build native streaming Parquet <-> CSV CLI tools into bin/
-odin run examples/quickstart -out:/tmp/quickstart   # run the runnable demo
-odin build skadi -build-mode:static -out:libskadi.a       # build the package
-```
-
-To use it in your own project, import the `skadi` directory as the `skadi`
-package (either via a relative path or `-collection:skadi=...`). A complete, runnable tour of the API lives in
-[`examples/quickstart`](examples/quickstart/main.odin); running it prints:
-
-```
-== Skadi quickstart ==
-
--- primitives + compute --
-  length=10  null_count=1
-  sum=42 (over 9 non-null)  min=0  max=9  mean=4.67
-  even values: [0, 2, 4, 6, 8]
-
--- strings --
-  4 strings, 17 total bytes; arr[1]="arrow"
-
--- sort_indices + take --
-  sorted: [10, 20, 30, 40, 50]
-
--- Arrow IPC file round-trip --
-  wrote /tmp/odinarrow_quickstart.arrow (readable by pyarrow.ipc.open_file)
-  read back 3 row(s):
-    id=1 name="ada"
-    id=2 name="alan"
-    id=3 name="grace"
-```
-
 ## Capabilities
 
 | Area                                                                 | Status       |
@@ -229,24 +202,23 @@ package (either via a relative path or `-collection:skadi=...`). A complete, run
 | Vectored `writev` zero-copy IPC writes + `mmap` zero-copy reads      | ✅           |
 | Reusable buffer-pool allocator                                       | ✅           |
 | 4-layer ATDD specs & property suite (`specs/`, `make test-specs`)    | ✅           |
-| GitHub Actions CI (Linux + macOS, PyArrow + Arrow C++ FFI)           | ✅           |
+| GitHub Actions CI (Linux, PyArrow + Arrow C++ FFI)                   | ✅           |
 | Streaming CSV ↔ Parquet subset CLI tools (`examples/`)               | ✅ (examples) |
 | Statistical 1v1 JSONL benchmark suite (`make bench-1v1`)             | ✅           |
 | Full Parquet spec, Flight RPC, GPU kernels                           | out of scope |
 
+## Project Layout
 
-## Project layout
-
-```
+```text
 skadi/                   the skadi package (buffers, types, arrays, builders,
                          compute, selection, fusion, umbra, rle, dict, ipc,
                          buffer_pool, hardware_config.odin, ...)
 skadi/pipeline/          Sleipnir actor & sharded SPSC morsel pipeline
                          (sleipnir_pipeline.odin)
-deps/sleipnir/actor/     Sleipnir lock-free actor & SPSC/MPSC runtime
+deps/sleipnir/actor/     Sleipnir v1.1.0 lock-free actor, OTP supervision & SPSC/MPSC runtime
 docs/                    Cursor.md, Endeavor.md, Review.md — architecture review,
                          security/performance notes, and Arrow capability gap matrix
-tests/                   unit & regression test suite (224 tests, `make test`)
+tests/                   unit & regression test suite (230 tests, `make test`)
 specs/                   4-layer ATDD executable specifications (22 specs, `make test-specs`)
 tests_cpp/               Arrow C++ FFI layout & IPC parity tests (14 tests, `make test-cpp`)
 examples/quickstart/     a runnable tour of the API

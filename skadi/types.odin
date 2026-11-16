@@ -1,3 +1,25 @@
+/*
+Package `skadi` implements the Apache Arrow columnar in-memory format, compute
+kernels, companion compressed encodings, and Arrow IPC (Feather v2) serialization
+in Odin.
+
+Core components:
+- **Columnar memory**: 64-byte aligned `Buffer`, packed validity `Bitmap`,
+  zero-copy `array_slice`, and single-threaded `Buffer_Pool` recycling.
+- **Type system & containers**: 16 flat `DataType` variants, `Array`,
+  `Primitive_Builder`, variable-length string/binary builders, `Schema`,
+  `Record_Batch` (with refcounted `mmap` backing), and `Table` / `Chunked_Array`.
+- **Compute, selection & fusion**: Target-scoped AVX2/SIMD reductions,
+  selectivity-hybrid `compute_filter`, prefetched `compute_take`, packed `u32`
+  LSD radix `compute_sort_indices`, lazy `Selection` vectors with L1d `u16`
+  morsels, single-pass `*_where` fused aggregates, and persistent thread-pool
+  `*_parallel` kernels.
+- **Companion encodings**: `Umbra_Array` (16-byte German strings), `RLE_Array(T)`
+  (run-end encoding), and `Dict_Array(T)` / `Str_Dict_Array` (dictionary encoding).
+- **Arrow IPC**: Self-contained FlatBuffers encoder/decoder, vectored `writev`
+  writes, and `mmap` zero-copy file/stream reads compatible with PyArrow and
+  Apache Arrow C++.
+*/
 package skadi
 
 // --- Type tags -----------------------------------------------------------
