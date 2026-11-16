@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-16
+
 ### Fixed
 
 - **`Buffer_Pool` & builders (`skadi/buffer_pool.odin`, `skadi/builders.odin`, `skadi/var_length.odin`)**: Pass true allocated capacities as `old_size` to `mem.resize_non_zeroed` in `_builder_grow_data` and `_vb_grow_offsets`, honor custom `allocator` arguments in `builder_finish` / `_vb_finish`, clamp `_pool_resize` `old_size` to block capacity, add 25% slack reuse and a 128 MB LRU cap for cached `>4 MB` pool blocks, and enforce release-mode 2 GiB `i32` offset overflow checks.
@@ -14,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Arrow IPC writer (`skadi/ipc.odin`)**: Omit `.Trunc` on open so regular-file overwrites reuse page-cache pages and extents, guard `os.truncate` via `_ipc_truncate_if_regular` (shrinking shorter writes and truncating regular files to `0` on failure without failing on pipes/sockets/`/dev/null`), and chunk writes in `_IPC_Vectored_Writer` below `max(i32)` bytes for Darwin safety.
 - **Sleipnir pipeline & hardware config (`skadi/pipeline/sleipnir_pipeline.odin`, `skadi/hardware_config.odin`, `deps/sleipnir/actor/actor.odin`)**: Add `actor.scheduler_set_parking` with unconditional `wake_futex` broadcast, reserve parent-loop sibling slots when splitting sort buckets (`_MAX_SORT_BUCKET_JOBS = 2048`), widen `worker_loads` to 256, make `hardware_config_get` lock-free when unoverridden, and expand sysfs CPU topology scanning to 1,024 entries with `core:sys/info` fallback.
 - **Streaming CSV & Parquet CLI examples (`examples/csv_to_parquet/`, `examples/parquet_to_csv/`)**: Propagate `os.read` and `os.read_at` errors, reject unclosed quotes and trailing non-separator bytes after closing quotes in CSV parsing, validate non-negative `num_rows`, and report mid-stream corrupt Parquet pages via `Parquet_To_CSV_Corrupt_Page_Error`.
+- **Cross-platform Arrow C++ FFI test check (`tests_cpp/arrow_cpp_test.odin`)**: Guard `foreign libarrow_capi` inside `when ODIN_OS == .Linux` and add non-Linux `proc "c"` stubs so `make check` passes on macOS and Windows targets.
 
 ### Testing
 
