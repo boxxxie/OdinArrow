@@ -1,7 +1,18 @@
+/*
+Package `pipeline` provides a cache-resident Sleipnir actor execution pipeline
+(`Morsel_Pipeline`) for Skadi columnar analytics, built on `deps/sleipnir/actor`.
+
+It dispatches coarsened super-morsels over pooled MPSC work batches
+(`Envelope_Pool` + `mpsc_push_chain`), processes L1d/L2-resident `u16` morsel
+selection vectors, and aggregates partial results through wait-free
+`Sharded_SPSC_Mailbox` lanes with zero steady-state heap allocations for fused
+predicates, dictionary histograms, and MSB-bucket parallel sorting.
+*/
 package pipeline
 
 import "base:intrinsics"
 import "core:mem"
+import "core:sync"
 import oa ".."
 import actor "../../deps/sleipnir/actor"
 
@@ -1489,7 +1500,12 @@ _sort_send_one :: proc(p: ^Morsel_Pipeline, w: int, msg: Sort_Bucket_Work, acc: 
 @(private="file")
 _sort_begin_unparked :: proc(p: ^Morsel_Pipeline) -> bool {
 	if p == nil || p.sched == nil { return false }
-	return actor.scheduler_set_parking(p.sched, false)
+	prev := intrinsics.atomic_exchange_explicit(&p.sched.enable_parking, false, .Seq_Cst)
+	if prev {
+		intrinsics.atomic_add_explicit((^u32)(&p.sched.wake_futex), 1, .Seq_Cst)
+		sync.futex_broadcast(&p.sched.wake_futex)
+	}
+	return prev
 }
 
 @(private="file")
@@ -1497,7 +1513,7 @@ _sort_end_unparked :: proc(p: ^Morsel_Pipeline, was_parking: bool) {
 	if p == nil || p.sched == nil { return }
 	actor.scheduler_wait_idle(p.sched)
 	if was_parking {
-		actor.scheduler_set_parking(p.sched, true)
+		intrinsics.atomic_store_explicit(&p.sched.enable_parking, true, .Seq_Cst)
 	}
 }
 

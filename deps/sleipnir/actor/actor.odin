@@ -1,10 +1,12 @@
 package actor
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:mem"
 import "core:os"
 import "core:sync"
 import "core:thread"
+import "core:time"
 
 // =============================================================================
 // Reusable Pony-Style M:N Actor & Sharded Work-Stealing Scheduler
@@ -22,9 +24,16 @@ import "core:thread"
 //     message-typed `PID($Msg)` handles, and 2-arg / 3-arg / value-union handlers.
 // =============================================================================
 
-DEFAULT_BATCH_QUOTA        :: 64
-DEFAULT_FUTEX_SPIN_LIMIT   :: 1024
-DEFAULT_AUTO_POOL_CAPACITY :: 256
+DEFAULT_BATCH_QUOTA         :: 64
+DEFAULT_FUTEX_SPIN_LIMIT    :: 1024
+DEFAULT_AUTO_POOL_CAPACITY  :: 256
+MAX_COOPERATIVE_CALL_DEPTH  :: 32
+
+CALL_STATE_PENDING   :: u32(0)
+CALL_STATE_PARKED    :: u32(1)
+CALL_STATE_SIGNALING :: u32(2)
+CALL_STATE_REPLIED   :: u32(3)
+CALL_STATE_FAULTED   :: u32(4)
 
 STEP_MODE_ACTOR  :: 0 // proc(ctx: ^Context, self: ^Actor(State, Msg), msg: ^Msg)
 STEP_MODE_STATE  :: 1 // proc(ctx: ^Context, state: ^State, msg: ^Msg)
@@ -40,13 +49,24 @@ _tls_active_ctx: ^Context
 @(thread_local)
 _tls_active_sched: ^Scheduler
 
+@(thread_local)
+_tls_call_depth: int
+
+// Count of live initialized Schedulers so `default_registry` is destroyed only when the last exits.
+_active_scheduler_count: i32
+
 // Returns the active `^Context` when called inside an actor handler on a worker thread,
 // or `nil` when called from an external thread.
 current_context :: #force_inline proc() -> ^Context {
-	if _tls_active_ctx != nil {
-		return _tls_active_ctx
+	return _tls_active_ctx
+}
+
+// Returns the currently executing actor's lifecycle generation on worker threads, or `0`.
+current_generation :: #force_inline proc() -> u32 {
+	if _tls_active_ctx != nil && _tls_active_ctx.current_actor != nil {
+		return intrinsics.atomic_load_explicit(&_tls_active_ctx.current_actor.generation, .Acquire)
 	}
-	return cast(^Context)context.user_ptr
+	return 0
 }
 
 // Returns the active `^Scheduler` bound to the current thread (via `init(&sched)`,
@@ -67,28 +87,39 @@ use_scheduler :: #force_inline proc(s: ^Scheduler) {
 // Allows a single `Scheduler` to queue and step heterogeneous actor types.
 Actor_Base :: struct #align(64) {
 	next:         ^Actor_Base, // Offset 0: Intrusive link for `RunQ_Shard(Actor_Base)`
-	scheduled:    u32,         // Atomic flag: 0 = idle, 1 = queued/running on scheduler
-	id:           u32,         // Optional actor ID for routing / debugging
-	user_ptr:     rawptr,      // Optional user context pointer
 	step_proc:    proc(base: ^Actor_Base, ctx: ^Context, quota: int) -> (processed: int, has_more: bool),
 	destroy_proc: proc(base: ^Actor_Base),
 	reg_sched:    ^Scheduler,
+	user_ptr:     rawptr, // Optional user / supervisor context pointer
+	scheduled:    u32,    // Atomic flag: 0 = idle, 1 = queued/running on scheduler
+	id:           u32,    // Optional actor ID for routing / debugging
+	status:       u32,    // Lifecycle status (used by Tracks 2–4 supervision)
+	in_step:      u32,    // Non-zero while a worker thread is actively inside `step_proc`
+	generation:   u32,    // Restart generation counter
+	trap_panics:  b32,    // True when running under a supervisor crash boundary
 }
+
+#assert(size_of(Actor_Base) == 64)
 
 // Execution context passed into an actor's `receive` callback (and bound to `_tls_active_ctx`).
 Context :: struct {
 	sched:              ^Scheduler,
 	worker_id:          int,
-	current_env:        rawptr, // Pointer to the active `^Envelope(Msg)` being processed
-	current_reply_slot: rawptr, // Optional `^Call_Slot(Res)` or `^Actor_Ref(Res)` for `actor.reply`
-	current_flags:      u16,    // Active envelope's `flags` (`ENVELOPE_FLAG_*`)
-	forwarded:          bool,   // Set to `true` when `forward` transfers ownership of `current_env`
+	current_actor:      ^Actor_Base, // Currently executing actor base
+	current_pools_raw:  rawptr,      // Backing slice pointer of current actor's `pools`
+	current_msg_type:   typeid,      // Message payload type of the active turn
+	current_env:        rawptr,      // Pointer to the active `^Envelope(Msg)` being processed
+	current_reply_slot: rawptr,      // Optional `^Call_Slot(Res)` or `^Actor_Ref(Res)` for `actor.reply`
+	current_flags:      u16,         // Active envelope's `flags` (`ENVELOPE_FLAG_*`)
+	forwarded:          bool,        // Set to `true` when `forward` transfers ownership of `current_env`
 }
 
 // Stack-allocated reply slot used by synchronous `actor.call`.
+// `ready` MUST remain at byte offset 0 for type-erased wake/cancellation during teardown.
 Call_Slot :: struct($Res: typeid) {
-	result: Res,
-	ready:  sync.Futex, // 0 = waiting, 1 = reply ready
+	ready:    sync.Futex, // Offset 0: `CALL_STATE_*` handshake word
+	res_type: typeid,
+	result:   Res,
 }
 
 // Message-typed actor endpoint (type-erased over private `$State`).
@@ -105,12 +136,19 @@ Actor_Ref :: struct($Msg: typeid) #align(64) {
 // Type-safe process identifier (address) for any actor accepting `$Msg`,
 // decoupled from the actor's private internal `$State` type.
 PID :: struct($Msg: typeid) {
-	ref: ^Actor_Ref(Msg),
+	ref:        ^Actor_Ref(Msg),
+	generation: u32,
 }
 
 // Obtain a message-typed `PID($Msg)` handle from any `^Actor($State, $Msg)`.
 pid :: #force_inline proc(a: ^Actor($State, $Msg)) -> PID(Msg) {
-	return PID(Msg){ref = &a.ref}
+	if a == nil {
+		return {}
+	}
+	return PID(Msg){
+		ref        = &a.ref,
+		generation = intrinsics.atomic_load_explicit(&a.base.generation, .Acquire),
+	}
 }
 
 // Concrete typed Actor parameterized over its private `$State` and `$Msg` type.
@@ -159,6 +197,7 @@ Scheduler :: struct #align(64) {
 	registry_mu:       sync.Mutex,
 	auto_pools:        [dynamic]Auto_Pool_Entry,
 	owned_actors:      [dynamic]^Actor_Base,
+	prev_tls_sched:    ^Scheduler,
 
 	// Global coordination & idle detection (cache-line isolated)
 	_pad0:             [64]u8,
@@ -168,6 +207,7 @@ Scheduler :: struct #align(64) {
 	target_messages:   i64,        // Target message count (0 = disabled)
 	running:           b32,        // False when shutting down
 	parked_workers:    u32,        // Count of workers sleeping on `wake_futex`
+	ext_shard_counter: u32,        // Round-robin shard counter for external sends
 	wake_futex:        sync.Futex, // Futex signaled when an actor becomes runnable
 }
 
@@ -183,29 +223,67 @@ scheduler_init :: proc(
 ) -> mem.Allocator_Error {
 	s.allocator = allocator
 	s.num_workers = cfg.num_workers if cfg.num_workers > 0 else max(1, os.get_processor_core_count())
-	s.num_shards  = cfg.num_shards  if cfg.num_shards >= s.num_workers else s.num_workers
+	s.num_shards  = cfg.num_shards  if cfg.num_shards > 0  else s.num_workers
 	s.batch_quota = cfg.batch_quota if cfg.batch_quota > 0 else DEFAULT_BATCH_QUOTA
 	s.enable_parking = cfg.enable_parking
 	s.started = false
 
-	s.shards = make([]RunQ_Shard(Actor_Base), s.num_shards, allocator) or_return
+	err: mem.Allocator_Error
+	s.shards, err = make([]RunQ_Shard(Actor_Base), s.num_shards, allocator)
+	if err != .None { return err }
 	for i := 0; i < s.num_shards; i += 1 {
 		shard_init(&s.shards[i])
 	}
 
-	s.workers      = make([]^thread.Thread, s.num_workers, allocator) or_return
-	s.worker_ctxs  = make([]Worker_Thread_Ctx, s.num_workers, allocator) or_return
-	s.auto_pools   = make([dynamic]Auto_Pool_Entry, 0, 8, allocator) or_return
-	s.owned_actors = make([dynamic]^Actor_Base, 0, 16, allocator) or_return
-	s.running      = true
-	s.active_actors = 0
-	s.pending_tokens = 0
-	s.total_processed = 0
-	s.target_messages = 0
-	s.parked_workers = 0
-	s.wake_futex = 0
+	s.workers, err = make([]^thread.Thread, s.num_workers, allocator)
+	if err != .None {
+		delete(s.shards, allocator)
+		s.shards = nil
+		return err
+	}
+	s.worker_ctxs, err = make([]Worker_Thread_Ctx, s.num_workers, allocator)
+	if err != .None {
+		delete(s.workers, allocator)
+		s.workers = nil
+		delete(s.shards, allocator)
+		s.shards = nil
+		return err
+	}
+	s.auto_pools, err = make([dynamic]Auto_Pool_Entry, 0, 8, allocator)
+	if err != .None {
+		delete(s.worker_ctxs, allocator)
+		s.worker_ctxs = nil
+		delete(s.workers, allocator)
+		s.workers = nil
+		delete(s.shards, allocator)
+		s.shards = nil
+		return err
+	}
+	s.owned_actors, err = make([dynamic]^Actor_Base, 0, 16, allocator)
+	if err != .None {
+		delete(s.auto_pools)
+		s.auto_pools = nil
+		delete(s.worker_ctxs, allocator)
+		s.worker_ctxs = nil
+		delete(s.workers, allocator)
+		s.workers = nil
+		delete(s.shards, allocator)
+		s.shards = nil
+		return err
+	}
 
+	s.running           = true
+	s.active_actors     = 0
+	s.pending_tokens    = 0
+	s.total_processed   = 0
+	s.target_messages   = 0
+	s.parked_workers    = 0
+	s.ext_shard_counter = 0
+	s.wake_futex        = 0
+
+	s.prev_tls_sched  = _tls_active_sched
 	_tls_active_sched = s
+	intrinsics.atomic_add_explicit(&_active_scheduler_count, 1, .Acq_Rel)
 	return .None
 }
 
@@ -287,6 +365,10 @@ scheduler_start :: proc(s: ^Scheduler = nil) {
 		}
 		sched.workers[w] = thread.create(scheduler_worker_proc)
 		sched.workers[w].data = &sched.worker_ctxs[w]
+		// Inherit caller context (`logger`, `allocator`, custom `temp_allocator` in tests).
+		// When using `default_temp_allocator_proc`, `core:thread`'s `_select_context_for_thread`
+		// rebinds `temp_allocator.data` to each worker thread's own `@(thread_local)` instance.
+		sched.workers[w].init_context = context
 		thread.start(sched.workers[w])
 	}
 }
@@ -298,7 +380,7 @@ start :: scheduler_start
 scheduler_stop_and_destroy :: proc(s: ^Scheduler) {
 	if s == nil { return }
 	intrinsics.atomic_store_explicit(&s.running, false, .Seq_Cst)
-	if intrinsics.atomic_load_explicit(&s.enable_parking, .Acquire) {
+	if s.enable_parking {
 		intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
 		sync.futex_broadcast(&s.wake_futex)
 	}
@@ -346,11 +428,30 @@ scheduler_stop_and_destroy :: proc(s: ^Scheduler) {
 		s.shards = nil
 	}
 	if _tls_active_sched == s {
-		_tls_active_sched = nil
+		if s.prev_tls_sched != nil && intrinsics.atomic_load_explicit(&s.prev_tls_sched.running, .Acquire) {
+			_tls_active_sched = s.prev_tls_sched
+		} else {
+			_tls_active_sched = nil
+		}
 	}
+	_ = intrinsics.atomic_sub_explicit(&_active_scheduler_count, 1, .Acq_Rel)
+	sync.rw_mutex_lock(&default_registry.mu)
+	if intrinsics.atomic_load_explicit(&_active_scheduler_count, .Acquire) == 0 {
+		if default_registry.entries != nil {
+			for _, entry in default_registry.entries {
+				detach_registry_hook_from_actor(entry.ref, rawptr(&default_registry))
+			}
+			delete(default_registry.entries)
+			default_registry.entries = nil
+		}
+		default_registry.allocator = {}
+	}
+	sync.rw_mutex_unlock(&default_registry.mu)
 }
 
 // Look up or lazily create a shared `[]Envelope_Pool($Msg)` slice on `s` for `$Msg`.
+// Layout: `pools[0 ..< num_workers]` are lock-free worker-local pools;
+// `pools[len(pools) - 1]` is the dedicated `.busy`-guarded external pool.
 @(private)
 scheduler_get_or_create_pools :: proc(s: ^Scheduler, $Msg: typeid) -> []Envelope_Pool(Msg) {
 	if s == nil { return nil }
@@ -364,7 +465,7 @@ scheduler_get_or_create_pools :: proc(s: ^Scheduler, $Msg: typeid) -> []Envelope
 		}
 	}
 
-	num_pools := min(max(s.num_shards, s.num_workers) + 1, MAX_POOLS)
+	num_pools := min(max(s.num_workers, 1) + 1, MAX_POOLS)
 	pools, err := make([]Envelope_Pool(Msg), num_pools, s.allocator)
 	if err != .None { return nil }
 	for i := 0; i < num_pools; i += 1 {
@@ -388,13 +489,18 @@ scheduler_get_or_create_pools :: proc(s: ^Scheduler, $Msg: typeid) -> []Envelope
 
 // Schedule an `Actor_Base` onto shard `shard_hint` if it is not already scheduled.
 scheduler_schedule_actor :: #force_inline proc(s: ^Scheduler, a: ^Actor_Base, shard_hint: int = 0) {
+	if s == nil || a == nil { return }
+	if intrinsics.atomic_load_explicit(&a.status, .Seq_Cst) != u32(Actor_Status.Running) {
+		return
+	}
 	if intrinsics.atomic_load_explicit(&a.scheduled, .Seq_Cst) == 0 {
 		if intrinsics.atomic_exchange_explicit(&a.scheduled, 1, .Acq_Rel) == 0 {
 			intrinsics.atomic_add_explicit(&s.active_actors, 1, .Acq_Rel)
 			idx := u32(shard_hint) % u32(s.num_shards)
 			shard_push(&s.shards[idx], a)
 
-			if intrinsics.atomic_load_explicit(&s.enable_parking, .Acquire) {
+			if s.enable_parking {
+				intrinsics.atomic_thread_fence(.Seq_Cst)
 				if intrinsics.atomic_load_explicit(&s.parked_workers, .Acquire) > 0 {
 					intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
 					sync.futex_signal(&s.wake_futex)
@@ -408,31 +514,31 @@ scheduler_schedule_actor :: #force_inline proc(s: ^Scheduler, a: ^Actor_Base, sh
 scheduler_wait_idle :: proc(s: ^Scheduler = nil) {
 	sched := s if s != nil else current_scheduler()
 	if sched == nil { return }
+	spin := 0
 	for intrinsics.atomic_load_explicit(&sched.active_actors, .Acquire) > 0 {
-		intrinsics.cpu_relax()
+		if sched.enable_parking && spin >= DEFAULT_FUTEX_SPIN_LIMIT {
+			time.sleep(10 * time.Microsecond)
+		} else {
+			spin += 1
+			intrinsics.cpu_relax()
+		}
 	}
 }
 
 wait_idle :: scheduler_wait_idle
 
-// Toggle adaptive worker Futex parking on or off and return the previous state.
-// When disabling parking, unconditionally wakes any sleeping or parking workers.
-scheduler_set_parking :: proc(s: ^Scheduler, enable: bool) -> (prev: bool) {
-	if s == nil { return false }
-	prev = intrinsics.atomic_exchange_explicit(&s.enable_parking, enable, .Seq_Cst)
-	if !enable && prev {
-		intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Seq_Cst)
-		sync.futex_broadcast(&s.wake_futex)
-	}
-	return prev
-}
-
 // Wait until `pending_tokens` drops to 0 (useful for autonomous Actor-to-Actor graphs).
 scheduler_wait_tokens :: proc(s: ^Scheduler = nil) {
 	sched := s if s != nil else current_scheduler()
 	if sched == nil { return }
+	spin := 0
 	for intrinsics.atomic_load_explicit(&sched.pending_tokens, .Acquire) > 0 {
-		intrinsics.cpu_relax()
+		if sched.enable_parking && spin >= DEFAULT_FUTEX_SPIN_LIMIT {
+			time.sleep(10 * time.Microsecond)
+		} else {
+			spin += 1
+			intrinsics.cpu_relax()
+		}
 	}
 }
 
@@ -440,8 +546,14 @@ wait_tokens :: scheduler_wait_tokens
 
 // Wait until `total_processed` reaches `target_msgs`.
 scheduler_wait_messages :: proc(s: ^Scheduler, target_msgs: i64) {
+	spin := 0
 	for intrinsics.atomic_load_explicit(&s.total_processed, .Acquire) < target_msgs {
-		intrinsics.cpu_relax()
+		if s.enable_parking && spin >= DEFAULT_FUTEX_SPIN_LIMIT {
+			time.sleep(10 * time.Microsecond)
+		} else {
+			spin += 1
+			intrinsics.cpu_relax()
+		}
 	}
 }
 
@@ -459,7 +571,7 @@ wait_messages :: proc {
 // Decrement the scheduler's active token counter (e.g. when a circulating message finishes its hops).
 complete_token_ctx :: #force_inline proc(ctx: ^Context, count: i64 = 1) {
 	if intrinsics.atomic_sub_explicit(&ctx.sched.pending_tokens, count, .Acq_Rel) == count {
-		if intrinsics.atomic_load_explicit(&ctx.sched.enable_parking, .Acquire) {
+		if ctx.sched.enable_parking {
 			intrinsics.atomic_add_explicit((^u32)(&ctx.sched.wake_futex), 1, .Release)
 			sync.futex_broadcast(&ctx.sched.wake_futex)
 		}
@@ -475,7 +587,7 @@ complete_token_ambient :: #force_inline proc(count: i64 = 1) {
 	s := current_scheduler()
 	if s != nil {
 		if intrinsics.atomic_sub_explicit(&s.pending_tokens, count, .Acq_Rel) == count {
-			if intrinsics.atomic_load_explicit(&s.enable_parking, .Acquire) {
+			if s.enable_parking {
 				intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
 				sync.futex_broadcast(&s.wake_futex)
 			}
@@ -493,6 +605,16 @@ complete_token :: proc {
 // -----------------------------------------------------------------------------
 
 @(private)
+scheduler_all_shards_empty :: #force_inline proc(s: ^Scheduler) -> bool {
+	for i := 0; i < s.num_shards; i += 1 {
+		if !mpsc_is_empty(&s.shards[i].q) {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
 scheduler_worker_proc :: proc(t: ^thread.Thread) {
 	wctx := cast(^Worker_Thread_Ctx)t.data
 	s    := wctx.sched
@@ -501,10 +623,14 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 		sched     = s,
 		worker_id = wid,
 	}
+	context.allocator = s.allocator
 	_tls_active_ctx   = &ctx
 	_tls_active_sched = s
-	context.user_ptr  = &ctx
 	defer {
+		free_all(context.temp_allocator)
+		if context.temp_allocator.procedure == runtime.default_temp_allocator_proc && context.temp_allocator.data != nil {
+			runtime.default_temp_allocator_destroy(cast(^runtime.Default_Temp_Allocator)context.temp_allocator.data)
+		}
 		_tls_active_ctx   = nil
 		_tls_active_sched = nil
 	}
@@ -525,7 +651,7 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 		}
 
 		if a == nil {
-			if !intrinsics.atomic_load_explicit(&s.enable_parking, .Acquire) {
+			if !s.enable_parking {
 				intrinsics.cpu_relax()
 			} else {
 				if spin_count < DEFAULT_FUTEX_SPIN_LIMIT {
@@ -535,11 +661,10 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 					val := intrinsics.atomic_load_explicit((^u32)(&s.wake_futex), .Acquire)
 					intrinsics.atomic_add_explicit(&s.parked_workers, 1, .Seq_Cst)
 					if intrinsics.atomic_load_explicit(&s.running, .Acquire) &&
-					   intrinsics.atomic_load_explicit(&s.active_actors, .Acquire) == 0 &&
-					   intrinsics.atomic_load_explicit(&s.enable_parking, .Seq_Cst) {
+					   (intrinsics.atomic_load_explicit(&s.active_actors, .Seq_Cst) == 0 || scheduler_all_shards_empty(s)) {
 						sync.futex_wait(&s.wake_futex, val)
 					}
-					intrinsics.atomic_sub_explicit(&s.parked_workers, 1, .Acq_Rel)
+					intrinsics.atomic_sub_explicit(&s.parked_workers, 1, .Seq_Cst)
 					spin_count = 0
 				}
 			}
@@ -548,19 +673,46 @@ scheduler_worker_proc :: proc(t: ^thread.Thread) {
 
 		spin_count = 0
 
-		// 2. Execute up to `quota` messages on the actor
+		// 2. Execute up to `quota` messages on the actor, then reclaim outer-turn temp memory.
 		processed, has_more := a.step_proc(a, &ctx, quota)
+		when !runtime.NO_DEFAULT_TEMP_ALLOCATOR {
+			if context.temp_allocator.procedure != runtime.default_temp_allocator_proc {
+				free_all(context.temp_allocator)
+			} else if ta := cast(^runtime.Default_Temp_Allocator)context.temp_allocator.data; ta != nil && ta.arena.total_used > 0 {
+				free_all(context.temp_allocator)
+			}
+		} else {
+			free_all(context.temp_allocator)
+		}
 
-		// 3. Reschedule or unschedule with `.Seq_Cst` Dekker barrier to prevent lost wakeups
+		// 3. Reschedule or unschedule with `.Seq_Cst` Dekker barrier before decrementing `active_actors`
 		if has_more {
 			shard_push(&s.shards[wid % num_shards], a)
+			if s.enable_parking {
+				intrinsics.atomic_thread_fence(.Seq_Cst)
+				if intrinsics.atomic_load_explicit(&s.parked_workers, .Acquire) > 0 {
+					intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
+					sync.futex_signal(&s.wake_futex)
+				}
+			}
 		} else {
 			intrinsics.atomic_store_explicit(&a.scheduled, 0, .Seq_Cst)
-			intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Acq_Rel)
-			// Re-check if a message arrived just before `scheduled = 0` became visible
 			_, still_has_more := a.step_proc(a, &ctx, 0)
 			if still_has_more {
-				scheduler_schedule_actor(s, a, wid)
+				if intrinsics.atomic_exchange_explicit(&a.scheduled, 1, .Acq_Rel) == 0 {
+					shard_push(&s.shards[wid % num_shards], a)
+					if s.enable_parking {
+						intrinsics.atomic_thread_fence(.Seq_Cst)
+						if intrinsics.atomic_load_explicit(&s.parked_workers, .Acquire) > 0 {
+							intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
+							sync.futex_signal(&s.wake_futex)
+						}
+					}
+				} else {
+					intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Seq_Cst)
+				}
+			} else {
+				intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Seq_Cst)
 			}
 		}
 
@@ -585,11 +737,17 @@ actor_init_common :: proc(
 	allocator := context.allocator,
 ) {
 	sched := s if s != nil else current_scheduler()
+	eff_alloc := resolve_spawn_allocator(sched, allocator)
 	a.base.next         = nil
 	a.base.scheduled    = 0
 	a.base.id           = id
+	a.base.status       = 0
+	a.base.in_step      = 0
+	a.base.generation   = 1
+	a.base.trap_panics  = false
 	a.base.reg_sched    = nil
 	a.base.destroy_proc = nil
+	a.base.user_ptr     = nil
 	switch step_mode {
 	case STEP_MODE_STATE:
 		a.base.step_proc = actor_generic_step_proc(State, Msg, STEP_MODE_STATE)
@@ -603,7 +761,7 @@ actor_init_common :: proc(
 	mpsc_init(&a.mailbox)
 	a.state     = initial_state
 	a.sched     = sched
-	a.allocator = allocator
+	a.allocator = eff_alloc
 	if pools != nil {
 		a.pools = pools
 	} else if sched != nil {
@@ -669,6 +827,8 @@ register_spawned_actor :: proc(a: ^Actor($State, $Msg), s: ^Scheduler) {
 	a.base.reg_sched = s
 	a.base.destroy_proc = proc(base: ^Actor_Base) {
 		self := cast(^Actor(State, Msg))base
+		actor_cleanup_supervision(&self.base)
+		actor_drain_mailbox(self)
 		free(self, self.allocator)
 	}
 	sync.mutex_lock(&s.registry_mu)
@@ -684,9 +844,10 @@ spawn_actor_auto :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> (a: ^Actor(State, Msg), err: mem.Allocator_Error) #optional_allocator_error {
-	a = new(Actor(State, Msg), allocator) or_return
 	s := current_scheduler()
-	actor_init_common(a, initial_state, STEP_MODE_ACTOR, nil, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a = new(Actor(State, Msg), eff_alloc) or_return
+	actor_init_common(a, initial_state, STEP_MODE_ACTOR, nil, id, s, eff_alloc)
 	a.receive = receive_proc
 	register_spawned_actor(a, s)
 	return a, .None
@@ -701,9 +862,10 @@ spawn_actor_pooled :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> (a: ^Actor(State, Msg), err: mem.Allocator_Error) #optional_allocator_error {
-	a = new(Actor(State, Msg), allocator) or_return
 	s := current_scheduler()
-	actor_init_common(a, initial_state, STEP_MODE_ACTOR, pools, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a = new(Actor(State, Msg), eff_alloc) or_return
+	actor_init_common(a, initial_state, STEP_MODE_ACTOR, pools, id, s, eff_alloc)
 	a.receive = receive_proc
 	register_spawned_actor(a, s)
 	return a, .None
@@ -718,8 +880,9 @@ spawn_sched_actor_auto :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> (a: ^Actor(State, Msg), err: mem.Allocator_Error) #optional_allocator_error {
-	a = new(Actor(State, Msg), allocator) or_return
-	actor_init_common(a, initial_state, STEP_MODE_ACTOR, nil, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a = new(Actor(State, Msg), eff_alloc) or_return
+	actor_init_common(a, initial_state, STEP_MODE_ACTOR, nil, id, s, eff_alloc)
 	a.receive = receive_proc
 	register_spawned_actor(a, s)
 	return a, .None
@@ -735,8 +898,9 @@ spawn_sched_actor_pooled :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> (a: ^Actor(State, Msg), err: mem.Allocator_Error) #optional_allocator_error {
-	a = new(Actor(State, Msg), allocator) or_return
-	actor_init_common(a, initial_state, STEP_MODE_ACTOR, pools, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a = new(Actor(State, Msg), eff_alloc) or_return
+	actor_init_common(a, initial_state, STEP_MODE_ACTOR, pools, id, s, eff_alloc)
 	a.receive = receive_proc
 	register_spawned_actor(a, s)
 	return a, .None
@@ -750,9 +914,10 @@ spawn_state_auto :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> (a: ^Actor(State, Msg), err: mem.Allocator_Error) #optional_allocator_error {
-	a = new(Actor(State, Msg), allocator) or_return
 	s := current_scheduler()
-	actor_init_common(a, initial_state, STEP_MODE_STATE, nil, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a = new(Actor(State, Msg), eff_alloc) or_return
+	actor_init_common(a, initial_state, STEP_MODE_STATE, nil, id, s, eff_alloc)
 	a.receive_state = receive_proc
 	register_spawned_actor(a, s)
 	return a, .None
@@ -767,8 +932,9 @@ spawn_sched_state_auto :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> (a: ^Actor(State, Msg), err: mem.Allocator_Error) #optional_allocator_error {
-	a = new(Actor(State, Msg), allocator) or_return
-	actor_init_common(a, initial_state, STEP_MODE_STATE, nil, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a = new(Actor(State, Msg), eff_alloc) or_return
+	actor_init_common(a, initial_state, STEP_MODE_STATE, nil, id, s, eff_alloc)
 	a.receive_state = receive_proc
 	register_spawned_actor(a, s)
 	return a, .None
@@ -782,9 +948,10 @@ spawn_simple_auto :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> (a: ^Actor(State, Msg), err: mem.Allocator_Error) #optional_allocator_error {
-	a = new(Actor(State, Msg), allocator) or_return
 	s := current_scheduler()
-	actor_init_common(a, initial_state, STEP_MODE_SIMPLE, nil, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a = new(Actor(State, Msg), eff_alloc) or_return
+	actor_init_common(a, initial_state, STEP_MODE_SIMPLE, nil, id, s, eff_alloc)
 	a.receive_simple = receive_proc
 	register_spawned_actor(a, s)
 	return a, .None
@@ -799,8 +966,9 @@ spawn_sched_simple_auto :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> (a: ^Actor(State, Msg), err: mem.Allocator_Error) #optional_allocator_error {
-	a = new(Actor(State, Msg), allocator) or_return
-	actor_init_common(a, initial_state, STEP_MODE_SIMPLE, nil, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a = new(Actor(State, Msg), eff_alloc) or_return
+	actor_init_common(a, initial_state, STEP_MODE_SIMPLE, nil, id, s, eff_alloc)
 	a.receive_simple = receive_proc
 	register_spawned_actor(a, s)
 	return a, .None
@@ -814,9 +982,13 @@ spawn_val_auto :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> ^Actor(State, Msg) where !intrinsics.type_is_pointer(Msg) {
-	a := new(Actor(State, Msg), allocator)
 	s := current_scheduler()
-	actor_init_common(a, initial_state, STEP_MODE_VAL, nil, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a := new(Actor(State, Msg), eff_alloc)
+	if a == nil {
+		return nil
+	}
+	actor_init_common(a, initial_state, STEP_MODE_VAL, nil, id, s, eff_alloc)
 	a.receive_val = receive_proc
 	register_spawned_actor(a, s)
 	return a
@@ -831,8 +1003,12 @@ spawn_sched_val_auto :: proc(
 	id: u32 = 0,
 	allocator := context.allocator,
 ) -> ^Actor(State, Msg) where !intrinsics.type_is_pointer(Msg) {
-	a := new(Actor(State, Msg), allocator)
-	actor_init_common(a, initial_state, STEP_MODE_VAL, nil, id, s, allocator)
+	eff_alloc := resolve_spawn_allocator(s, allocator)
+	a := new(Actor(State, Msg), eff_alloc)
+	if a == nil {
+		return nil
+	}
+	actor_init_common(a, initial_state, STEP_MODE_VAL, nil, id, s, eff_alloc)
 	a.receive_val = receive_proc
 	register_spawned_actor(a, s)
 	return a
@@ -863,15 +1039,76 @@ spawn_self :: proc(
 	return spawn_val_auto(initial_state, initial_state.receive, id, allocator)
 }
 
+// Retire a consumed or drained envelope (wake pending `actor.call` waiters as faulted if
+// un-replied, then free heap nodes or append pooled nodes to `collector`).
+@(private)
+step_retire_envelope :: #force_inline proc(
+	ref: ^Actor_Ref($Msg),
+	env: ^Envelope(Msg),
+	flags: u16,
+	reply_slot: rawptr,
+	collector: ^Batch_Return_Collector(Msg),
+	has_pools: bool,
+) {
+	if (flags & ENVELOPE_FLAG_CALL) != 0 && reply_slot != nil {
+		complete_call_slot(reply_slot, CALL_STATE_FAULTED)
+	}
+	if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
+		pid := env.pool_id
+		alloc := ref.pools[pid].allocator if (has_pools && int(pid) < len(ref.pools)) else ref.allocator
+		if alloc.procedure == nil {
+			alloc = context.allocator
+		}
+		free(env, alloc)
+	} else if has_pools && (env.flags & ENVELOPE_FLAG_STATIC) == 0 && int(env.pool_id) < len(ref.pools) {
+		collector_add(collector, env)
+	}
+}
+
+// Pop and reclaim all remaining envelopes in an actor's mailbox, waking any
+// queued synchronous `actor.call` waiters with `CALL_STATE_FAULTED`.
+@(private)
+actor_ref_drain_mailbox :: proc(ref: ^Actor_Ref($Msg)) {
+	if ref == nil { return }
+	collector: Batch_Return_Collector(Msg) = ---
+	collector.used_mask = 0
+	has_pools := len(ref.pools) > 0
+	for {
+		env := mpsc_pop_detached(&ref.mailbox)
+		if env == nil {
+			if !mpsc_is_empty(&ref.mailbox) {
+				intrinsics.cpu_relax()
+				continue
+			}
+			break
+		}
+		step_retire_envelope(ref, env, env.flags, env.reply_slot, &collector, has_pools)
+	}
+	if has_pools {
+		collector_flush(&collector, ref.pools, -1)
+	}
+}
+
+@(private)
+actor_drain_mailbox :: proc(a: ^Actor($State, $Msg)) {
+	if a == nil { return }
+	actor_ref_drain_mailbox(&a.ref)
+}
+
 // Free a heap-allocated `Actor($State, $Msg)` created via `spawn`.
 // Safe to call explicitly via `defer actor.destroy(a)` OR omit entirely when using
 // a `Scheduler` (which automatically destroys all remaining registered actors on shutdown).
 actor_destroy :: proc(a: ^Actor($State, $Msg)) {
 	if a == nil { return }
+	if a.base.destroy_proc != nil {
+		actor_base_destroy(&a.base)
+		return
+	}
 	s := a.base.reg_sched
 	if s != nil {
 		if s.started && intrinsics.atomic_load_explicit(&s.running, .Acquire) {
-			for intrinsics.atomic_load_explicit(&a.base.scheduled, .Acquire) != 0 {
+			for intrinsics.atomic_load_explicit(&a.base.scheduled, .Acquire) != 0 ||
+			    intrinsics.atomic_load_explicit(&a.base.in_step, .Seq_Cst) != 0 {
 				intrinsics.cpu_relax()
 			}
 		}
@@ -885,7 +1122,73 @@ actor_destroy :: proc(a: ^Actor($State, $Msg)) {
 		sync.mutex_unlock(&s.registry_mu)
 		a.base.reg_sched = nil
 	}
+	actor_cleanup_supervision(&a.base)
+	actor_drain_mailbox(a)
 	free(a, a.allocator)
+}
+
+@(private)
+actor_step_trapped :: #force_no_inline proc(
+	self: ^Actor($State, $Msg),
+	base: ^Actor_Base,
+	ctx: ^Context,
+	quota: int,
+	collector: ^Batch_Return_Collector(Msg),
+	has_pools: bool,
+	$Mode: int,
+) -> (int, bool) {
+	processed := 0
+	for processed < quota {
+		if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
+			break
+		}
+		env := mpsc_pop_detached(&self.mailbox)
+		if env == nil { break }
+
+		ctx.current_env        = env
+		ctx.current_reply_slot = env.reply_slot
+		ctx.current_flags      = env.flags
+		ctx.forwarded          = false
+
+		trapped, normal_exit, fault := execute_trapped_actor_turn(self, env, ctx, Mode)
+		processed += 1
+		if trapped {
+			reply_slot := ctx.current_reply_slot
+			flags := ctx.current_flags
+			if !ctx.forwarded {
+				step_retire_envelope(&self.ref, env, 0, nil, collector, has_pools)
+			}
+			if has_pools {
+				collector_flush(collector, self.pools, -1)
+			}
+
+			ctx.current_env        = nil
+			ctx.current_reply_slot = nil
+			ctx.current_flags      = 0
+			ctx.current_pools_raw  = nil
+			ctx.current_msg_type   = nil
+
+			// Keep `ctx.current_actor = base` across `handle_actor_turn_exit` so
+			// `finalize_actor_stopped` sees `is_self_step == true` while `in_step == 1`.
+			handle_actor_turn_exit(base, normal_exit, fault)
+			if (flags & ENVELOPE_FLAG_CALL) != 0 && reply_slot != nil {
+				complete_call_slot(reply_slot, CALL_STATE_FAULTED)
+			}
+			return processed, false
+		}
+
+		if !ctx.forwarded {
+			step_retire_envelope(&self.ref, env, ctx.current_flags, ctx.current_reply_slot, collector, has_pools)
+		}
+	}
+
+	if has_pools {
+		collector_flush(collector, self.pools, -1)
+	}
+	if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
+		return processed, false
+	}
+	return processed, !mpsc_is_empty(&self.mailbox)
 }
 
 // Generates the specialized type-erased step procedure for `Actor($State, $Msg)`.
@@ -899,14 +1202,45 @@ actor_generic_step_proc :: proc(
 	return proc(base: ^Actor_Base, ctx: ^Context, quota: int) -> (int, bool) {
 		self := cast(^Actor(State, Msg))base
 		if quota == 0 {
+			if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
+				return 0, false
+			}
 			return 0, !mpsc_is_empty(&self.mailbox)
 		}
 
-		collector: Batch_Return_Collector(Msg)
+		intrinsics.atomic_store_explicit(&base.in_step, 1, .Seq_Cst)
+		defer intrinsics.atomic_store_explicit(&base.in_step, 0, .Seq_Cst)
+
+		collector: Batch_Return_Collector(Msg) = ---
+		collector.used_mask = 0
 		has_pools := len(self.pools) > 0
 		processed := 0
 
+		ctx.current_actor     = base
+		ctx.current_pools_raw = raw_data(self.pools)
+		ctx.current_msg_type  = typeid_of(Msg)
+		defer {
+			ctx.current_env        = nil
+			ctx.current_reply_slot = nil
+			ctx.current_flags      = 0
+			ctx.current_actor      = nil
+			ctx.current_pools_raw  = nil
+			ctx.current_msg_type   = nil
+			ctx.forwarded          = false
+		}
+
+		if base.trap_panics || base.user_ptr != nil {
+			return actor_step_trapped(self, base, ctx, quota, &collector, has_pools, Mode)
+		}
+
 		for processed < quota {
+			if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
+				break
+			}
+			if base.trap_panics || base.user_ptr != nil {
+				p2, has_more := actor_step_trapped(self, base, ctx, quota - processed, &collector, has_pools, Mode)
+				return processed + p2, has_more
+			}
 			env := mpsc_pop_detached(&self.mailbox)
 			if env == nil { break }
 
@@ -914,6 +1248,7 @@ actor_generic_step_proc :: proc(
 			ctx.current_reply_slot = env.reply_slot
 			ctx.current_flags      = env.flags
 			ctx.forwarded          = false
+
 			when Mode == STEP_MODE_ACTOR {
 				self.receive(ctx, self, &env.msg)
 			} else when Mode == STEP_MODE_STATE {
@@ -926,20 +1261,16 @@ actor_generic_step_proc :: proc(
 			processed += 1
 
 			if !ctx.forwarded {
-				if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
-					pid := env.pool_id
-					alloc := self.pools[pid].allocator if (has_pools && int(pid) < len(self.pools)) else self.allocator
-					free(env, alloc)
-				} else if has_pools && (env.flags & ENVELOPE_FLAG_STATIC) == 0 {
-					collector_add(&collector, env)
-				}
+				step_retire_envelope(&self.ref, env, ctx.current_flags, ctx.current_reply_slot, &collector, has_pools)
 			}
 		}
 
 		if processed > 0 && has_pools {
 			collector_flush(&collector, self.pools, -1)
 		}
-
+		if intrinsics.atomic_load_explicit(&base.status, .Seq_Cst) != u32(Actor_Status.Running) {
+			return processed, false
+		}
 		return processed, !mpsc_is_empty(&self.mailbox)
 	}
 }
@@ -950,8 +1281,8 @@ actor_generic_step_proc :: proc(
 
 @(private)
 resolve_target_scheduler :: #force_inline proc(s: ^Scheduler, target: ^Actor_Ref($Msg)) -> ^Scheduler {
+	if target != nil && target.sched != nil { return target.sched }
 	if s != nil { return s }
-	if target.sched != nil { return target.sched }
 	return current_scheduler()
 }
 
@@ -966,9 +1297,16 @@ acquire_auto_envelope :: #force_inline proc(
 	}
 	pools := target.pools
 	ctx := _tls_active_ctx
-	if ctx != nil && ctx.sched == s && ctx.worker_id >= 0 && ctx.worker_id < len(pools) {
+	if ctx != nil && ctx.sched == s && ctx.worker_id >= 0 && ctx.worker_id + 1 < len(pools) {
 		wid := ctx.worker_id
-		return pool_acquire(&pools[wid], spin_if_exhausted = false), wid
+		e := pool_acquire(&pools[wid], spin_if_exhausted = false)
+		return e, (wid if shard_hint < 0 else shard_hint)
+	}
+	eff_hint := shard_hint
+	if eff_hint < 0 && s != nil {
+		eff_hint = int(intrinsics.atomic_add_explicit(&s.ext_shard_counter, 1, .Relaxed))
+	} else if eff_hint < 0 {
+		eff_hint = 0
 	}
 	if len(pools) > 0 {
 		ext_idx := len(pools) - 1
@@ -976,15 +1314,16 @@ acquire_auto_envelope :: #force_inline proc(
 		if intrinsics.atomic_exchange_explicit(&ext_pool.busy, 1, .Acquire) == 0 {
 			e := pool_acquire(ext_pool, spin_if_exhausted = false)
 			intrinsics.atomic_store_explicit(&ext_pool.busy, 0, .Release)
-			return e, (ext_idx if shard_hint < 0 else shard_hint)
+			return e, eff_hint
 		}
 	}
 	alloc := target.allocator if target.allocator.procedure != nil else context.allocator
 	e := new(Envelope(Msg), alloc)
-	e.next = nil
-	e.pool_id = 0
-	e.flags = ENVELOPE_FLAG_HEAP
-	return e, max(0, shard_hint)
+	e.next       = nil
+	e.pool_id    = POOL_ID_NONE
+	e.flags      = ENVELOPE_FLAG_HEAP
+	e.reply_slot = nil
+	return e, eff_hint
 }
 
 @(private)
@@ -999,10 +1338,16 @@ acquire_auto_envelope_chain :: #force_inline proc(
 	}
 	pools := target.pools
 	ctx := _tls_active_ctx
-	if ctx != nil && ctx.sched == s && ctx.worker_id >= 0 && ctx.worker_id < len(pools) {
+	if ctx != nil && ctx.sched == s && ctx.worker_id >= 0 && ctx.worker_id + 1 < len(pools) {
 		wid := ctx.worker_id
 		f, l := pool_acquire_chain(&pools[wid], msgs, spin_if_exhausted = false)
-		return f, l, wid
+		return f, l, (wid if shard_hint < 0 else shard_hint)
+	}
+	eff_hint := shard_hint
+	if eff_hint < 0 && s != nil {
+		eff_hint = int(intrinsics.atomic_add_explicit(&s.ext_shard_counter, 1, .Relaxed))
+	} else if eff_hint < 0 {
+		eff_hint = 0
 	}
 	if len(pools) > 0 {
 		ext_idx := len(pools) - 1
@@ -1010,31 +1355,75 @@ acquire_auto_envelope_chain :: #force_inline proc(
 		if intrinsics.atomic_exchange_explicit(&ext_pool.busy, 1, .Acquire) == 0 {
 			f, l := pool_acquire_chain(ext_pool, msgs, spin_if_exhausted = false)
 			intrinsics.atomic_store_explicit(&ext_pool.busy, 0, .Release)
-			return f, l, (ext_idx if shard_hint < 0 else shard_hint)
+			return f, l, eff_hint
 		}
 	}
 	alloc := target.allocator if target.allocator.procedure != nil else context.allocator
 	first = new(Envelope(Msg), alloc)
-	first.next = nil
-	first.pool_id = 0
-	first.flags = ENVELOPE_FLAG_HEAP
-	first.msg = msgs[0]
+	first.next       = nil
+	first.pool_id    = POOL_ID_NONE
+	first.flags      = ENVELOPE_FLAG_HEAP
+	first.reply_slot = nil
+	first.msg        = msgs[0]
 	prev := first
 	for i := 1; i < len(msgs); i += 1 {
 		cur := new(Envelope(Msg), alloc)
-		cur.next = nil
-		cur.pool_id = 0
-		cur.flags = ENVELOPE_FLAG_HEAP
-		cur.msg = msgs[i]
+		cur.next       = nil
+		cur.pool_id    = POOL_ID_NONE
+		cur.flags      = ENVELOPE_FLAG_HEAP
+		cur.reply_slot = nil
+		cur.msg        = msgs[i]
 		intrinsics.atomic_store_explicit(&prev.next, cur, .Relaxed)
 		prev = cur
 	}
-	return first, prev, max(0, shard_hint)
+	return first, prev, eff_hint
 }
 
 // -----------------------------------------------------------------------------
 // Message Sending Overloads (Explicit Pool, Auto-Pooled, `ctx`, Ambient, & `PID`)
 // -----------------------------------------------------------------------------
+
+@(private)
+actor_base_can_accept :: #force_inline proc(base: ^Actor_Base, pid_gen: u32) -> bool {
+	if base == nil {
+		return false
+	}
+	if intrinsics.atomic_load_explicit(&base.status, .Acquire) == u32(Actor_Status.Stopped) {
+		return false
+	}
+	if pid_gen != 0 && intrinsics.atomic_load_explicit(&base.generation, .Acquire) != pid_gen {
+		return false
+	}
+	return true
+}
+
+@(private)
+actor_recycle_single_envelope :: proc(ref: ^Actor_Ref($Msg), env: ^Envelope(Msg)) {
+	if env == nil { return }
+	if (env.flags & ENVELOPE_FLAG_CALL) != 0 && env.reply_slot != nil {
+		complete_call_slot(env.reply_slot, CALL_STATE_FAULTED)
+	}
+	if (env.flags & ENVELOPE_FLAG_HEAP) != 0 {
+		pid := env.pool_id
+		alloc := ref.pools[pid].allocator if (ref != nil && len(ref.pools) > 0 && int(pid) < len(ref.pools)) else (ref.allocator if ref != nil else context.allocator)
+		if alloc.procedure == nil {
+			alloc = context.allocator
+		}
+		free(env, alloc)
+	} else if ref != nil && len(ref.pools) > 0 && (env.flags & ENVELOPE_FLAG_STATIC) == 0 && int(env.pool_id) < len(ref.pools) {
+		mpsc_push(&ref.pools[env.pool_id].remote_returns, env)
+	}
+}
+
+@(private)
+actor_recycle_envelope_chain :: proc(ref: ^Actor_Ref($Msg), first: ^Envelope(Msg)) {
+	cur := first
+	for cur != nil {
+		nxt := intrinsics.atomic_load_explicit(&cur.next, .Relaxed)
+		actor_recycle_single_envelope(ref, cur)
+		cur = nxt
+	}
+}
 
 // Send a message to `target` using a pre-allocated or pooled `^Envelope(Msg)`.
 send_envelope :: #force_inline proc(
@@ -1043,8 +1432,15 @@ send_envelope :: #force_inline proc(
 	env: ^Envelope(Msg),
 	shard_hint: int = 0,
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) {
+		actor_recycle_single_envelope(&target.ref if target != nil else nil, env)
+		return
+	}
 	mpsc_push(&target.mailbox, env)
 	scheduler_schedule_actor(s, &target.base, shard_hint)
+	if intrinsics.atomic_load_explicit(&target.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target.base, false)
+	}
 }
 
 send_envelope_pid :: #force_inline proc(
@@ -1053,14 +1449,25 @@ send_envelope_pid :: #force_inline proc(
 	env: ^Envelope(Msg),
 	shard_hint: int = 0,
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) {
+		actor_recycle_single_envelope(target.ref, env)
+		return
+	}
 	mpsc_push(&target.ref.mailbox, env)
 	scheduler_schedule_actor(s, &target.ref.base, shard_hint)
+	if intrinsics.atomic_load_explicit(&target.ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target.ref.base, false)
+	}
 }
 
 send_ambient_envelope :: #force_inline proc(
 	target: ^Actor($State, $Msg),
 	env: ^Envelope(Msg),
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) {
+		actor_recycle_single_envelope(&target.ref if target != nil else nil, env)
+		return
+	}
 	s := resolve_target_scheduler(nil, &target.ref)
 	send_envelope(s, target, env, 0)
 }
@@ -1069,6 +1476,10 @@ send_ambient_envelope_pid :: #force_inline proc(
 	target: PID($Msg),
 	env: ^Envelope(Msg),
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) {
+		actor_recycle_single_envelope(target.ref, env)
+		return
+	}
 	s := resolve_target_scheduler(nil, target.ref)
 	send_envelope_pid(s, target, env, 0)
 }
@@ -1082,8 +1493,15 @@ send_envelope_chain :: #force_inline proc(
 	last: ^Envelope(Msg),
 	shard_hint: int = 0,
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) {
+		actor_recycle_envelope_chain(&target.ref if target != nil else nil, first)
+		return
+	}
 	mpsc_push_chain(&target.mailbox, first, last)
 	scheduler_schedule_actor(s, &target.base, shard_hint)
+	if intrinsics.atomic_load_explicit(&target.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target.base, false)
+	}
 }
 
 send_envelope_chain_pid :: #force_inline proc(
@@ -1093,8 +1511,15 @@ send_envelope_chain_pid :: #force_inline proc(
 	last: ^Envelope(Msg),
 	shard_hint: int = 0,
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) {
+		actor_recycle_envelope_chain(target.ref, first)
+		return
+	}
 	mpsc_push_chain(&target.ref.mailbox, first, last)
 	scheduler_schedule_actor(s, &target.ref.base, shard_hint)
+	if intrinsics.atomic_load_explicit(&target.ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target.ref.base, false)
+	}
 }
 
 // Allocate an envelope from `pool`, copy `msg` into it, and send to `target`.
@@ -1105,6 +1530,7 @@ send_from_pool :: #force_inline proc(
 	msg: Msg,
 	shard_hint: int = -1,
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) { return }
 	env := pool_acquire(pool)
 	env.msg = msg
 	hint := int(pool.pool_id) if shard_hint < 0 else shard_hint
@@ -1118,6 +1544,7 @@ send_from_pool_pid :: #force_inline proc(
 	msg: Msg,
 	shard_hint: int = -1,
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
 	env := pool_acquire(pool)
 	env.msg = msg
 	hint := int(pool.pool_id) if shard_hint < 0 else shard_hint
@@ -1133,7 +1560,7 @@ send_batch_from_pool :: #force_inline proc(
 	msgs: []Msg,
 	shard_hint: int = -1,
 ) {
-	if len(msgs) == 0 { return }
+	if len(msgs) == 0 || target == nil || !actor_base_can_accept(&target.base, 0) { return }
 	first, last := pool_acquire_chain(pool, msgs)
 	hint := int(pool.pool_id) if shard_hint < 0 else shard_hint
 	send_envelope_chain(s, target, first, last, hint)
@@ -1146,7 +1573,7 @@ send_batch_from_pool_pid :: #force_inline proc(
 	msgs: []Msg,
 	shard_hint: int = -1,
 ) {
-	if len(msgs) == 0 { return }
+	if len(msgs) == 0 || target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
 	first, last := pool_acquire_chain(pool, msgs)
 	hint := int(pool.pool_id) if shard_hint < 0 else shard_hint
 	send_envelope_chain_pid(s, target, first, last, hint)
@@ -1159,6 +1586,7 @@ send_sched_auto :: #force_inline proc(
 	msg: Msg,
 	shard_hint: int = -1,
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) { return }
 	env, hint := acquire_auto_envelope(s, &target.ref, shard_hint)
 	env.msg = msg
 	send_envelope(s, target, env, hint)
@@ -1170,6 +1598,7 @@ send_sched_auto_pid :: #force_inline proc(
 	msg: Msg,
 	shard_hint: int = -1,
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
 	env, hint := acquire_auto_envelope(s, target.ref, shard_hint)
 	env.msg = msg
 	send_envelope_pid(s, target, env, hint)
@@ -1181,7 +1610,7 @@ send_sched_batch_auto :: #force_inline proc(
 	msgs: []Msg,
 	shard_hint: int = -1,
 ) {
-	if len(msgs) == 0 { return }
+	if len(msgs) == 0 || target == nil || !actor_base_can_accept(&target.base, 0) { return }
 	first, last, hint := acquire_auto_envelope_chain(s, &target.ref, msgs, shard_hint)
 	send_envelope_chain(s, target, first, last, hint)
 }
@@ -1192,23 +1621,29 @@ send_sched_batch_auto_pid :: #force_inline proc(
 	msgs: []Msg,
 	shard_hint: int = -1,
 ) {
-	if len(msgs) == 0 { return }
+	if len(msgs) == 0 || target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
 	first, last, hint := acquire_auto_envelope_chain(s, target.ref, msgs, shard_hint)
 	send_envelope_chain_pid(s, target, first, last, hint)
 }
 
 // Inside an actor's `receive` callback: send a new message to `target` using the
-// current worker's pool (`target.pools[ctx.worker_id]`).
+// current worker's pool when on the same scheduler, or external path across schedulers.
 send_ctx :: #force_inline proc(
 	ctx: ^Context,
 	target: ^Actor($State, $Msg),
 	msg: Msg,
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) { return }
+	target_sched := resolve_target_scheduler(ctx.sched, &target.ref)
+	if target_sched != ctx.sched {
+		send_sched_auto(target_sched, target, msg, -1)
+		return
+	}
 	wid := ctx.worker_id
-	if wid >= 0 && wid < len(target.pools) {
-		send_from_pool(ctx.sched, &target.pools[wid], target, msg, wid)
+	if wid >= 0 && wid + 1 < len(target.pools) {
+		send_from_pool(target_sched, &target.pools[wid], target, msg, wid)
 	} else {
-		send_sched_auto(ctx.sched, target, msg, wid)
+		send_sched_auto(target_sched, target, msg, wid)
 	}
 }
 
@@ -1217,11 +1652,17 @@ send_ctx_pid :: #force_inline proc(
 	target: PID($Msg),
 	msg: Msg,
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
+	target_sched := resolve_target_scheduler(ctx.sched, target.ref)
+	if target_sched != ctx.sched {
+		send_sched_auto_pid(target_sched, target, msg, -1)
+		return
+	}
 	wid := ctx.worker_id
-	if wid >= 0 && wid < len(target.ref.pools) {
-		send_from_pool_pid(ctx.sched, &target.ref.pools[wid], target, msg, wid)
+	if wid >= 0 && wid + 1 < len(target.ref.pools) {
+		send_from_pool_pid(target_sched, &target.ref.pools[wid], target, msg, wid)
 	} else {
-		send_sched_auto_pid(ctx.sched, target, msg, wid)
+		send_sched_auto_pid(target_sched, target, msg, wid)
 	}
 }
 
@@ -1230,11 +1671,17 @@ send_ctx_batch :: #force_inline proc(
 	target: ^Actor($State, $Msg),
 	msgs: []Msg,
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) { return }
+	target_sched := resolve_target_scheduler(ctx.sched, &target.ref)
+	if target_sched != ctx.sched {
+		send_sched_batch_auto(target_sched, target, msgs, -1)
+		return
+	}
 	wid := ctx.worker_id
-	if wid >= 0 && wid < len(target.pools) {
-		send_batch_from_pool(ctx.sched, &target.pools[wid], target, msgs, wid)
+	if wid >= 0 && wid + 1 < len(target.pools) {
+		send_batch_from_pool(target_sched, &target.pools[wid], target, msgs, wid)
 	} else {
-		send_sched_batch_auto(ctx.sched, target, msgs, wid)
+		send_sched_batch_auto(target_sched, target, msgs, wid)
 	}
 }
 
@@ -1243,11 +1690,17 @@ send_ctx_batch_pid :: #force_inline proc(
 	target: PID($Msg),
 	msgs: []Msg,
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
+	target_sched := resolve_target_scheduler(ctx.sched, target.ref)
+	if target_sched != ctx.sched {
+		send_sched_batch_auto_pid(target_sched, target, msgs, -1)
+		return
+	}
 	wid := ctx.worker_id
-	if wid >= 0 && wid < len(target.ref.pools) {
-		send_batch_from_pool_pid(ctx.sched, &target.ref.pools[wid], target, msgs, wid)
+	if wid >= 0 && wid + 1 < len(target.ref.pools) {
+		send_batch_from_pool_pid(target_sched, &target.ref.pools[wid], target, msgs, wid)
 	} else {
-		send_sched_batch_auto_pid(ctx.sched, target, msgs, wid)
+		send_sched_batch_auto_pid(target_sched, target, msgs, wid)
 	}
 }
 
@@ -1257,6 +1710,7 @@ send_ambient :: #force_inline proc(
 	target: ^Actor($State, $Msg),
 	msg: Msg,
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) { return }
 	if ctx := _tls_active_ctx; ctx != nil {
 		send_ctx(ctx, target, msg)
 		return
@@ -1270,6 +1724,7 @@ send_ambient_pid :: #force_inline proc(
 	target: PID($Msg),
 	msg: Msg,
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
 	if ctx := _tls_active_ctx; ctx != nil {
 		send_ctx_pid(ctx, target, msg)
 		return
@@ -1283,6 +1738,7 @@ send_ambient_batch :: #force_inline proc(
 	target: ^Actor($State, $Msg),
 	msgs: []Msg,
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) { return }
 	if ctx := _tls_active_ctx; ctx != nil {
 		send_ctx_batch(ctx, target, msgs)
 		return
@@ -1296,6 +1752,7 @@ send_ambient_batch_pid :: #force_inline proc(
 	target: PID($Msg),
 	msgs: []Msg,
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
 	if ctx := _tls_active_ctx; ctx != nil {
 		send_ctx_batch_pid(ctx, target, msgs)
 		return
@@ -1309,6 +1766,67 @@ send_ambient_batch_pid :: #force_inline proc(
 // Zero-Copy `iso` Message Forwarding (`actor.forward`)
 // -----------------------------------------------------------------------------
 
+@(private)
+forward_ref_impl :: #force_inline proc(
+	ctx:         ^Context,
+	target_ref:  ^Actor_Ref($Msg),
+	pid_gen:     u32,
+	has_update:  bool,
+	updated_msg: Msg,
+) {
+	assert(!ctx.forwarded && ctx.current_env != nil, "actor.forward called twice or outside active message turn")
+	assert(ctx.current_msg_type == typeid_of(Msg), "actor.forward target message type mismatch")
+
+	env := cast(^Envelope(Msg))ctx.current_env
+	saved_reply_slot := ctx.current_reply_slot
+	saved_reply_flags := ctx.current_flags & (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
+	// Preserve `reply_slot` and call/reply flags on the forwarded envelope while
+	// disarming the forwarding context so subsequent `reply` or turn exit is a no-op.
+	ctx.current_reply_slot = nil
+	ctx.current_flags &~= (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
+
+	if target_ref == nil || !actor_base_can_accept(&target_ref.base, pid_gen) {
+		if saved_reply_slot != nil && (saved_reply_flags & ENVELOPE_FLAG_CALL) != 0 {
+			complete_call_slot(saved_reply_slot, CALL_STATE_FAULTED)
+		}
+		env.reply_slot = nil
+		env.flags &~= (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
+		return
+	}
+
+	target_sched := resolve_target_scheduler(ctx.sched, target_ref)
+	same_pool_space := ctx.current_pools_raw != nil && ctx.current_pools_raw == raw_data(target_ref.pools)
+	if target_sched == ctx.sched && same_pool_space {
+		ctx.forwarded = true
+		ctx.current_env = nil
+		if has_update {
+			env.msg = updated_msg
+		}
+		env.reply_slot = saved_reply_slot
+		env.flags = (env.flags &~ (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)) | saved_reply_flags
+		mpsc_push(&target_ref.mailbox, env)
+		scheduler_schedule_actor(target_sched, &target_ref.base, ctx.worker_id)
+		if intrinsics.atomic_load_explicit(&target_ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+			actor_drain_stopped_target(&target_ref.base, false)
+		}
+		return
+	}
+
+	// Cross-scheduler or mismatched-pool forward: move payload & reply metadata to
+	// a target-owned envelope so the caller safely recycles `env` to its own pool.
+	new_env, hint := acquire_auto_envelope(target_sched, target_ref, -1)
+	new_env.msg = updated_msg if has_update else env.msg
+	new_env.reply_slot = saved_reply_slot
+	new_env.flags |= saved_reply_flags
+	env.reply_slot = nil
+	env.flags &~= (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
+	mpsc_push(&target_ref.mailbox, new_env)
+	scheduler_schedule_actor(target_sched, &target_ref.base, hint)
+	if intrinsics.atomic_load_explicit(&target_ref.base.status, .Seq_Cst) == u32(Actor_Status.Stopped) {
+		actor_drain_stopped_target(&target_ref.base, false)
+	}
+}
+
 // Zero-copy `iso` ownership transfer inside an actor's `receive` callback!
 // Marks `ctx.forwarded = true` on the worker's stack so the caller actor does
 // NOT recycle `current_env`, mutates its payload to `updated_msg`, and pushes
@@ -1318,10 +1836,7 @@ forward_ctx :: #force_inline proc(
 	target: ^Actor($State, $Msg),
 	updated_msg: Msg,
 ) {
-	env := cast(^Envelope(Msg))ctx.current_env
-	ctx.forwarded = true
-	env.msg = updated_msg
-	send_envelope(ctx.sched, target, env, ctx.worker_id)
+	forward_ref_impl(ctx, &target.ref if target != nil else nil, 0, true, updated_msg)
 }
 
 forward_ctx_pid :: #force_inline proc(
@@ -1329,10 +1844,7 @@ forward_ctx_pid :: #force_inline proc(
 	target: PID($Msg),
 	updated_msg: Msg,
 ) {
-	env := cast(^Envelope(Msg))ctx.current_env
-	ctx.forwarded = true
-	env.msg = updated_msg
-	send_envelope_pid(ctx.sched, target, env, ctx.worker_id)
+	forward_ref_impl(ctx, target.ref, target.generation, true, updated_msg)
 }
 
 // Forward the current message envelope with an updated payload using the ambient worker context.
@@ -1359,18 +1871,16 @@ forward_unchanged_ctx :: #force_inline proc(
 	ctx: ^Context,
 	target: ^Actor($State, $Msg),
 ) {
-	env := cast(^Envelope(Msg))ctx.current_env
-	ctx.forwarded = true
-	send_envelope(ctx.sched, target, env, ctx.worker_id)
+	empty: Msg
+	forward_ref_impl(ctx, &target.ref if target != nil else nil, 0, false, empty)
 }
 
 forward_unchanged_ctx_pid :: #force_inline proc(
 	ctx: ^Context,
 	target: PID($Msg),
 ) {
-	env := cast(^Envelope(Msg))ctx.current_env
-	ctx.forwarded = true
-	send_envelope_pid(ctx.sched, target, env, ctx.worker_id)
+	empty: Msg
+	forward_ref_impl(ctx, target.ref, target.generation, false, empty)
 }
 
 forward_unchanged_ambient :: #force_inline proc(
@@ -1412,6 +1922,7 @@ send_with_reply_actor_pid :: #force_inline proc(
 	msg: Msg,
 	reply_to: PID($Res),
 ) {
+	if target == nil || !actor_base_can_accept(&target.base, 0) { return }
 	s := resolve_target_scheduler(nil, &target.ref)
 	assert(s != nil, "No active Scheduler found for actor.send(target, msg, reply_to)")
 	env, hint := acquire_auto_envelope(s, &target.ref, -1)
@@ -1426,6 +1937,7 @@ send_with_reply_pid_pid :: #force_inline proc(
 	msg: Msg,
 	reply_to: PID($Res),
 ) {
+	if target.ref == nil || !actor_base_can_accept(&target.ref.base, target.generation) { return }
 	s := resolve_target_scheduler(nil, target.ref)
 	assert(s != nil, "No active Scheduler found for actor.send(pid, msg, reply_to)")
 	env, hint := acquire_auto_envelope(s, target.ref, -1)
@@ -1451,16 +1963,36 @@ send_with_reply_pid_actor :: #force_inline proc(
 	send_with_reply_pid_pid(target, msg, pid(reply_to))
 }
 
+@(private)
+complete_call_slot :: #force_inline proc(slot_ptr: rawptr, final_state: u32) {
+	if slot_ptr == nil { return }
+	ready := cast(^sync.Futex)slot_ptr
+	prev := intrinsics.atomic_exchange_explicit((^u32)(ready), CALL_STATE_SIGNALING, .Acq_Rel)
+	if prev == CALL_STATE_PARKED {
+		// Caller stays blocked in loop while state == CALL_STATE_SIGNALING, ensuring
+		// `sync.futex_signal` completes before the stack frame can be popped.
+		sync.futex_signal(ready)
+	}
+	intrinsics.atomic_store_explicit((^u32)(ready), final_state, .Release)
+}
+
 // Reply to the sender of the currently executing message (`actor.call` or `send(..., reply_to)`).
 reply_ctx :: #force_inline proc(ctx: ^Context, val: $Res) {
 	slot_ptr := ctx.current_reply_slot
 	if slot_ptr == nil { return }
 	flags := ctx.current_flags
+	ctx.current_reply_slot = nil
+	ctx.current_flags &~= (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
+	if ctx.current_env != nil {
+		raw_env := cast(^Envelope(u8))ctx.current_env
+		raw_env.reply_slot = nil
+		raw_env.flags &~= (ENVELOPE_FLAG_CALL | ENVELOPE_FLAG_REPLY_PID)
+	}
 	if (flags & ENVELOPE_FLAG_CALL) != 0 {
 		slot := cast(^Call_Slot(Res))slot_ptr
+		assert(slot.res_type == typeid_of(Res), "actor.reply result type mismatch with actor.call")
 		slot.result = val
-		intrinsics.atomic_store_explicit((^u32)(&slot.ready), 1, .Release)
-		sync.futex_signal(&slot.ready)
+		complete_call_slot(slot_ptr, CALL_STATE_REPLIED)
 	} else if (flags & ENVELOPE_FLAG_REPLY_PID) != 0 {
 		target_ref := cast(^Actor_Ref(Res))slot_ptr
 		send_ctx_pid(ctx, PID(Res){ref = target_ref}, val)
@@ -1481,6 +2013,9 @@ reply :: proc {
 // Cooperatively execute one runnable actor turn while a worker thread is waiting inside `actor.call`.
 @(private)
 scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> bool {
+	if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
+		panic("actor.call cooperative recursion depth limit exceeded")
+	}
 	wid := caller_ctx.worker_id
 	num_shards := s.num_shards
 	a := shard_pop_or_steal(&s.shards[wid % num_shards])
@@ -1493,18 +2028,38 @@ scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> b
 	}
 	if a == nil { return false }
 
-	saved := caller_ctx^
+	saved_ctx := caller_ctx^
+	saved_tls := _tls_active_ctx
+	_tls_call_depth += 1
+	defer {
+		_tls_call_depth -= 1
+		caller_ctx^ = saved_ctx
+		_tls_active_ctx = saved_tls
+	}
+
 	processed, has_more := a.step_proc(a, caller_ctx, s.batch_quota)
-	caller_ctx^ = saved
+	caller_ctx^ = saved_ctx
 
 	if has_more {
 		shard_push(&s.shards[wid % num_shards], a)
+		if s.enable_parking {
+			intrinsics.atomic_thread_fence(.Seq_Cst)
+			if intrinsics.atomic_load_explicit(&s.parked_workers, .Acquire) > 0 {
+				intrinsics.atomic_add_explicit((^u32)(&s.wake_futex), 1, .Release)
+				sync.futex_signal(&s.wake_futex)
+			}
+		}
 	} else {
 		intrinsics.atomic_store_explicit(&a.scheduled, 0, .Seq_Cst)
-		intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Acq_Rel)
 		_, still_has_more := a.step_proc(a, caller_ctx, 0)
 		if still_has_more {
-			scheduler_schedule_actor(s, a, wid)
+			if intrinsics.atomic_exchange_explicit(&a.scheduled, 1, .Acq_Rel) == 0 {
+				shard_push(&s.shards[wid % num_shards], a)
+			} else {
+				intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Seq_Cst)
+			}
+		} else {
+			intrinsics.atomic_sub_explicit(&s.active_actors, 1, .Seq_Cst)
 		}
 	}
 	if processed > 0 {
@@ -1513,9 +2068,46 @@ scheduler_step_one_cooperative :: proc(s: ^Scheduler, caller_ctx: ^Context) -> b
 	return true
 }
 
+@(private)
+wait_for_call_slot :: proc(s: ^Scheduler, slot: ^Call_Slot($Res), caller_ctx: ^Context) -> u32 {
+	spin := 0
+	for {
+		state := intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire)
+		if state >= CALL_STATE_REPLIED {
+			return state
+		}
+		if caller_ctx != nil && caller_ctx.sched == s && s.num_workers == 1 {
+			if state == CALL_STATE_PENDING {
+				if !scheduler_step_one_cooperative(s, caller_ctx) {
+					intrinsics.cpu_relax()
+				}
+			} else {
+				intrinsics.cpu_relax()
+			}
+		} else {
+			if state == CALL_STATE_SIGNALING || spin < DEFAULT_FUTEX_SPIN_LIMIT {
+				spin += 1
+				intrinsics.cpu_relax()
+			} else {
+				old_st, cas_ok := intrinsics.atomic_compare_exchange_strong_explicit(
+					(^u32)(&slot.ready),
+					CALL_STATE_PENDING,
+					CALL_STATE_PARKED,
+					.Acq_Rel,
+					.Acquire,
+				)
+				if cas_ok || old_st == CALL_STATE_PARKED {
+					sync.futex_wait(&slot.ready, CALL_STATE_PARKED)
+				}
+				spin = 0
+			}
+		}
+	}
+}
+
 // Synchronous request/reply (`GenServer.call` / Akka `ask`): sends `msg` to `target`,
 // waits for `target` to call `actor.reply(res)` (cooperatively stepping actors if called
-// from a worker thread), and returns `res` of type `$Res`.
+// from a 1-worker thread), and returns `res` of type `$Res`.
 @(require_results)
 call_sched_pid :: proc(
 	s: ^Scheduler,
@@ -1523,32 +2115,37 @@ call_sched_pid :: proc(
 	msg: Msg,
 	$Res: typeid,
 ) -> Res {
-	slot: Call_Slot(Res)
+	if target.ref == nil {
+		if is_trap_active() {
+			fail_turn_reason(.Panic, "actor.call on nil PID")
+		}
+		assert(target.ref != nil, "actor.call on nil PID")
+		return {}
+	}
+	caller_ctx := _tls_active_ctx
+	if caller_ctx != nil && caller_ctx.sched == s {
+		if caller_ctx.current_actor == &target.ref.base {
+			panic("actor.call self-call deadlock detected")
+		}
+		if s.num_workers == 1 && intrinsics.atomic_load_explicit(&target.ref.base.in_step, .Seq_Cst) != 0 {
+			panic("actor.call cycle detected on single-worker scheduler")
+		}
+		if _tls_call_depth >= MAX_COOPERATIVE_CALL_DEPTH {
+			panic("actor.call cooperative recursion depth limit exceeded")
+		}
+	}
+
+	slot := Call_Slot(Res){
+		ready    = sync.Futex(CALL_STATE_PENDING),
+		res_type = typeid_of(Res),
+	}
 	env, hint := acquire_auto_envelope(s, target.ref, -1)
 	env.flags |= ENVELOPE_FLAG_CALL
 	env.reply_slot = &slot
 	env.msg = msg
 	send_envelope_pid(s, target, env, hint)
 
-	caller_ctx := _tls_active_ctx
-	spin := 0
-	for intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire) == 0 {
-		if caller_ctx != nil && caller_ctx.sched == s {
-			if !scheduler_step_one_cooperative(s, caller_ctx) {
-				intrinsics.cpu_relax()
-			}
-		} else {
-			if spin < DEFAULT_FUTEX_SPIN_LIMIT {
-				spin += 1
-				intrinsics.cpu_relax()
-			} else {
-				if intrinsics.atomic_load_explicit((^u32)(&slot.ready), .Acquire) == 0 {
-					sync.futex_wait(&slot.ready, 0)
-				}
-				spin = 0
-			}
-		}
-	}
+	_ = wait_for_call_slot(s, &slot, caller_ctx)
 	return slot.result
 }
 
