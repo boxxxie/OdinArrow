@@ -758,16 +758,31 @@ _ipc_vw_i32 :: proc(w: ^_IPC_Vectored_Writer, v: i32) -> bool {
 
 // ── Public writer ─────────────────────────────────────────────────────────────
 
+// Truncate `f` to `size` when `f` is a regular file; silently succeed on
+// non-regular targets (pipes, sockets, character devices like `/dev/null`).
+@(private="file")
+_ipc_truncate_if_regular :: proc(f: ^os.File, size: i64) -> bool {
+	if err := os.truncate(f, size); err != nil {
+		if fi, stat_err := os.fstat(f, context.temp_allocator); stat_err == nil && fi.type == .Regular {
+			return false
+		}
+	}
+	return true
+}
+
 // Write all batches to an Arrow IPC file.
 ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
-	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
+	// Intentionally omit `.Trunc` on open so overwriting an existing regular file
+	// reuses its page-cache pages and extents instead of triggering kernel page
+	// reallocation on every write; `_ipc_truncate_if_regular` shrinks shorter writes.
+	f, err := os.open(path, {.Write, .Create}, os.Permissions_Default_File)
 	if err != nil { return false }
 	write_ok := false
 	defer {
+		if !write_ok { _ = _ipc_truncate_if_regular(f, 0) }
 		os.close(f)
-		if !write_ok { _ = os.remove(path) }
 	}
 
 	w: _IPC_Vectored_Writer = ---
@@ -814,6 +829,7 @@ ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -
 	// Tail magic
 	if !_ipc_vw_write(&w, _ipc_magic_tail_bytes[:]) { return false }
 	if !_ipc_vw_flush(&w) { return false }
+	if !_ipc_truncate_if_regular(f, w.file_pos) { return false }
 	write_ok = true
 	return true
 }
@@ -986,9 +1002,15 @@ ipc_read_file :: proc(path: string, allocator := context.allocator, validate := 
 ipc_write_stream :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
-	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Default_File)
+	// Intentionally omit `.Trunc` on open to match `ipc_write_file` page-cache reuse
+	// on regular files while still working on pipes/sockets/character devices.
+	f, err := os.open(path, {.Write, .Create}, os.Permissions_Default_File)
 	if err != nil { return false }
-	defer os.close(f)
+	write_ok := false
+	defer {
+		if !write_ok { _ = _ipc_truncate_if_regular(f, 0) }
+		os.close(f)
+	}
 
 	w: _IPC_Vectored_Writer = ---
 	w.f = f
@@ -1012,6 +1034,8 @@ ipc_write_stream :: proc(path: string, schema: ^Schema, batches: []Record_Batch)
 	if !_ipc_vw_u32(&w, 0xFFFF_FFFF) { return false }
 	if !_ipc_vw_u32(&w, 0)           { return false }
 	if !_ipc_vw_flush(&w)            { return false }
+	if !_ipc_truncate_if_regular(f, w.file_pos) { return false }
+	write_ok = true
 	return true
 }
 

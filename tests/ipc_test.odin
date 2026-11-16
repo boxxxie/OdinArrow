@@ -572,5 +572,95 @@ test_ipc_write_stream_chardev :: proc(t: ^testing.T) {
 
 		testing.expect(t, oa.ipc_write_stream("/dev/null", &schema, []oa.Record_Batch{batch}),
 			"ipc_write_stream must succeed on character devices without failing on ftruncate")
+		testing.expect(t, oa.ipc_write_file("/dev/null", &schema, []oa.Record_Batch{batch}),
+			"ipc_write_file must succeed on character devices without failing on ftruncate")
+	}
+}
+
+@(test)
+test_ipc_overwrite_shrinks_existing_file :: proc(t: ^testing.T) {
+	fields := []oa.Field{oa.field_make("v", oa.Int32_Type{})}
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
+	defer oa.schema_free(&schema)
+
+	large_vals := make([]i32, 1024)
+	defer delete(large_vals)
+	for i in 0..<len(large_vals) { large_vals[i] = i32(i) }
+
+	large_col := make_i32_array(large_vals)
+	large_batch, l_ok := oa.record_batch_make(&schema, []oa.Array{large_col})
+	testing.expect(t, l_ok)
+	defer oa.record_batch_free(&large_batch)
+
+	small_col := make_i32_array([]i32{10, 20, 30})
+	small_batch, s_ok := oa.record_batch_make(&schema, []oa.Array{small_col})
+	testing.expect(t, s_ok)
+	defer oa.record_batch_free(&small_batch)
+
+	file_path := ipc_test_temp_path("overwrite_shrink", "arrow")
+	defer delete(file_path)
+	defer _ = os.remove(file_path)
+
+	stream_path := ipc_test_temp_path("overwrite_shrink", "arrows")
+	defer delete(stream_path)
+	defer _ = os.remove(stream_path)
+
+	testing.expect(t, oa.ipc_write_file(file_path, &schema, []oa.Record_Batch{large_batch}))
+	testing.expect(t, oa.ipc_write_stream(stream_path, &schema, []oa.Record_Batch{large_batch}))
+
+	large_file_bytes, lf_err := os.read_entire_file(file_path, context.temp_allocator)
+	testing.expect_value(t, lf_err, nil)
+	large_stream_bytes, ls_err := os.read_entire_file(stream_path, context.temp_allocator)
+	testing.expect_value(t, ls_err, nil)
+
+	// Overwrite with the smaller batch; post-write ftruncate must shrink both files.
+	testing.expect(t, oa.ipc_write_file(file_path, &schema, []oa.Record_Batch{small_batch}))
+	testing.expect(t, oa.ipc_write_stream(stream_path, &schema, []oa.Record_Batch{small_batch}))
+
+	small_file_bytes, sf_err := os.read_entire_file(file_path, context.temp_allocator)
+	testing.expect_value(t, sf_err, nil)
+	small_stream_bytes, ss_err := os.read_entire_file(stream_path, context.temp_allocator)
+	testing.expect_value(t, ss_err, nil)
+
+	testing.expect(t, len(small_file_bytes) > 0 && len(small_file_bytes) < len(large_file_bytes),
+		"overwriting IPC file with smaller batch must shrink file size")
+	testing.expect(t, len(small_stream_bytes) > 0 && len(small_stream_bytes) < len(large_stream_bytes),
+		"overwriting IPC stream with smaller batch must shrink file size")
+
+	out_sc_f, out_bs_f, r_ok_f := oa.ipc_read_file(file_path, use_mmap = false)
+	testing.expect(t, r_ok_f)
+	if r_ok_f {
+		defer {
+			for &b in out_bs_f { oa.record_batch_free(&b) }
+			delete(out_bs_f)
+			oa.schema_free(out_sc_f)
+			free(out_sc_f)
+		}
+		testing.expect_value(t, len(out_bs_f), 1)
+		if len(out_bs_f) == 1 {
+			testing.expect_value(t, out_bs_f[0].length, 3)
+			testing.expect_value(t, oa.array_get(&out_bs_f[0].columns[0], 0, i32), i32(10))
+			testing.expect_value(t, oa.array_get(&out_bs_f[0].columns[0], 1, i32), i32(20))
+			testing.expect_value(t, oa.array_get(&out_bs_f[0].columns[0], 2, i32), i32(30))
+		}
+	}
+
+	out_sc_s, out_bs_s, r_ok_s := oa.ipc_read_stream(stream_path, use_mmap = false)
+	testing.expect(t, r_ok_s)
+	if r_ok_s {
+		defer {
+			for &b in out_bs_s { oa.record_batch_free(&b) }
+			delete(out_bs_s)
+			oa.schema_free(out_sc_s)
+			free(out_sc_s)
+		}
+		testing.expect_value(t, len(out_bs_s), 1)
+		if len(out_bs_s) == 1 {
+			testing.expect_value(t, out_bs_s[0].length, 3)
+			testing.expect_value(t, oa.array_get(&out_bs_s[0].columns[0], 0, i32), i32(10))
+			testing.expect_value(t, oa.array_get(&out_bs_s[0].columns[0], 1, i32), i32(20))
+			testing.expect_value(t, oa.array_get(&out_bs_s[0].columns[0], 2, i32), i32(30))
+		}
 	}
 }
