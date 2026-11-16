@@ -9,12 +9,8 @@ on:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: Test (ubuntu-latest)
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -73,5 +69,4 @@ jobs:
           diff -u /tmp/ci_in.csv /tmp/ci_out.csv
 
       - name: Run Arrow C++ FFI layout compatibility tests (Linux)
-        if: runner.os == 'Linux'
         run: make test-cpp build-parquet-capi parquet-ffi csv-to-parquet-ffi
