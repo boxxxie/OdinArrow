@@ -59,13 +59,18 @@ _pool_init :: proc() {
 
 	n := os.get_processor_core_count()
 	if n < 1 { n = 1 }
-	g_pool.n       = n
 	g_pool.workers = make([]^thread.Thread, n)
 	g_pool.wdata   = make([]_Pool_Worker, n)
-	for i in 0..<n {
-		g_pool.wdata[i] = _Pool_Worker{ pool = &g_pool, id = i }
-		g_pool.workers[i] = thread.create_and_start_with_poly_data(&g_pool.wdata[i], _pool_worker)
+	started := 0
+	for _ in 0..<n {
+		g_pool.wdata[started] = _Pool_Worker{ pool = &g_pool, id = started }
+		t := thread.create_and_start_with_poly_data(&g_pool.wdata[started], _pool_worker)
+		if t != nil {
+			g_pool.workers[started] = t
+			started += 1
+		}
 	}
+	g_pool.n = started
 }
 
 @(private)

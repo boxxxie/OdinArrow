@@ -119,6 +119,8 @@ _detect_hardware_config :: proc() -> Hardware_Config {
 		type_path := fmt.bprintf(path_buf[:], "/sys/devices/system/cpu/cpu0/cache/index%d/type", idx)
 		ctype, t_ok := _read_sysfs_small(type_path, val_buf[:])
 		if !t_ok { continue }
+		is_data := ctype == "Data"
+		is_unified := ctype == "Unified"
 
 		sz_path := fmt.bprintf(path_buf[:], "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx)
 		sz_str, s_ok := _read_sysfs_small(sz_path, val_buf[:])
@@ -126,11 +128,11 @@ _detect_hardware_config :: proc() -> Hardware_Config {
 		sz_bytes, b_ok := parse_cache_size_bytes(sz_str)
 		if !b_ok { continue }
 
-		if lvl == 1 && ctype == "Data" && l1d == 0 {
+		if lvl == 1 && is_data && l1d == 0 {
 			l1d = sz_bytes
-		} else if lvl == 2 && (ctype == "Unified" || ctype == "Data") && l2 == 0 {
+		} else if lvl == 2 && (is_unified || is_data) && l2 == 0 {
 			l2 = sz_bytes
-		} else if lvl == 3 && (ctype == "Unified" || ctype == "Data") && l3 == 0 {
+		} else if lvl == 3 && (is_unified || is_data) && l3 == 0 {
 			l3 = sz_bytes
 		}
 	}
@@ -142,16 +144,16 @@ _detect_hardware_config :: proc() -> Hardware_Config {
 	max_scan := min(max(logical * 2, 32), len(seen_pairs))
 	for cpu in 0..<max_scan {
 		pkg_path  := fmt.bprintf(path_buf[:], "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu)
-		core_path := fmt.bprintf(path_buf[:], "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu)
-
 		pkg_str, p_ok := _read_sysfs_small(pkg_path, val_buf[:])
 		if !p_ok { continue }
+		pkg_id, pi_ok := _parse_nonneg_int(pkg_str)
+		if !pi_ok { continue }
+
+		core_path := fmt.bprintf(path_buf[:], "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu)
 		core_str, c_ok := _read_sysfs_small(core_path, val_buf[:])
 		if !c_ok { continue }
-
-		pkg_id,  pi_ok := _parse_nonneg_int(pkg_str)
 		core_id, ci_ok := _parse_nonneg_int(core_str)
-		if !pi_ok || !ci_ok { continue }
+		if !ci_ok { continue }
 
 		pair := [2]i32{i32(pkg_id), i32(core_id)}
 		dup := false
@@ -171,8 +173,8 @@ _detect_hardware_config :: proc() -> Hardware_Config {
 		physical = clamp(p_cnt, 1, max(l_cnt, logical))
 	}
 	if l1d <= 0 { l1d = 32 * 1024 }
-	if l2  <= 0 { l2  = 256 * 1024 }
-	if l3  <= 0 { l3  = 6 * 1024 * 1024 }
+	if l2  <= 0 { l2  = max(256 * 1024, l1d) }
+	if l3  <= 0 { l3  = max(6 * 1024 * 1024, l2) }
 
 	return Hardware_Config{
 		physical_cores      = physical,

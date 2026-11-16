@@ -104,6 +104,7 @@ table_column_at :: proc(t: ^Table, i: int) -> (col: ^Chunked_Array, ok: bool) {
 
 // Get element i across all chunks of a ChunkedArray.
 chunked_array_get :: proc(ca: ^Chunked_Array, i: int, $T: typeid) -> T {
+	if i < 0 { panic("chunked_array_get: index out of bounds") }
 	pos := i
 	for ci in 0..<len(ca.chunks) {
 		if pos < ca.chunks[ci].length {
@@ -115,6 +116,7 @@ chunked_array_get :: proc(ca: ^Chunked_Array, i: int, $T: typeid) -> T {
 }
 
 chunked_array_is_null :: proc(ca: ^Chunked_Array, i: int) -> bool {
+	if i < 0 { panic("chunked_array_is_null: index out of bounds") }
 	pos := i
 	for ci in 0..<len(ca.chunks) {
 		if pos < ca.chunks[ci].length {

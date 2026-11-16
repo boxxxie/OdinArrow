@@ -51,6 +51,7 @@ umbra_builder_make :: proc(initial_cap := 64, allocator := context.allocator) ->
 }
 
 umbra_append :: proc(b: ^Umbra_Builder, s: string) {
+	assert(len(s) <= int(max(u32)), "Umbra_Builder: string length exceeds u32 limit")
 	us: Umbra_String
 	us.length = u32(len(s))
 	if len(s) <= 12 {
@@ -285,7 +286,9 @@ _merge_sort_umbra_run :: proc(a: ^Umbra_Array, run, tmp: []_Umbra_Radix_Entry) {
 // merge-sorts unsorted equal-prefix runs.
 umbra_sort_indices :: proc(a: ^Umbra_Array, allocator := context.allocator) -> Array {
 	n := a.length
-	buf, _ := buffer_make_uninit(n * size_of(i64), allocator)
+	assert(n <= int(max(i32)), "umbra_sort_indices: length exceeds i32 radix index limit")
+	buf, buf_err := buffer_make_uninit(n * size_of(i64), allocator)
+	assert(buf_err == .None, "umbra_sort_indices: allocation failed")
 	out := cast([^]i64)buf.data
 	if n <= 1 {
 		if n == 1 { out[0] = 0 }

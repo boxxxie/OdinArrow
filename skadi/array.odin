@@ -71,6 +71,7 @@ array_slice :: proc(arr: Array, from, to: int) -> Array {
 	result.offset     = arr.offset + from
 	result.length     = to - from
 	result.null_count = -1
+	result.children   = nil
 	// Clear allocators so array_free won't attempt to double-free shared buffers
 	for &buf in result.buffers {
 		buf.allocator = {}
@@ -139,6 +140,7 @@ array_copy :: proc(src: ^Array, allocator := context.allocator) -> (dst: Array, 
 		return _array_copy_rebased(src, allocator)
 	}
 	dst = src^
+	dst.children = nil
 	for i in 0..<3 {
 		dst.buffers[i] = {}
 	}
@@ -160,6 +162,7 @@ array_copy :: proc(src: ^Array, allocator := context.allocator) -> (dst: Array, 
 _array_copy_rebased :: proc(src: ^Array, allocator: mem.Allocator) -> (dst: Array, err: mem.Allocator_Error) {
 	dst = src^
 	dst.offset = 0
+	dst.children = nil
 	for i in 0..<3 {
 		dst.buffers[i] = {}
 	}

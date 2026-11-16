@@ -43,6 +43,7 @@ rle_builder_make :: proc($T: typeid, initial_runs := 64, allocator := context.al
 
 // Append one logical value, coalescing with the current run if it is equal.
 rle_append :: proc(b: ^RLE_Builder($T), v: T) {
+	assert(b.length < int(max(i32)), "RLE_Builder: length exceeds i32 run_ends limit")
 	n := len(b.values)
 	b.length += 1
 	eq := false
@@ -64,6 +65,7 @@ rle_append :: proc(b: ^RLE_Builder($T), v: T) {
 
 // Append one logical null, coalescing consecutive nulls into a single null run.
 rle_append_null :: proc(b: ^RLE_Builder($T)) {
+	assert(b.length < int(max(i32)), "RLE_Builder: length exceeds i32 run_ends limit")
 	n := len(b.values)
 	b.length += 1
 	b.null_count += 1

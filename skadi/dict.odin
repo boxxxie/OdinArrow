@@ -512,9 +512,26 @@ dict_sum :: proc(d: ^Dict_Array($T)) -> f64 {
 
 // Min/Max over the dictionary values — O(n_dict), independent of length.
 dict_min_max :: proc(d: ^Dict_Array($T)) -> (lo: f64, hi: f64, ok: bool) {
-	if len(d.dictionary) == 0 { return }
+	if len(d.dictionary) == 0 || d.length <= d.null_count { return }
 	mn, mx: T
 	seen := false
+	if d.allocator.procedure == nil {
+		for c in d.codes[:d.length] {
+			if c < 0 { continue }
+			v := d.dictionary[c]
+			if v != v { continue }
+			if !seen {
+				mn = v
+				mx = v
+				seen = true
+			} else {
+				if v < mn { mn = v }
+				if v > mx { mx = v }
+			}
+		}
+		if !seen { return }
+		return f64(mn), f64(mx), true
+	}
 	for v in d.dictionary {
 		if v != v { continue }
 		if !seen {
