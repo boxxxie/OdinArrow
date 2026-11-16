@@ -199,11 +199,13 @@ _vb_make :: proc($Offset: typeid, initial_cap: int, initial_data_cap: int, alloc
 
 _vb_append :: #force_inline proc(b: ^_Var_Builder($Offset), bytes: []u8) {
 	n := len(bytes)
-	when ODIN_DEBUG {
-		when Offset == i32 {
-			assert(n <= int(max(i32)) - b.data_len, "var_length builder: data exceeds i32 offset limit")
-		} else {
-			assert(n <= max(int) - b.data_len, "var_length builder: data length overflow")
+	when Offset == i32 {
+		if n > int(max(i32)) - b.data_len {
+			panic("var_length builder: data exceeds i32 offset limit")
+		}
+	} else {
+		if n > max(int) - b.data_len {
+			panic("var_length builder: data length overflow")
 		}
 	}
 	if n > b.data_cap - b.data_len { _vb_grow_data(b, b.data_len + n) }
@@ -227,56 +229,117 @@ _vb_append_null :: #force_inline proc(b: ^_Var_Builder($Offset)) {
 }
 
 _vb_finish :: proc(b: ^_Var_Builder($Offset), data_type: DataType, allocator: mem.Allocator) -> (arr: Array, err: mem.Allocator_Error) {
-	if b.offsets == nil {
-		off_bytes, off_err := mem.alloc(ARROW_ALIGNMENT, ARROW_ALIGNMENT, b.allocator)
-		if off_err != .None {
-			return {}, off_err
+	same_alloc := b.allocator.procedure == allocator.procedure && b.allocator.data == allocator.data
+	if same_alloc {
+		if b.offsets == nil {
+			off_bytes, off_err := mem.alloc(ARROW_ALIGNMENT, ARROW_ALIGNMENT, b.allocator)
+			if off_err != .None {
+				return {}, off_err
+			}
+			b.offsets = cast([^]Offset)off_bytes
+			b.off_cap = ARROW_ALIGNMENT / size_of(Offset)
+			b.offsets[0] = 0
 		}
-		b.offsets = cast([^]Offset)off_bytes
-		b.off_cap = ARROW_ALIGNMENT / size_of(Offset)
-		b.offsets[0] = 0
-	}
-	if b.data == nil {
-		data_bytes, data_err := mem.alloc_bytes_non_zeroed(ARROW_ALIGNMENT, ARROW_ALIGNMENT, b.allocator)
-		if data_err != .None {
-			return {}, data_err
+		if b.data == nil {
+			data_bytes, data_err := mem.alloc_bytes_non_zeroed(ARROW_ALIGNMENT, ARROW_ALIGNMENT, b.allocator)
+			if data_err != .None {
+				return {}, data_err
+			}
+			b.data = raw_data(data_bytes)
+			b.data_cap = ARROW_ALIGNMENT
 		}
-		b.data = raw_data(data_bytes)
-		b.data_cap = ARROW_ALIGNMENT
+		bitmap_buf: Buffer
+		if b.null_count > 0 {
+			bm_size := bitmap_byte_count(b.length)
+			if b.bm_cap < bm_size {
+				_vb_grow_bitmap(b, bm_size)
+			}
+			active_bytes := (b.length + 7) / 8
+			rem := uint(b.length) & 7
+			if rem != 0 && active_bytes > 0 {
+				b.bitmap[active_bytes - 1] &= u8((1 << rem) - 1)
+			}
+			if bm_size > active_bytes {
+				mem.zero(rawptr(b.bitmap[active_bytes:]), bm_size - active_bytes)
+			}
+			bitmap_buf = Buffer{ data = b.bitmap, size = bm_size, capacity = b.bm_cap, allocator = b.allocator }
+			b.bitmap = nil
+			b.bm_cap = 0
+		} else if b.bitmap != nil {
+			mem.free_with_size(rawptr(b.bitmap), b.bm_cap, b.allocator)
+			b.bitmap = nil
+			b.bm_cap = 0
+		}
+		off_buf := Buffer{
+			data      = cast([^]u8)b.offsets,
+			size      = (b.length + 1) * size_of(Offset),
+			capacity  = b.off_cap * size_of(Offset),
+			allocator = b.allocator,
+		}
+		b.offsets = nil
+		b.off_cap = 0
+		data_buf := Buffer{ data = b.data, size = b.data_len, capacity = b.data_cap, allocator = b.allocator }
+		b.data = nil
+		b.data_cap = 0
+
+		arr = Array{
+			type       = data_type,
+			length     = b.length,
+			null_count = b.null_count,
+			offset     = 0,
+			buffers    = {bitmap_buf, off_buf, data_buf},
+		}
+		b.length     = 0
+		b.data_len   = 0
+		b.null_count = 0
+		return
 	}
+
 	bitmap_buf: Buffer
 	if b.null_count > 0 {
 		bm_size := bitmap_byte_count(b.length)
-		if b.bm_cap < bm_size {
-			_vb_grow_bitmap(b, bm_size)
-		}
+		bitmap_buf = buffer_make(bm_size, allocator) or_return
 		active_bytes := (b.length + 7) / 8
+		if active_bytes > 0 && b.bitmap != nil {
+			mem.copy_non_overlapping(rawptr(bitmap_buf.data), rawptr(b.bitmap), active_bytes)
+		}
 		rem := uint(b.length) & 7
 		if rem != 0 && active_bytes > 0 {
-			b.bitmap[active_bytes - 1] &= u8((1 << rem) - 1)
+			bitmap_buf.data[active_bytes - 1] &= u8((1 << rem) - 1)
 		}
-		if bm_size > active_bytes {
-			mem.zero(rawptr(b.bitmap[active_bytes:]), bm_size - active_bytes)
-		}
-		bitmap_buf = Buffer{ data = b.bitmap, size = bm_size, capacity = b.bm_cap, allocator = b.allocator }
-		b.bitmap = nil
-		b.bm_cap = 0
-	} else if b.bitmap != nil {
-		mem.free_with_size(rawptr(b.bitmap), b.bm_cap, b.allocator)
-		b.bitmap = nil
-		b.bm_cap = 0
 	}
-	off_buf := Buffer{
-		data      = cast([^]u8)b.offsets,
-		size      = (b.length + 1) * size_of(Offset),
-		capacity  = b.off_cap * size_of(Offset),
-		allocator = b.allocator,
+
+	off_size := (b.length + 1) * size_of(Offset)
+	off_buf, off_err := buffer_make_uninit(off_size, allocator)
+	if off_err != .None {
+		buffer_free(&bitmap_buf)
+		return {}, off_err
 	}
-	b.offsets = nil
-	b.off_cap = 0
-	data_buf := Buffer{ data = b.data, size = b.data_len, capacity = b.data_cap, allocator = b.allocator }
-	b.data = nil
-	b.data_cap = 0
+	if b.offsets != nil {
+		mem.copy_non_overlapping(rawptr(off_buf.data), rawptr(b.offsets), off_size)
+	} else {
+		(cast([^]Offset)off_buf.data)[0] = 0
+	}
+
+	data_buf, data_err := buffer_make_uninit(b.data_len, allocator)
+	if data_err != .None {
+		buffer_free(&bitmap_buf)
+		buffer_free(&off_buf)
+		return {}, data_err
+	}
+	if b.data_len > 0 && b.data != nil {
+		mem.copy_non_overlapping(rawptr(data_buf.data), rawptr(b.data), b.data_len)
+	}
+
+	if b.data    != nil { mem.free_with_size(rawptr(b.data),    b.data_cap,                b.allocator) }
+	if b.offsets != nil { mem.free_with_size(rawptr(b.offsets), b.off_cap * size_of(Offset), b.allocator) }
+	if b.bitmap  != nil { mem.free_with_size(rawptr(b.bitmap),  b.bm_cap,                  b.allocator) }
+	b.data       = nil
+	b.data_cap   = 0
+	b.offsets    = nil
+	b.off_cap    = 0
+	b.bitmap     = nil
+	b.bm_cap     = 0
 
 	arr = Array{
 		type       = data_type,
@@ -288,7 +351,6 @@ _vb_finish :: proc(b: ^_Var_Builder($Offset), data_type: DataType, allocator: me
 	b.length     = 0
 	b.data_len   = 0
 	b.null_count = 0
-	_ = allocator
 	return
 }
 
@@ -309,9 +371,13 @@ _vb_destroy :: proc(b: ^_Var_Builder($Offset)) {
 
 _vb_grow_data :: proc(b: ^_Var_Builder($Offset), needed: int) {
 	when Offset == i32 {
-		assert(needed >= b.data_len && needed <= int(max(i32)), "var_length builder: data exceeds i32 offset limit")
+		if needed < b.data_len || needed > int(max(i32)) {
+			panic("var_length builder: data exceeds i32 offset limit")
+		}
 	} else {
-		assert(needed >= b.data_len, "var_length builder: data length overflow")
+		if needed < b.data_len {
+			panic("var_length builder: data length overflow")
+		}
 	}
 	doubled := b.data_cap * 2 if b.data_cap <= max(int) / 2 else max(int)
 	new_cap := max(doubled, needed, ARROW_ALIGNMENT)
@@ -338,8 +404,7 @@ _vb_grow_offsets :: proc(b: ^_Var_Builder($Offset)) {
 	assert(b.off_cap <= max(int) / 2, "var_length builder: offsets capacity overflow")
 	new_cap := max(b.off_cap * 2, 16)
 	assert(new_cap <= max(int) / size_of(Offset), "var_length builder: offsets byte overflow")
-	live_bytes := (b.length + 1) * size_of(Offset) if b.off_cap > 0 else 0
-	new_raw, err := mem.resize_non_zeroed(rawptr(b.offsets), live_bytes, new_cap * size_of(Offset), ARROW_ALIGNMENT, b.allocator)
+	new_raw, err := mem.resize_non_zeroed(rawptr(b.offsets), b.off_cap * size_of(Offset), new_cap * size_of(Offset), ARROW_ALIGNMENT, b.allocator)
 	assert(err == .None, "_vb_grow_offsets: allocation failed")
 	if b.off_cap == 0 { (cast([^]Offset)new_raw)[0] = 0 }
 	b.offsets = cast([^]Offset)new_raw

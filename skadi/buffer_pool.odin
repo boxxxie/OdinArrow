@@ -15,11 +15,13 @@ import "core:mem"
 // All blocks are released by buffer_pool_destroy.
 
 Buffer_Pool :: struct {
-	backing:   mem.Allocator,
-	free_list: map[_Pool_Key][dynamic]rawptr, // (size, align) -> stack of free user pointers
-	bases:     [dynamic]rawptr,              // every backing base pointer (for destroy)
-	hits:      u64,                          // blocks served from free_list or in-place resize
-	misses:    u64,                          // fresh blocks allocated from backing allocator
+	backing:          mem.Allocator,
+	free_list:        map[_Pool_Key][dynamic]rawptr, // (size, align) -> stack of free user pointers
+	bases:            [dynamic]^_Pool_Header,        // every live backing block (for destroy & O(1) eviction)
+	large_lru:        [dynamic]^_Pool_Header,        // cached >4 MB blocks in FIFO/LRU order
+	free_large_bytes: int,                           // total cached bytes in large_lru
+	hits:             u64,                           // blocks served from free_list or in-place resize
+	misses:           u64,                           // fresh blocks allocated from backing allocator
 }
 
 @(private="file")
@@ -30,9 +32,10 @@ _Pool_Key :: struct {
 
 @(private="file")
 _Pool_Header :: struct {
-	size:  int,    // bucket capacity in bytes
-	align: int,    // bucket alignment in bytes
-	base:  rawptr, // backing allocation start
+	size:     int,    // bucket capacity in bytes
+	align:    int,    // bucket alignment in bytes
+	base:     rawptr, // backing allocation start
+	base_idx: int,    // index in pool.bases
 }
 
 @(private="file")
@@ -61,15 +64,17 @@ buffer_pool_init :: proc(pool: ^Buffer_Pool, backing := context.allocator) {
 	// callers commonly set context.allocator to this very pool, and routing the
 	// pool's own metadata through itself is reentrant (use-after-free).
 	pool.free_list = make(map[_Pool_Key][dynamic]rawptr, 16, backing)
-	pool.bases     = make([dynamic]rawptr, 0, 0, backing)
+	pool.bases     = make([dynamic]^_Pool_Header, 0, 0, backing)
+	pool.large_lru = make([dynamic]^_Pool_Header, 0, 0, backing)
 }
 
 // Release every block the pool ever allocated, plus its bookkeeping.
 buffer_pool_destroy :: proc(pool: ^Buffer_Pool) {
-	for base in pool.bases {
-		mem.free(base, pool.backing)
+	for h in pool.bases {
+		mem.free(h.base, pool.backing)
 	}
 	delete(pool.bases)
+	delete(pool.large_lru)
 	for _, stack in pool.free_list {
 		delete(stack)
 	}
@@ -126,9 +131,11 @@ _buffer_pool_proc :: proc(
 }
 
 @(private="file")
-LARGE_BUCKET_THRESHOLD :: 4 * 1024 * 1024 // 4 MB
+LARGE_BUCKET_THRESHOLD  :: 4 * 1024 * 1024   // 4 MB
 @(private="file")
-LARGE_BUCKET_STEP      :: 256 * 1024      // 256 KB
+LARGE_BUCKET_STEP       :: 256 * 1024        // 256 KB
+@(private="file")
+_MAX_CACHED_LARGE_BYTES :: 128 * 1024 * 1024 // cap retained >4 MB free blocks at 128 MB
 
 // Bucketing policy: power-of-two up to 4 MB for fast small/medium reuse, then
 // 256 KB step alignment above 4 MB so large payloads (e.g., 11 MB or 20 MB) do
@@ -142,6 +149,50 @@ _bucket_size :: proc "contextless" (size: int) -> int {
 	return align_up(clamped, LARGE_BUCKET_STEP)
 }
 
+@(private="file")
+_pool_unlink_and_free :: proc(pool: ^Buffer_Pool, h: ^_Pool_Header) {
+	idx := h.base_idx
+	last := len(pool.bases) - 1
+	if idx != last {
+		moved := pool.bases[last]
+		pool.bases[idx] = moved
+		moved.base_idx = idx
+	}
+	pop(&pool.bases)
+	mem.free(h.base, pool.backing)
+}
+
+@(private="file")
+_pool_pop_specific_free :: proc(pool: ^Buffer_Pool, h: ^_Pool_Header) {
+	key := _Pool_Key{size = h.size, align = h.align}
+	stack, ok := pool.free_list[key]
+	if !ok { return }
+	user := rawptr(uintptr(h) + uintptr(_POOL_HDR))
+	for i := len(stack) - 1; i >= 0; i -= 1 {
+		if stack[i] == user {
+			unordered_remove(&stack, i)
+			break
+		}
+	}
+	if len(stack) == 0 {
+		delete(stack)
+		delete_key(&pool.free_list, key)
+	} else {
+		pool.free_list[key] = stack
+	}
+}
+
+@(private="file")
+_pool_remove_large_lru :: proc(pool: ^Buffer_Pool, h: ^_Pool_Header) {
+	for entry, i in pool.large_lru {
+		if entry == h {
+			ordered_remove(&pool.large_lru, i)
+			pool.free_large_bytes -= h.size
+			return
+		}
+	}
+}
+
 // Hand back a block of at least `size` bytes (reused if one is free), with the
 // user pointer aligned to `effective_align` and bucketed by `(bucket_size, effective_align)`.
 @(private="file")
@@ -152,9 +203,38 @@ _pool_get :: proc(pool: ^Buffer_Pool, size, alignment: int) -> (rawptr, mem.Allo
 	key := _Pool_Key{size = bucket_size, align = effective_align}
 	if stack, ok := pool.free_list[key]; ok && len(stack) > 0 {
 		user := stack[len(stack) - 1]
-		pop(&pool.free_list[key])
+		pop(&stack)
+		if len(stack) == 0 {
+			delete(stack)
+			delete_key(&pool.free_list, key)
+		} else {
+			pool.free_list[key] = stack
+		}
+		if bucket_size > LARGE_BUCKET_THRESHOLD {
+			h := (^_Pool_Header)(rawptr(uintptr(user) - uintptr(_POOL_HDR)))
+			_pool_remove_large_lru(pool, h)
+		}
 		pool.hits += 1
 		return user, .None
+	}
+	if bucket_size > LARGE_BUCKET_THRESHOLD && len(pool.large_lru) > 0 {
+		max_slack := bucket_size + bucket_size / 4
+		best_idx := -1
+		best_sz  := max(int)
+		for h, i in pool.large_lru {
+			if h.align == effective_align && h.size >= bucket_size && h.size <= max_slack && h.size < best_sz {
+				best_sz  = h.size
+				best_idx = i
+			}
+		}
+		if best_idx >= 0 {
+			h := pool.large_lru[best_idx]
+			ordered_remove(&pool.large_lru, best_idx)
+			pool.free_large_bytes -= h.size
+			_pool_pop_specific_free(pool, h)
+			pool.hits += 1
+			return rawptr(uintptr(h) + uintptr(_POOL_HDR)), .None
+		}
 	}
 	total := _POOL_HDR + effective_align + bucket_size
 	raw, err := mem.alloc_bytes_non_zeroed(total, effective_align, pool.backing)
@@ -163,10 +243,11 @@ _pool_get :: proc(pool: ^Buffer_Pool, size, alignment: int) -> (rawptr, mem.Allo
 	au   := uintptr(effective_align)
 	user := (uintptr(base) + uintptr(_POOL_HDR) + au - 1) & ~(au - 1)
 	header := (^_Pool_Header)(rawptr(user - uintptr(_POOL_HDR)))
-	header.size  = bucket_size
-	header.align = effective_align
-	header.base  = base
-	append(&pool.bases, base)
+	header.size     = bucket_size
+	header.align    = effective_align
+	header.base     = base
+	header.base_idx = len(pool.bases)
+	append(&pool.bases, header)
 	pool.misses += 1
 	return rawptr(user), .None
 }
@@ -174,6 +255,21 @@ _pool_get :: proc(pool: ^Buffer_Pool, size, alignment: int) -> (rawptr, mem.Allo
 @(private="file")
 _pool_put :: proc(pool: ^Buffer_Pool, user: rawptr) {
 	header := (^_Pool_Header)(rawptr(uintptr(user) - uintptr(_POOL_HDR)))
+	if header.size > LARGE_BUCKET_THRESHOLD {
+		if header.size > _MAX_CACHED_LARGE_BYTES {
+			_pool_unlink_and_free(pool, header)
+			return
+		}
+		for len(pool.large_lru) > 0 && pool.free_large_bytes + header.size > _MAX_CACHED_LARGE_BYTES {
+			victim := pool.large_lru[0]
+			ordered_remove(&pool.large_lru, 0)
+			pool.free_large_bytes -= victim.size
+			_pool_pop_specific_free(pool, victim)
+			_pool_unlink_and_free(pool, victim)
+		}
+		append(&pool.large_lru, header)
+		pool.free_large_bytes += header.size
+	}
 	key := _Pool_Key{size = header.size, align = header.align}
 	s, ok := pool.free_list[key]
 	if !ok {
@@ -199,10 +295,11 @@ _pool_resize :: proc(pool: ^Buffer_Pool, old_memory: rawptr, old_size, new_size,
 	}
 	header   := (^_Pool_Header)(rawptr(uintptr(old_memory) - uintptr(_POOL_HDR)))
 	capacity := header.size
+	safe_old := clamp(old_size, 0, capacity)
 	req_align := uintptr(max(alignment, 1))
 	if new_size <= capacity && uintptr(old_memory) % req_align == 0 {
-		if zeroed && new_size > old_size {
-			mem.zero(rawptr(uintptr(old_memory) + uintptr(old_size)), new_size - old_size)
+		if zeroed && new_size > safe_old {
+			mem.zero(rawptr(uintptr(old_memory) + uintptr(safe_old)), new_size - safe_old)
 		}
 		pool.hits += 1
 		return old_memory, .None
@@ -210,7 +307,7 @@ _pool_resize :: proc(pool: ^Buffer_Pool, old_memory: rawptr, old_size, new_size,
 	// Grow: take a bigger block, copy the live bytes, recycle the old one.
 	p, err := _pool_get(pool, new_size, alignment)
 	if err != .None { return nil, err }
-	keep := min(old_size, new_size)
+	keep := min(safe_old, new_size)
 	if keep > 0 { mem.copy(p, old_memory, keep) }
 	if zeroed && new_size > keep {
 		mem.zero(rawptr(uintptr(p) + uintptr(keep)), new_size - keep)

@@ -221,3 +221,48 @@ test_buffer_pool_large_256kb_bucketing :: proc(t: ^testing.T) {
 	testing.expect_value(t, pool.hits, u64(2))
 	mem.free(p4, alloc)
 }
+
+@(test)
+test_buffer_pool_large_eviction_and_resize_bounds :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	saved_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = saved_alloc
+		check_no_leaks(t, &track)
+	}
+
+	pool: oa.Buffer_Pool
+	oa.buffer_pool_init(&pool)
+	defer oa.buffer_pool_destroy(&pool)
+	alloc := oa.buffer_pool_allocator(&pool)
+
+	// Allocate and free many distinct >4 MB sizes totaling well above the 128 MB cache cap.
+	for i in 0..<24 {
+		sz := 16 * 1024 * 1024 + i * 512 * 1024
+		p, err := mem.alloc(sz, oa.ARROW_ALIGNMENT, alloc)
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+		mem.free(p, alloc)
+	}
+	testing.expect(t, pool.free_large_bytes <= 128 * 1024 * 1024, "cached >4 MB free blocks must stay bounded")
+
+	// Slack reuse: freeing a 12 MB block and requesting 11.2 MB reuses it without a backing miss.
+	misses_before := pool.misses
+	p_big, err_big := mem.alloc(12 * 1024 * 1024, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err_big, mem.Allocator_Error.None)
+	mem.free(p_big, alloc)
+	misses_after_big := pool.misses
+	p_slack, err_slack := mem.alloc(11_200_000, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err_slack, mem.Allocator_Error.None)
+	testing.expect(t, p_slack == p_big, "nearby smaller >4 MB alloc should reuse cached large block within slack")
+	testing.expect_value(t, pool.misses, misses_after_big)
+	_ = misses_before
+	mem.free(p_slack, alloc)
+
+	// Resize with overstated old_size must clamp cleanly to block capacity and never fault.
+	p_small, err_small := mem.alloc(128, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err_small, mem.Allocator_Error.None)
+	p_grown, err_grown := mem.resize(p_small, 10_000_000, 512, oa.ARROW_ALIGNMENT, alloc)
+	testing.expect_value(t, err_grown, mem.Allocator_Error.None)
+	mem.free(p_grown, alloc)
+}

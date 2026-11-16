@@ -66,30 +66,42 @@ builder_finish :: proc(
 	b:         ^Primitive_Builder($T),
 	allocator := context.allocator,
 ) -> (arr: Array, err: mem.Allocator_Error) {
-	// Validity bitmap — only materialised when there are nulls; transferred.
+	same_alloc := b.allocator.procedure == allocator.procedure && b.allocator.data == allocator.data
+
+	// Validity bitmap — only materialised when there are nulls.
 	bitmap_buf: Buffer
 	if b.null_count > 0 {
 		bm_size := bitmap_byte_count(b.length)
-		if b.bm_cap < bm_size {
-			_builder_grow_bitmap(b, bm_size)
-		}
 		active_bytes := (b.length + 7) / 8
 		rem := uint(b.length) & 7
-		if rem != 0 && active_bytes > 0 {
-			b.bitmap[active_bytes - 1] &= u8((1 << rem) - 1)
+		if same_alloc {
+			if b.bm_cap < bm_size {
+				_builder_grow_bitmap(b, bm_size)
+			}
+			if rem != 0 && active_bytes > 0 {
+				b.bitmap[active_bytes - 1] &= u8((1 << rem) - 1)
+			}
+			if bm_size > active_bytes {
+				mem.zero(rawptr(b.bitmap[active_bytes:]), bm_size - active_bytes)
+			}
+			bitmap_buf = Buffer{
+				data      = b.bitmap,
+				size      = bm_size,
+				capacity  = b.bm_cap,
+				allocator = b.allocator,
+			}
+			b.bitmap = nil
+			b.bm_cap = 0
+		} else {
+			bitmap_buf = buffer_make(bm_size, allocator) or_return
+			if active_bytes > 0 && b.bitmap != nil {
+				mem.copy_non_overlapping(rawptr(bitmap_buf.data), rawptr(b.bitmap), active_bytes)
+			}
+			if rem != 0 && active_bytes > 0 {
+				bitmap_buf.data[active_bytes - 1] &= u8((1 << rem) - 1)
+			}
 		}
-		if bm_size > active_bytes {
-			mem.zero(rawptr(b.bitmap[active_bytes:]), bm_size - active_bytes)
-		}
-		bitmap_buf = Buffer{
-			data      = b.bitmap,
-			size      = bm_size,
-			capacity  = b.bm_cap,
-			allocator = b.allocator,
-		}
-		b.bitmap = nil
-		b.bm_cap = 0
-	} else if b.bitmap != nil {
+	} else if same_alloc && b.bitmap != nil {
 		mem.free_with_size(rawptr(b.bitmap), b.bm_cap, b.allocator)
 		b.bitmap = nil
 		b.bm_cap = 0
@@ -111,16 +123,47 @@ builder_finish :: proc(
 			b.data = nil
 			b.cap  = 0
 		}
-	} else {
-		// Transfer ownership of the value buffer directly — no copy.
-		data_buf = Buffer{
-			data      = cast([^]u8)b.data,
-			size      = b.length * size_of(T),
-			capacity  = b.cap * size_of(T),
-			allocator = b.allocator,
+		if b.bitmap != nil {
+			mem.free_with_size(rawptr(b.bitmap), b.bm_cap, b.allocator)
+			b.bitmap = nil
+			b.bm_cap = 0
 		}
-		b.data = nil
-		b.cap  = 0
+	} else {
+		if same_alloc {
+			if b.data == nil {
+				buf, buf_err := buffer_make_uninit(0, b.allocator)
+				if buf_err != nil { buffer_free(&bitmap_buf); err = buf_err; return }
+				data_buf = buf
+			} else {
+				// Transfer ownership of the value buffer directly — no copy.
+				data_buf = Buffer{
+					data      = cast([^]u8)b.data,
+					size      = b.length * size_of(T),
+					capacity  = b.cap * size_of(T),
+					allocator = b.allocator,
+				}
+				b.data = nil
+				b.cap  = 0
+			}
+		} else {
+			n_data_bytes := b.length * size_of(T)
+			buf, buf_err := buffer_make_uninit(n_data_bytes, allocator)
+			if buf_err != nil { buffer_free(&bitmap_buf); err = buf_err; return }
+			if n_data_bytes > 0 && b.data != nil {
+				mem.copy_non_overlapping(rawptr(buf.data), rawptr(b.data), n_data_bytes)
+			}
+			data_buf = buf
+			if b.data != nil {
+				mem.free_with_size(rawptr(b.data), b.cap * size_of(T), b.allocator)
+				b.data = nil
+				b.cap  = 0
+			}
+			if b.bitmap != nil {
+				mem.free_with_size(rawptr(b.bitmap), b.bm_cap, b.allocator)
+				b.bitmap = nil
+				b.bm_cap = 0
+			}
+		}
 	}
 
 	arr = Array{
@@ -155,7 +198,7 @@ _builder_grow_data :: proc(b: ^Primitive_Builder($T)) {
 	new_cap := max(b.cap * 2, 16)
 	elem_sz := max(size_of(T), 1)
 	assert(new_cap <= max(int) / elem_sz, "Primitive_Builder: byte size overflow")
-	new_raw, err := mem.resize_non_zeroed(rawptr(b.data), b.length * size_of(T), new_cap * size_of(T), ARROW_ALIGNMENT, b.allocator)
+	new_raw, err := mem.resize_non_zeroed(rawptr(b.data), b.cap * size_of(T), new_cap * size_of(T), ARROW_ALIGNMENT, b.allocator)
 	assert(err == .None, "_builder_grow_data: allocation failed")
 	b.data = cast([^]T)new_raw
 	b.cap  = new_cap

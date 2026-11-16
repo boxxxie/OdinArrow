@@ -451,3 +451,97 @@ test_large_array_1m :: proc(t: ^testing.T) {
 	testing.expect(t, oa.array_is_valid(&arr, 1))
 	testing.expect_value(t, oa.array_get(&arr, 1, i32), i32(1))
 }
+
+@(test)
+test_builder_finish_cross_allocator_and_reset_grow :: proc(t: ^testing.T) {
+	scratch_track := setup_tracking(t)
+	finish_track  := setup_tracking(t)
+	defer {
+		check_no_leaks(t, &scratch_track)
+		check_no_leaks(t, &finish_track)
+	}
+	scratch_alloc := mem.tracking_allocator(&scratch_track)
+	finish_alloc  := mem.tracking_allocator(&finish_track)
+
+	// 1. Primitive_Builder(i64) built in scratch_alloc, reset & regrown, finished into finish_alloc.
+	{
+		b := oa.builder_make(i64, 4, scratch_alloc)
+		defer oa.builder_destroy(&b)
+		for i in 0..<20 { oa.builder_append(&b, i64(i)) }
+		oa.builder_reset(&b)
+		for i in 0..<40 {
+			if i % 5 == 0 { oa.builder_append_null(&b) }
+			else          { oa.builder_append(&b, i64(i * 3)) }
+		}
+		arr, err := oa.builder_finish(&b, finish_alloc)
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer oa.array_free(&arr)
+		testing.expect_value(t, arr.length, 40)
+		testing.expect_value(t, arr.null_count, 8)
+		testing.expect(t, oa.array_is_null(&arr, 0))
+		testing.expect_value(t, oa.array_get(&arr, 7, i64), i64(21))
+	}
+
+	// 2. Primitive_Builder(bool) with nulls built in scratch_alloc, finished into finish_alloc.
+	{
+		b := oa.builder_make(bool, 8, scratch_alloc)
+		defer oa.builder_destroy(&b)
+		for i in 0..<17 {
+			if i % 4 == 0 { oa.builder_append_null(&b) }
+			else          { oa.builder_append(&b, (i % 2) == 1) }
+		}
+		arr, err := oa.builder_finish(&b, finish_alloc)
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+		defer oa.array_free(&arr)
+		testing.expect_value(t, arr.length, 17)
+		testing.expect_value(t, arr.null_count, 5)
+		testing.expect(t, oa.array_is_null(&arr, 4))
+		testing.expect_value(t, oa.array_get(&arr, 5, bool), true)
+		testing.expect_value(t, oa.array_get(&arr, 6, bool), false)
+	}
+
+	// 3. All 4 variable-length builders built in scratch_alloc, reset & regrown, finished into finish_alloc.
+	{
+		sb := oa.string_builder_make(4, scratch_alloc)
+		defer oa.string_builder_destroy(&sb)
+		for _ in 0..<20 { oa.string_builder_append(&sb, "warm") }
+		oa.string_builder_reset(&sb)
+		for i in 0..<25 {
+			if i % 3 == 0 { oa.string_builder_append_null(&sb) }
+			else          { oa.string_builder_append(&sb, "ok") }
+		}
+		sarr, serr := oa.string_builder_finish(&sb, finish_alloc)
+		testing.expect_value(t, serr, mem.Allocator_Error.None)
+		defer oa.array_free(&sarr)
+		testing.expect_value(t, sarr.length, 25)
+		testing.expect(t, oa.array_is_null(&sarr, 0))
+		testing.expect_value(t, oa.array_get_string(&sarr, 1), "ok")
+
+		bb := oa.binary_builder_make(4, scratch_alloc)
+		defer oa.binary_builder_destroy(&bb)
+		oa.binary_builder_append(&bb, []u8{1, 2, 3})
+		oa.binary_builder_append_null(&bb)
+		barr, berr := oa.binary_builder_finish(&bb, finish_alloc)
+		testing.expect_value(t, berr, mem.Allocator_Error.None)
+		defer oa.array_free(&barr)
+		testing.expect_value(t, barr.length, 2)
+		testing.expect(t, oa.array_is_null(&barr, 1))
+		testing.expect_value(t, len(oa.array_get_binary(&barr, 0)), 3)
+
+		lsb := oa.large_string_builder_make(4, scratch_alloc)
+		defer oa.large_string_builder_destroy(&lsb)
+		oa.large_string_builder_append(&lsb, "large")
+		lsarr, lserr := oa.large_string_builder_finish(&lsb, finish_alloc)
+		testing.expect_value(t, lserr, mem.Allocator_Error.None)
+		defer oa.array_free(&lsarr)
+		testing.expect_value(t, oa.array_get_large_string(&lsarr, 0), "large")
+
+		lbb := oa.large_binary_builder_make(4, scratch_alloc)
+		defer oa.large_binary_builder_destroy(&lbb)
+		oa.large_binary_builder_append(&lbb, []u8{9, 8})
+		lbarr, lberr := oa.large_binary_builder_finish(&lbb, finish_alloc)
+		testing.expect_value(t, lberr, mem.Allocator_Error.None)
+		defer oa.array_free(&lbarr)
+		testing.expect_value(t, len(oa.array_get_large_binary(&lbarr, 0)), 2)
+	}
+}
