@@ -11,6 +11,7 @@ package skadi
 //   Footer length (i32 LE)
 //   "ARROW1"      (6 bytes)
 
+import "base:intrinsics"
 import "base:runtime"
 import "core:mem"
 import "core:os"
@@ -445,7 +446,7 @@ _ipc_encode_record_batch :: proc(
 			val_data: [^]u8
 			data_len: i64
 			if col.length == 0 || offsets_ptr == nil {
-				zero_off := make([]u8, int(off_len), allocator)
+				zero_off, _ := mem.alloc_bytes(int(off_len), align_of(i32), allocator)
 				append(scratch_bufs, zero_off)
 				off_data = raw_data(zero_off)
 			} else if col.offset == 0 {
@@ -455,7 +456,7 @@ _ipc_encode_record_batch :: proc(
 			} else {
 				base_byte := offsets_ptr[col.offset]
 				end_byte  := offsets_ptr[col.offset + col.length]
-				rebased_bytes := make([]u8, int(off_len), allocator)
+				rebased_bytes, _ := mem.alloc_bytes_non_zeroed(int(off_len), align_of(i32), allocator)
 				append(scratch_bufs, rebased_bytes)
 				rebased := cast([^]i32)raw_data(rebased_bytes)
 				for k in 0..=col.length {
@@ -485,7 +486,7 @@ _ipc_encode_record_batch :: proc(
 			val_data: [^]u8
 			data_len: i64
 			if col.length == 0 || offsets_ptr == nil {
-				zero_off := make([]u8, int(off_len), allocator)
+				zero_off, _ := mem.alloc_bytes(int(off_len), align_of(i64), allocator)
 				append(scratch_bufs, zero_off)
 				off_data = raw_data(zero_off)
 			} else if col.offset == 0 {
@@ -495,7 +496,7 @@ _ipc_encode_record_batch :: proc(
 			} else {
 				base_byte := offsets_ptr[col.offset]
 				end_byte  := offsets_ptr[col.offset + col.length]
-				rebased_bytes := make([]u8, int(off_len), allocator)
+				rebased_bytes, _ := mem.alloc_bytes_non_zeroed(int(off_len), align_of(i64), allocator)
 				append(scratch_bufs, rebased_bytes)
 				rebased := cast([^]i64)raw_data(rebased_bytes)
 				for k in 0..=col.length {
@@ -972,8 +973,8 @@ ipc_read_file :: proc(path: string, allocator := context.allocator, validate := 
 		}
 	}
 
-	batches = batch_list[:]
-	if len(batches) > 0 {
+	if len(batch_list) > 0 {
+		batches = batch_list[:]
 		backing := new(_IPC_Backing, allocator)
 		backing^ = _IPC_Backing{
 			ref_count = len(batches),
@@ -985,6 +986,8 @@ ipc_read_file :: proc(path: string, allocator := context.allocator, validate := 
 			b._ipc_backing = backing
 		}
 		keep_data = true
+	} else {
+		delete(batch_list)
 	}
 	ok = true
 	return
@@ -1133,8 +1136,8 @@ ipc_read_stream :: proc(path: string, allocator := context.allocator, validate :
 		return
 	}
 
-	batches = batch_list[:]
-	if len(batches) > 0 {
+	if len(batch_list) > 0 {
+		batches = batch_list[:]
 		backing := new(_IPC_Backing, allocator)
 		backing^ = _IPC_Backing{
 			ref_count = len(batches),
@@ -1146,6 +1149,8 @@ ipc_read_stream :: proc(path: string, allocator := context.allocator, validate :
 			b._ipc_backing = backing
 		}
 		keep_data = true
+	} else {
+		delete(batch_list)
 	}
 	ok = true
 	return
@@ -1165,9 +1170,13 @@ _ipc_view_buffer :: proc(body: []u8, off, length: int) -> Buffer {
 // non-decreasing, and stay within the data buffer.
 // A1/A3: the data buffer of a fixed-width / bool column must actually hold
 // col_len elements, or array_get would read past the view (overflow-safe).
+_ipc_bitmap_bytes_needed :: #force_inline proc "contextless" (col_len: int) -> int {
+	return (col_len >> 3) + (1 if (col_len & 7) != 0 else 0)
+}
+
 _ipc_fixed_ok :: proc(dt: DataType, col_len: int, data_buf: Buffer) -> bool {
 	#partial switch _ in dt {
-	case Bool_Type: return data_buf.size >= (col_len + 7) / 8
+	case Bool_Type: return col_len >= 0 && data_buf.size >= _ipc_bitmap_bytes_needed(col_len)
 	}
 	w := type_byte_width(dt)
 	return w > 0 && col_len <= data_buf.size / w
@@ -1180,19 +1189,19 @@ _ipc_offsets_valid :: proc(off_buf, data_buf: Buffer, col_len, off_w: int) -> bo
 	data_len := i64(data_buf.size)
 	if off_w == size_of(i32) {
 		o := cast([^]i32)off_buf.data
-		if o[0] != 0 { return false }
+		if intrinsics.unaligned_load(&o[0]) != 0 { return false }
 		prev: i32 = 0
 		for k in 1..=col_len {
-			cur := o[k]
+			cur := intrinsics.unaligned_load(&o[k])
 			if cur < prev || i64(cur) > data_len { return false }
 			prev = cur
 		}
 	} else {
 		o := cast([^]i64)off_buf.data
-		if o[0] != 0 { return false }
+		if intrinsics.unaligned_load(&o[0]) != 0 { return false }
 		prev: i64 = 0
 		for k in 1..=col_len {
-			cur := o[k]
+			cur := intrinsics.unaligned_load(&o[k])
 			if cur < prev || cur > data_len { return false }
 			prev = cur
 		}
@@ -1353,7 +1362,7 @@ _ipc_read_field :: proc(data: []u8, tbl: int, allocator: mem.Allocator) -> (f: F
 	if fo := get_fo(data, vt, 1); fo > 0 {
 		f.nullable = _rd_u8(data, tbl+fo) != 0
 	} else {
-		f.nullable = true
+		f.nullable = false
 	}
 	type_disc := u8(0)
 	if fo := get_fo(data, vt, 2); fo > 0 {
@@ -1388,40 +1397,51 @@ _ipc_disc_to_datatype :: proc(data: []u8, disc: u8, tbl: int) -> (dt: DataType, 
 	case _IPC_TYPE_BINARY:      return Binary_Type{}, true
 	case _IPC_TYPE_LARGEBINARY: return Large_Binary_Type{}, true
 	case _IPC_TYPE_INT:
-		if _fits(data, tbl, 4) {
+		if tbl > 0 && _fits(data, tbl, 4) {
 			soff := _rd_i32(data, tbl)
 			vt   := tbl - int(soff)
-			bw_off := int(_rd_i16(data, vt+4))  // bitWidth   (reads are bounds-safe)
-			sg_off := int(_rd_i16(data, vt+6))  // isSigned
-			bw := i32(0); sg := true
-			if bw_off > 0 { bw = _rd_i32(data, tbl+bw_off) }
-			if sg_off > 0 { sg = _rd_u8(data, tbl+sg_off) != 0 }
-			if sg {
-				switch bw {
-				case 8:  return Int8_Type{}, true
-				case 16: return Int16_Type{}, true
-				case 32: return Int32_Type{}, true
-				case 64: return Int64_Type{}, true
-				}
-			} else {
-				switch bw {
-				case 8:  return UInt8_Type{}, true
-				case 16: return UInt16_Type{}, true
-				case 32: return UInt32_Type{}, true
-				case 64: return UInt64_Type{}, true
+			if _fits(data, vt, 4) {
+				vt_size := int(_rd_i16(data, vt))
+				if vt_size >= 4 && _fits(data, vt, vt_size) {
+					bw_off := int(_rd_i16(data, vt+4)) if vt_size >= 6 else 0
+					sg_off := int(_rd_i16(data, vt+6)) if vt_size >= 8 else 0
+					bw := i32(0)
+					sg := false
+					if bw_off > 0 { bw = _rd_i32(data, tbl+bw_off) }
+					if sg_off > 0 { sg = _rd_u8(data, tbl+sg_off) != 0 }
+					if sg {
+						switch bw {
+						case 8:  return Int8_Type{}, true
+						case 16: return Int16_Type{}, true
+						case 32: return Int32_Type{}, true
+						case 64: return Int64_Type{}, true
+						}
+					} else {
+						switch bw {
+						case 8:  return UInt8_Type{}, true
+						case 16: return UInt16_Type{}, true
+						case 32: return UInt32_Type{}, true
+						case 64: return UInt64_Type{}, true
+						}
+					}
 				}
 			}
 		}
 		return nil, false
 	case _IPC_TYPE_FLOATINGPT:
-		if _fits(data, tbl, 4) {
+		if tbl > 0 && _fits(data, tbl, 4) {
 			soff := _rd_i32(data, tbl)
-			vt := tbl - int(soff)
-			pr_off := int(_rd_i16(data, vt+4))
-			pr := i16(0)
-			if pr_off > 0 { pr = _rd_i16(data, tbl+pr_off) }
-			if pr == 1 { return Float32_Type{}, true }
-			if pr == 2 { return Float64_Type{}, true }
+			vt   := tbl - int(soff)
+			if _fits(data, vt, 4) {
+				vt_size := int(_rd_i16(data, vt))
+				if vt_size >= 4 && _fits(data, vt, vt_size) {
+					pr_off := int(_rd_i16(data, vt+4)) if vt_size >= 6 else 0
+					pr := i16(0)
+					if pr_off > 0 { pr = _rd_i16(data, tbl+pr_off) }
+					if pr == 1 { return Float32_Type{}, true }
+					if pr == 2 { return Float64_Type{}, true }
+				}
+			}
 		}
 		return nil, false
 	}
@@ -1476,7 +1496,9 @@ _ipc_decode_record_batch :: proc(
 		// nodes
 		n_nodes := 0
 		node_lengths    := make([dynamic]i64, 0, n_cols, context.temp_allocator)
+		defer delete(node_lengths)
 		node_nullcounts := make([dynamic]i64, 0, n_cols, context.temp_allocator)
+		defer delete(node_nullcounts)
 		if fo2 := get_fo(meta, rb_vt, 1); fo2 > 0 {
 			nv_pos := rb_tbl + fo2
 			nv_ref := _rd_i32(meta, nv_pos)
@@ -1494,7 +1516,9 @@ _ipc_decode_record_batch :: proc(
 		// buffers
 		n_bufs := 0
 		buf_offsets := make([dynamic]i64, 0, n_cols*3, context.temp_allocator)
+		defer delete(buf_offsets)
 		buf_lengths := make([dynamic]i64, 0, n_cols*3, context.temp_allocator)
+		defer delete(buf_lengths)
 		if fo2 := get_fo(meta, rb_vt, 2); fo2 > 0 {
 			bv_pos := rb_tbl + fo2
 			bv_ref := _rd_i32(meta, bv_pos)
@@ -1547,7 +1571,7 @@ _ipc_decode_record_batch :: proc(
 			buf_idx += 1
 
 			// A1/A3: a validity bitmap must cover col_len bits.
-			if validate && null_count > 0 && (var_buf.data == nil || var_buf.size < (col_len + 7) / 8) {
+			if validate && null_count > 0 && (var_buf.data == nil || var_buf.size < _ipc_bitmap_bytes_needed(col_len)) {
 				delete(columns, allocator); return
 			}
 
