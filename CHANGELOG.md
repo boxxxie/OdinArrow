@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-17
+
 ### Fixed
 
 - **Arrow IPC (`skadi/ipc.odin`):**
@@ -15,7 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Buffer Pool (`skadi/buffer_pool.odin`):**
   - Retained `<= LARGE_BUCKET_THRESHOLD` (`4 MB`) free-list bucket stacks across empty transitions and pre-reserved small-bucket stacks at capacity `16` in `_pool_get` / `_pool_put` to eliminate steady-state backing allocator churn.
 - **Vendored Sleipnir (`deps/sleipnir/actor/`):**
-  - Synced `actor.odin` and `supervision.odin` with Sleipnir's cooperative shard-drain fix (`scheduler_wait_actor_unscheduled` and rotating-offset `scheduler_step_one_cooperative`) in `actor_destroy` and `actor_base_destroy_sched` to prevent 1-worker self-scheduler destroy deadlocks after in-place cooperative `actor.call`.
+  - Synced `actor.odin` and `supervision.odin` byte-for-byte with Sleipnir `v1.1.3` (`cc3a2aa`) for the cooperative shard-drain fix (`scheduler_wait_actor_unscheduled` and rotating-offset `scheduler_step_one_cooperative`) in `actor_destroy` and `actor_base_destroy_sched` to prevent 1-worker self-scheduler destroy deadlocks after in-place cooperative `actor.call`.
+
+### Documentation
+
+- Updated the vendored Sleipnir version reference (`v1.1.2` -> `v1.1.3`) and unit test count (`232`) in `README.md`.
 
 ## [0.2.3] - 2026-11-17
 
