@@ -763,12 +763,14 @@ _ipc_vw_i32 :: proc(w: ^_IPC_Vectored_Writer, v: i32) -> bool {
 // non-regular targets (pipes, sockets, character devices like `/dev/null`).
 @(private="file")
 _ipc_truncate_if_regular :: proc(f: ^os.File, size: i64) -> bool {
-	if err := os.truncate(f, size); err != nil {
-		if fi, stat_err := os.fstat(f, context.temp_allocator); stat_err == nil && fi.type == .Regular {
-			return false
-		}
+	fi, stat_err := os.fstat(f, context.temp_allocator)
+	if stat_err != nil || fi.type != .Regular {
+		return true
 	}
-	return true
+	if fi.size == size {
+		return true
+	}
+	return os.truncate(f, size) == nil
 }
 
 // Write all batches to an Arrow IPC file.
@@ -805,6 +807,7 @@ ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -
 	blocks := make([dynamic]IPC_Block, 0, len(batches), context.temp_allocator)
 
 	for i in 0..<len(batches) {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		body_descs := make([dynamic]IPC_Body_Buffer, 0, 32, context.temp_allocator)
 		scratch_bufs := make([dynamic][]u8, 0, 4, context.temp_allocator)
 		rb_meta := _ipc_encode_record_batch(&batches[i], &body_descs, &scratch_bufs, context.temp_allocator)
@@ -812,6 +815,7 @@ ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -
 		blk_start := offset
 		body_len, msg_ok := _ipc_write_message(&w, rb_meta, body_descs[:], &offset)
 		if !msg_ok { return false }
+		if !_ipc_vw_flush(&w) { return false }
 		meta_pad   := (8 - (len(rb_meta) % 8)) % 8
 		meta_total := i32(8 + len(rb_meta) + meta_pad)
 		append(&blocks, IPC_Block{offset=blk_start, meta_len=meta_total, body_len=body_len})
@@ -1027,10 +1031,12 @@ ipc_write_stream :: proc(path: string, schema: ^Schema, batches: []Record_Batch)
 	if _, ok := _ipc_write_message(&w, schema_meta, nil, &offset); !ok { return false }
 
 	for i in 0..<len(batches) {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		body_descs := make([dynamic]IPC_Body_Buffer, 0, 32, context.temp_allocator)
 		scratch_bufs := make([dynamic][]u8, 0, 4, context.temp_allocator)
 		rb_meta := _ipc_encode_record_batch(&batches[i], &body_descs, &scratch_bufs, context.temp_allocator)
 		if _, ok := _ipc_write_message(&w, rb_meta, body_descs[:], &offset); !ok { return false }
+		if !_ipc_vw_flush(&w) { return false }
 	}
 
 	// End-of-stream: continuation marker followed by a zero metadata length.
