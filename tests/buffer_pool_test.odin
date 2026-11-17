@@ -266,3 +266,59 @@ test_buffer_pool_large_eviction_and_resize_bounds :: proc(t: ^testing.T) {
 	testing.expect_value(t, err_grown, mem.Allocator_Error.None)
 	mem.free(p_grown, alloc)
 }
+
+@(test)
+test_buffer_pool_steady_state_zero_backing_churn :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	defer check_no_leaks(t, &track)
+	backing := mem.tracking_allocator(&track)
+
+	pool: oa.Buffer_Pool
+	oa.buffer_pool_init(&pool, backing)
+	defer oa.buffer_pool_destroy(&pool)
+	alloc := oa.buffer_pool_allocator(&pool)
+
+	BATCH_DEPTH :: 16
+	sizes := [3]int{4096, 16_448, 32_768}
+	ptrs: [3][BATCH_DEPTH]rawptr
+
+	// Warmup: populate each <= 4 MB bucket up to full batch depth and free back to pool.
+	for s_idx in 0 ..< len(sizes) {
+		for i in 0 ..< BATCH_DEPTH {
+			p, err := mem.alloc(sizes[s_idx], oa.ARROW_ALIGNMENT, alloc)
+			testing.expect_value(t, err, mem.Allocator_Error.None)
+			ptrs[s_idx][i] = p
+		}
+	}
+	for s_idx in 0 ..< len(sizes) {
+		for i in 0 ..< BATCH_DEPTH {
+			mem.free(ptrs[s_idx][i], alloc)
+		}
+	}
+
+	warmup_allocs := track.total_allocation_count
+	warmup_frees  := track.total_free_count
+	testing.expect(t, warmup_allocs > 0)
+
+	// Steady state: draining every bucket stack completely and returning all blocks
+	// across repeated cycles must incur zero backing allocations or frees.
+	for _ in 0 ..< 4 {
+		for s_idx in 0 ..< len(sizes) {
+			for i in 0 ..< BATCH_DEPTH {
+				p, err := mem.alloc(sizes[s_idx], oa.ARROW_ALIGNMENT, alloc)
+				testing.expect_value(t, err, mem.Allocator_Error.None)
+				ptrs[s_idx][i] = p
+			}
+		}
+		testing.expect_value(t, track.total_allocation_count, warmup_allocs)
+		testing.expect_value(t, track.total_free_count, warmup_frees)
+
+		for s_idx in 0 ..< len(sizes) {
+			for i in 0 ..< BATCH_DEPTH {
+				mem.free(ptrs[s_idx][i], alloc)
+			}
+		}
+		testing.expect_value(t, track.total_allocation_count, warmup_allocs)
+		testing.expect_value(t, track.total_free_count, warmup_frees)
+	}
+}

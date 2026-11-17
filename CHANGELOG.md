@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Arrow IPC (`skadi/ipc.odin`):**
+  - Bounded per-batch `temp_allocator` lifetime (`DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()`) and flushed the vectored writer after each batch (`_ipc_vw_flush`) in `ipc_write_file` and `ipc_write_stream`.
+  - Checked file type and size via `os.fstat` before invoking `os.truncate` in `_ipc_truncate_if_regular`, avoiding redundant syscalls when overwriting equal-length files or writing to non-regular targets.
+- **Buffer Pool (`skadi/buffer_pool.odin`):**
+  - Retained `<= LARGE_BUCKET_THRESHOLD` (`4 MB`) free-list bucket stacks across empty transitions and pre-reserved small-bucket stacks at capacity `16` in `_pool_get` / `_pool_put` to eliminate steady-state backing allocator churn.
+- **Vendored Sleipnir (`deps/sleipnir/actor/`):**
+  - Synced `actor.odin` and `supervision.odin` with Sleipnir's cooperative shard-drain fix (`scheduler_wait_actor_unscheduled` and rotating-offset `scheduler_step_one_cooperative`) in `actor_destroy` and `actor_base_destroy_sched` to prevent 1-worker self-scheduler destroy deadlocks after in-place cooperative `actor.call`.
+
 ## [0.2.3] - 2026-11-17
 
 ### Dependencies

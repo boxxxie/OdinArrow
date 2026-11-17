@@ -204,7 +204,7 @@ _pool_get :: proc(pool: ^Buffer_Pool, size, alignment: int) -> (rawptr, mem.Allo
 	if stack, ok := pool.free_list[key]; ok && len(stack) > 0 {
 		user := stack[len(stack) - 1]
 		pop(&stack)
-		if len(stack) == 0 {
+		if len(stack) == 0 && bucket_size > LARGE_BUCKET_THRESHOLD {
 			delete(stack)
 			delete_key(&pool.free_list, key)
 		} else {
@@ -275,7 +275,8 @@ _pool_put :: proc(pool: ^Buffer_Pool, user: rawptr) {
 	if !ok {
 		// New bucket — back its stack with the pool's backing allocator so
 		// appends never reenter the pool via context.allocator.
-		s = make([dynamic]rawptr, 0, 0, pool.backing)
+		init_cap := 1 if header.size > LARGE_BUCKET_THRESHOLD else 16
+		s = make([dynamic]rawptr, 0, init_cap, pool.backing)
 	}
 	append(&s, user)
 	pool.free_list[key] = s

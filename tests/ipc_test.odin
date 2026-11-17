@@ -664,3 +664,130 @@ test_ipc_overwrite_shrinks_existing_file :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+@(test)
+test_ipc_multi_batch_sliced_roundtrip :: proc(t: ^testing.T) {
+	track := setup_tracking(t)
+	defer check_no_leaks(t, &track)
+	old_alloc := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer context.allocator = old_alloc
+
+	file_path := ipc_test_temp_path("multi_sliced", "arrow")
+	defer {
+		_ = os.remove(file_path)
+		delete(file_path)
+	}
+	stream_path := ipc_test_temp_path("multi_sliced", "arrows")
+	defer {
+		_ = os.remove(stream_path)
+		delete(stream_path)
+	}
+
+	fields := []oa.Field{
+		oa.field_make("id", oa.Int64_Type{}),
+		oa.field_make("label", oa.String_Type{}),
+	}
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
+	defer oa.schema_free(&schema)
+
+	BATCH_COUNT :: 16
+	FULL_LEN    :: 64
+	SLICE_OFF   :: 5
+	SLICE_LEN   :: 37
+
+	parents_id := make([]oa.Array, BATCH_COUNT)
+	parents_lb := make([]oa.Array, BATCH_COUNT)
+	batches    := make([]oa.Record_Batch, BATCH_COUNT)
+	defer {
+		for &b in batches { oa.record_batch_free(&b) }
+		for &a in parents_id { oa.array_free(&a) }
+		for &a in parents_lb { oa.array_free(&a) }
+		delete(batches)
+		delete(parents_id)
+		delete(parents_lb)
+	}
+
+	for bi in 0 ..< BATCH_COUNT {
+		ib := oa.builder_make(i64, FULL_LEN)
+		sb := oa.string_builder_make(FULL_LEN)
+		for row in 0 ..< FULL_LEN {
+			if (row + bi) % 5 == 0 {
+				oa.builder_append_null(&ib)
+				oa.string_builder_append_null(&sb)
+			} else {
+				oa.builder_append(&ib, i64(bi * 1000 + row))
+				oa.string_builder_append(&sb, fmt.tprintf("b%d_r%d", bi, row))
+			}
+		}
+		id_full, id_err := oa.builder_finish(&ib)
+		testing.expect_value(t, id_err, nil)
+		oa.builder_destroy(&ib)
+
+		lb_full, lb_err := oa.string_builder_finish(&sb)
+		testing.expect_value(t, lb_err, nil)
+		oa.string_builder_destroy(&sb)
+
+		parents_id[bi] = id_full
+		parents_lb[bi] = lb_full
+
+		id_slice := oa.array_slice(id_full, SLICE_OFF, SLICE_OFF + SLICE_LEN)
+		lb_slice := oa.array_slice(lb_full, SLICE_OFF, SLICE_OFF + SLICE_LEN)
+		rb, rb_ok := oa.record_batch_make(&schema, []oa.Array{id_slice, lb_slice})
+		testing.expect(t, rb_ok)
+		batches[bi] = rb
+	}
+
+	testing.expect(t, oa.ipc_write_file(file_path, &schema, batches))
+	testing.expect(t, oa.ipc_write_stream(stream_path, &schema, batches))
+
+	verify_batches :: proc(t: ^testing.T, sc: ^oa.Schema, out: []oa.Record_Batch) {
+		testing.expect(t, sc != nil)
+		if sc != nil {
+			testing.expect_value(t, len(sc.fields), 2)
+		}
+		testing.expect_value(t, len(out), BATCH_COUNT)
+		for bi in 0 ..< len(out) {
+			testing.expect_value(t, out[bi].length, SLICE_LEN)
+			id_col := &out[bi].columns[0]
+			lb_col := &out[bi].columns[1]
+			for j in 0 ..< out[bi].length {
+				orig_row := SLICE_OFF + j
+				if (orig_row + bi) % 5 == 0 {
+					testing.expect(t, oa.array_is_null(id_col, j))
+					testing.expect(t, oa.array_is_null(lb_col, j))
+				} else {
+					testing.expect(t, !oa.array_is_null(id_col, j))
+					testing.expect(t, !oa.array_is_null(lb_col, j))
+					testing.expect_value(t, oa.array_get(id_col, j, i64), i64(bi * 1000 + orig_row))
+					testing.expect_value(t, oa.array_get_string(lb_col, j), fmt.tprintf("b%d_r%d", bi, orig_row))
+				}
+			}
+		}
+	}
+
+	out_sc_f, out_bs_f, r_ok_f := oa.ipc_read_file(file_path)
+	testing.expect(t, r_ok_f)
+	if r_ok_f {
+		defer {
+			for &b in out_bs_f { oa.record_batch_free(&b) }
+			delete(out_bs_f)
+			oa.schema_free(out_sc_f)
+			free(out_sc_f)
+		}
+		verify_batches(t, out_sc_f, out_bs_f)
+	}
+
+	out_sc_s, out_bs_s, r_ok_s := oa.ipc_read_stream(stream_path)
+	testing.expect(t, r_ok_s)
+	if r_ok_s {
+		defer {
+			for &b in out_bs_s { oa.record_batch_free(&b) }
+			delete(out_bs_s)
+			oa.schema_free(out_sc_s)
+			free(out_sc_s)
+		}
+		verify_batches(t, out_sc_s, out_bs_s)
+	}
+}
