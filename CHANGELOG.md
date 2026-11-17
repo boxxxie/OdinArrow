@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-17
+
 ### Dependencies
 
 - **Sleipnir `v1.1.2` (`deps/sleipnir/actor/`)**: Synced vendored `package actor` byte-for-byte with Sleipnir `v1.1.2` (`7825295`, including `v1.1.1` untrapped step-path throughput optimizations and `v1.1.2` multi-worker cooperative `call` / `try_call` stepping, call-cycle isolation, `.Seq_Cst` ordering fixes, and safe stopped/faulted drains).
+
+### Documentation & CI
+
+- Updated the vendored Sleipnir version reference in `README.md` (`v1.1.0` -> `v1.1.2`).
+- Added tag-triggered (`v*`) and `workflow_dispatch` GitHub Release workflow (`.github/workflows/release.yml`) to verify `make check`, `make test`, `make test-cpp`, and `odin doc`, package source archives and native Linux CLI tools with `SHA256SUMS.txt`, and publish release notes from `CHANGELOG.md`.
 
 ## [0.2.2] - 2026-11-16
 
