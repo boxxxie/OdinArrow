@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Dependencies
+
+- **Sleipnir `v1.1.2` (`deps/sleipnir/actor/`)**: Synced vendored `package actor` byte-for-byte with Sleipnir `v1.1.2` (`7825295`, including `v1.1.1` untrapped step-path throughput optimizations and `v1.1.2` multi-worker cooperative `call` / `try_call` stepping, call-cycle isolation, `.Seq_Cst` ordering fixes, and safe stopped/faulted drains).
+
 ## [0.2.2] - 2026-11-16
 
 ### Fixed

@@ -215,7 +215,7 @@ skadi/                   the skadi package (buffers, types, arrays, builders,
                          buffer_pool, hardware_config.odin, ...)
 skadi/pipeline/          Sleipnir actor & sharded SPSC morsel pipeline
                          (sleipnir_pipeline.odin)
-deps/sleipnir/actor/     Sleipnir v1.1.0 lock-free actor, OTP supervision & SPSC/MPSC runtime
+deps/sleipnir/actor/     Sleipnir v1.1.2 lock-free actor, OTP supervision & SPSC/MPSC runtime
 docs/                    Cursor.md, Endeavor.md, Review.md — architecture review,
                          security/performance notes, and Arrow capability gap matrix
 tests/                   unit & regression test suite (230 tests, `make test`)
