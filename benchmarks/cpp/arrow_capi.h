@@ -97,6 +97,7 @@ int arrow_capi_binary_stats_slice(
 
 /* Arrow IPC file/stream interop helpers (returns 1 on success, 0 on error). */
 int arrow_capi_ipc_write_sample(const char* path, int is_stream);
+int arrow_capi_ipc_write_sample_lz4(const char* path, int is_stream);
 
 int arrow_capi_ipc_verify_roundtrip(
     const char* path,

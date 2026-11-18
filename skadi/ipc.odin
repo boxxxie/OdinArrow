@@ -259,6 +259,15 @@ _IPC_HEADER_RECORD_BATCH :: u8(3)
 // Endianness
 _IPC_ENDIAN_LITTLE :: i16(0)
 
+// RecordBatch body buffer compression codec for IPC writers.
+IPC_Compression :: enum u8 {
+	None      = 0,
+	LZ4_Frame = 1,
+}
+
+_IPC_CODEC_LZ4_FRAME    :: u8(0) // CompressionType.LZ4_FRAME in Message.fbs
+_IPC_COMP_METHOD_BUFFER :: u8(0) // BodyCompressionMethod.BUFFER in Message.fbs
+
 // Build an Arrow type table for the given DataType.
 // Returns (type_discriminant, type_table_offset).  The offset is 0 only for the
 // NONE discriminant; every concrete Arrow type — including the bodyless ones
@@ -391,14 +400,52 @@ _ipc_pack_bits :: proc(src: [^]u8, bit_off, n_bits: int, allocator := context.al
 	return dst
 }
 
+_ipc_emit_body_buffer :: proc(
+	ptr:          [^]u8,
+	raw_len:      i64,
+	compression:  IPC_Compression,
+	running_off:  ^i64,
+	buf_offsets:  ^[dynamic]i64,
+	buf_lengths:  ^[dynamic]i64,
+	body_descs:   ^[dynamic]IPC_Body_Buffer,
+	scratch_bufs: ^[dynamic][]u8,
+	allocator:    mem.Allocator,
+) -> bool {
+	append(buf_offsets, running_off^)
+	if raw_len <= 0 || ptr == nil {
+		append(buf_lengths, 0)
+		append(body_descs, IPC_Body_Buffer{nil, 0})
+		return true
+	}
+
+	out_ptr := ptr
+	out_len := raw_len
+	if compression == .LZ4_Frame {
+		backing, comp_len, comp_ok := _ipc_lz4_compress_buffer(ptr, raw_len, allocator)
+		if !comp_ok {
+			return false
+		}
+		append(scratch_bufs, backing)
+		out_ptr = raw_data(backing)
+		out_len = comp_len
+	}
+
+	append(buf_lengths, out_len)
+	append(body_descs, IPC_Body_Buffer{out_ptr, out_len})
+	running_off^ += out_len
+	_align_i64(running_off, 8)
+	return true
+}
+
 // Encode a record batch metadata FlatBuffer.  body_buf_offset is the running
 // byte offset within the IPC message body (tracks where each buffer starts).
-// Returns the FlatBuffer bytes.  body_descs is populated with (data, length)
-// for each column buffer, in the Arrow IPC buffer order.
+// Returns the FlatBuffer bytes (or nil on compression failure).  body_descs is
+// populated with (data, length) for each column buffer, in the Arrow IPC buffer order.
 _ipc_encode_record_batch :: proc(
 	batch:        ^Record_Batch,
 	body_descs:   ^[dynamic]IPC_Body_Buffer,
 	scratch_bufs: ^[dynamic][]u8,
+	compression:  IPC_Compression = .None,
 	allocator     := context.allocator,
 ) -> []u8 {
 	n_cols := len(batch.columns)
@@ -428,15 +475,12 @@ _ipc_encode_record_batch :: proc(
 				validity_data = raw_data(packed)
 			}
 		}
-		append(&buf_offsets, running_off)
-		append(&buf_lengths, validity_len)
-		if validity_len > 0 {
-			append(body_descs, IPC_Body_Buffer{validity_data, validity_len})
-		} else {
-			append(body_descs, IPC_Body_Buffer{nil, 0})
+		if !_ipc_emit_body_buffer(
+			validity_data, validity_len, compression,
+			&running_off, &buf_offsets, &buf_lengths, body_descs, scratch_bufs, allocator,
+		) {
+			return nil
 		}
-		running_off += validity_len
-		_align_i64(&running_off, 8)
 
 		#partial switch _ in col.type {
 		case String_Type, Binary_Type:
@@ -468,17 +512,18 @@ _ipc_encode_record_batch :: proc(
 					val_data = &col.buffers[2].data[base_byte]
 				}
 			}
-			append(&buf_offsets, running_off)
-			append(&buf_lengths, off_len)
-			append(body_descs, IPC_Body_Buffer{off_data, off_len})
-			running_off += off_len
-			_align_i64(&running_off, 8)
-
-			append(&buf_offsets, running_off)
-			append(&buf_lengths, data_len)
-			append(body_descs, IPC_Body_Buffer{val_data, data_len})
-			running_off += data_len
-			_align_i64(&running_off, 8)
+			if !_ipc_emit_body_buffer(
+				off_data, off_len, compression,
+				&running_off, &buf_offsets, &buf_lengths, body_descs, scratch_bufs, allocator,
+			) {
+				return nil
+			}
+			if !_ipc_emit_body_buffer(
+				val_data, data_len, compression,
+				&running_off, &buf_offsets, &buf_lengths, body_descs, scratch_bufs, allocator,
+			) {
+				return nil
+			}
 		case Large_String_Type, Large_Binary_Type:
 			off_len := i64((col.length + 1) * size_of(i64))
 			offsets_ptr := cast([^]i64)col.buffers[1].data
@@ -508,17 +553,18 @@ _ipc_encode_record_batch :: proc(
 					val_data = &col.buffers[2].data[base_byte]
 				}
 			}
-			append(&buf_offsets, running_off)
-			append(&buf_lengths, off_len)
-			append(body_descs, IPC_Body_Buffer{off_data, off_len})
-			running_off += off_len
-			_align_i64(&running_off, 8)
-
-			append(&buf_offsets, running_off)
-			append(&buf_lengths, data_len)
-			append(body_descs, IPC_Body_Buffer{val_data, data_len})
-			running_off += data_len
-			_align_i64(&running_off, 8)
+			if !_ipc_emit_body_buffer(
+				off_data, off_len, compression,
+				&running_off, &buf_offsets, &buf_lengths, body_descs, scratch_bufs, allocator,
+			) {
+				return nil
+			}
+			if !_ipc_emit_body_buffer(
+				val_data, data_len, compression,
+				&running_off, &buf_offsets, &buf_lengths, body_descs, scratch_bufs, allocator,
+			) {
+				return nil
+			}
 		case Bool_Type:
 			data_len := i64((col.length + 7) / 8)
 			bool_ptr := col.buffers[1].data
@@ -527,11 +573,12 @@ _ipc_encode_record_batch :: proc(
 				append(scratch_bufs, packed)
 				bool_ptr = raw_data(packed)
 			}
-			append(&buf_offsets, running_off)
-			append(&buf_lengths, data_len)
-			append(body_descs, IPC_Body_Buffer{bool_ptr, data_len})
-			running_off += data_len
-			_align_i64(&running_off, 8)
+			if !_ipc_emit_body_buffer(
+				bool_ptr, data_len, compression,
+				&running_off, &buf_offsets, &buf_lengths, body_descs, scratch_bufs, allocator,
+			) {
+				return nil
+			}
 		case Int8_Type, Int16_Type, Int32_Type, Int64_Type,
 			 UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
 			 Float32_Type, Float64_Type:
@@ -541,11 +588,12 @@ _ipc_encode_record_batch :: proc(
 			if val_ptr != nil && col.offset > 0 {
 				val_ptr = val_ptr[i64(col.offset) * w:]
 			}
-			append(&buf_offsets, running_off)
-			append(&buf_lengths, data_len)
-			append(body_descs, IPC_Body_Buffer{val_ptr, data_len})
-			running_off += data_len
-			_align_i64(&running_off, 8)
+			if !_ipc_emit_body_buffer(
+				val_ptr, data_len, compression,
+				&running_off, &buf_offsets, &buf_lengths, body_descs, scratch_bufs, allocator,
+			) {
+				return nil
+			}
 		}
 	}
 
@@ -580,11 +628,23 @@ _ipc_encode_record_batch :: proc(
 	}
 	buffers_vec := _fbb_create_struct_vector(&b, buf_structs, 8)
 
-	// ── RecordBatch table: length@0, nodes@1, buffers@2
+	// ── Optional BodyCompression table (must be built before RecordBatch table)
+	comp_off := 0
+	if compression == .LZ4_Frame {
+		_fbb_start_table(&b, 2)
+		_fbb_add_u8(&b, 0, _IPC_CODEC_LZ4_FRAME, 0)
+		_fbb_add_u8(&b, 1, _IPC_COMP_METHOD_BUFFER, 0)
+		comp_off = _fbb_end_table(&b)
+	}
+
+	// ── RecordBatch table: length@0, nodes@1, buffers@2, compression@3
 	_fbb_start_table(&b, 4)
 	_fbb_add_i64(&b, 0, i64(batch.length), 0)
 	_fbb_add_offset(&b, 1, nodes_vec)
 	_fbb_add_offset(&b, 2, buffers_vec)
+	if comp_off != 0 {
+		_fbb_add_offset(&b, 3, comp_off)
+	}
 	rb_off := _fbb_end_table(&b)
 
 	// ── Message table: version@0, header_type@1, header@2, bodyLength@3
@@ -772,7 +832,12 @@ _ipc_truncate_if_regular :: proc(f: ^os.File, size: i64) -> bool {
 }
 
 // Write all batches to an Arrow IPC file.
-ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -> bool {
+ipc_write_file :: proc(
+	path:        string,
+	schema:      ^Schema,
+	batches:     []Record_Batch,
+	compression: IPC_Compression = .None,
+) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	// Intentionally omit `.Trunc` on open so overwriting an existing regular file
@@ -807,7 +872,10 @@ ipc_write_file :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -
 	for i in 0..<len(batches) {
 		body_descs := make([dynamic]IPC_Body_Buffer, 0, 32, context.temp_allocator)
 		scratch_bufs := make([dynamic][]u8, 0, 4, context.temp_allocator)
-		rb_meta := _ipc_encode_record_batch(&batches[i], &body_descs, &scratch_bufs, context.temp_allocator)
+		rb_meta := _ipc_encode_record_batch(
+			&batches[i], &body_descs, &scratch_bufs, compression, context.temp_allocator,
+		)
+		if rb_meta == nil { return false }
 
 		blk_start := offset
 		body_len, msg_ok := _ipc_write_message(&w, rb_meta, body_descs[:], &offset)
@@ -942,6 +1010,7 @@ ipc_read_file :: proc(path: string, allocator := context.allocator, validate := 
 	// Record batch blocks are at vtable index 3.
 	rb_fo := ft_get(footer_fb, ft_vt, 3)
 	batch_list := make([dynamic]Record_Batch, 0, 8, allocator)
+	any_view_batch := false
 
 	if rb_fo > 0 && _fits(footer_fb, ft_root + rb_fo, 4) {
 		bv_ref_pos := ft_root + rb_fo
@@ -967,25 +1036,32 @@ ipc_read_file :: proc(path: string, allocator := context.allocator, validate := 
 				meta      := data[blk_off+8 : blk_off+blk_meta]
 				body_end  := body_start + blk_body
 
-				batch, batch_ok := _ipc_decode_record_batch(meta, schema, data[body_start:body_end], allocator, validate)
-				if batch_ok { append(&batch_list, batch) }
+				batch, uses_backing, batch_ok := _ipc_decode_record_batch(
+					meta, schema, data[body_start:body_end], allocator, validate,
+				)
+				if batch_ok {
+					append(&batch_list, batch)
+					if uses_backing { any_view_batch = true }
+				}
 			}
 		}
 	}
 
 	if len(batch_list) > 0 {
 		batches = batch_list[:]
-		backing := new(_IPC_Backing, allocator)
-		backing^ = _IPC_Backing{
-			ref_count = len(batches),
-			data      = data,
-			release   = release,
-			allocator = allocator,
+		if any_view_batch {
+			backing := new(_IPC_Backing, allocator)
+			backing^ = _IPC_Backing{
+				ref_count = len(batches),
+				data      = data,
+				release   = release,
+				allocator = allocator,
+			}
+			for &b in batches {
+				b._ipc_backing = backing
+			}
+			keep_data = true
 		}
-		for &b in batches {
-			b._ipc_backing = backing
-		}
-		keep_data = true
 	} else {
 		delete(batch_list)
 	}
@@ -1002,7 +1078,12 @@ ipc_read_file :: proc(path: string, allocator := context.allocator, validate := 
 // pipes, and stdout.
 
 // Write a schema + batches as an Arrow IPC stream.
-ipc_write_stream :: proc(path: string, schema: ^Schema, batches: []Record_Batch) -> bool {
+ipc_write_stream :: proc(
+	path:        string,
+	schema:      ^Schema,
+	batches:     []Record_Batch,
+	compression: IPC_Compression = .None,
+) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	// Intentionally omit `.Trunc` on open to match `ipc_write_file` page-cache reuse
@@ -1029,7 +1110,10 @@ ipc_write_stream :: proc(path: string, schema: ^Schema, batches: []Record_Batch)
 	for i in 0..<len(batches) {
 		body_descs := make([dynamic]IPC_Body_Buffer, 0, 32, context.temp_allocator)
 		scratch_bufs := make([dynamic][]u8, 0, 4, context.temp_allocator)
-		rb_meta := _ipc_encode_record_batch(&batches[i], &body_descs, &scratch_bufs, context.temp_allocator)
+		rb_meta := _ipc_encode_record_batch(
+			&batches[i], &body_descs, &scratch_bufs, compression, context.temp_allocator,
+		)
+		if rb_meta == nil { return false }
 		if _, ok := _ipc_write_message(&w, rb_meta, body_descs[:], &offset); !ok { return false }
 	}
 
@@ -1066,6 +1150,7 @@ ipc_read_stream :: proc(path: string, allocator := context.allocator, validate :
 	schema = new(Schema, allocator)
 	schema_ok := false
 	batch_list := make([dynamic]Record_Batch, 0, 8, allocator)
+	any_view_batch := false
 
 	pos := 0
 	for pos + 8 <= n {
@@ -1091,6 +1176,7 @@ ipc_read_stream :: proc(path: string, allocator := context.allocator, validate :
 			if len(batch_list) > 0 {
 				for &b in batch_list { record_batch_free(&b) }
 				clear(&batch_list)
+				any_view_batch = false
 				if schema_ok {
 					schema_free(schema)
 					schema^ = {}
@@ -1120,8 +1206,13 @@ ipc_read_stream :: proc(path: string, allocator := context.allocator, validate :
 			}
 			body_padded := (int(body_length) + 7) & ~int(7)
 			body_end := body_start + int(body_length)
-			batch, bok := _ipc_decode_record_batch(meta, schema, data[body_start:body_end], allocator, validate)
-			if bok { append(&batch_list, batch) }
+			batch, uses_backing, bok := _ipc_decode_record_batch(
+				meta, schema, data[body_start:body_end], allocator, validate,
+			)
+			if bok {
+				append(&batch_list, batch)
+				if uses_backing { any_view_batch = true }
+			}
 			pos = body_start + body_padded
 		case:
 			// Unknown/dictionary message — cannot advance safely.
@@ -1138,17 +1229,19 @@ ipc_read_stream :: proc(path: string, allocator := context.allocator, validate :
 
 	if len(batch_list) > 0 {
 		batches = batch_list[:]
-		backing := new(_IPC_Backing, allocator)
-		backing^ = _IPC_Backing{
-			ref_count = len(batches),
-			data      = data,
-			release   = release,
-			allocator = allocator,
+		if any_view_batch {
+			backing := new(_IPC_Backing, allocator)
+			backing^ = _IPC_Backing{
+				ref_count = len(batches),
+				data      = data,
+				release   = release,
+				allocator = allocator,
+			}
+			for &b in batches {
+				b._ipc_backing = backing
+			}
+			keep_data = true
 		}
-		for &b in batches {
-			b._ipc_backing = backing
-		}
-		keep_data = true
 	} else {
 		delete(batch_list)
 	}
@@ -1454,18 +1547,20 @@ _ipc_decode_record_batch :: proc(
 	body:      []u8,
 	allocator: mem.Allocator,
 	validate:  bool = true,
-) -> (batch: Record_Batch, ok: bool) {
+) -> (batch: Record_Batch, uses_backing: bool, ok: bool) {
 	if len(meta) < 8 { return }
 	root_off := _rd_u32(meta, 0)
 	tbl := int(root_off)
+	if !_fits(meta, tbl, 4) { return }
 	soff := _rd_i32(meta, tbl)
 	vt := tbl - int(soff)
+	if !_fits(meta, vt, 4) { return }
 	vt_size := _rd_i16(meta, vt)
 	n_vf := (int(vt_size) - 4) / 2
 
 	get_fo := proc(data: []u8, vt, idx: int) -> int {
 		n := (int(_rd_i16(data, vt))-4)/2
-		if idx >= n { return 0 }
+		if idx < 0 || idx >= n { return 0 }
 		return int(_rd_i16(data, vt+4+idx*2))
 	}
 
@@ -1477,16 +1572,52 @@ _ipc_decode_record_batch :: proc(
 	if fo := get_fo(meta, vt, 2); fo == 0 { return }
 	else {
 		hpos := tbl + fo
+		if !_fits(meta, hpos, 4) { return }
 		href := _rd_i32(meta, hpos)
 		rb_tbl := hpos + int(href)
+		if !_fits(meta, rb_tbl, 4) { return }
 
 		// rb_tbl is the RecordBatch table
 		rb_soff := _rd_i32(meta, rb_tbl)
 		rb_vt   := rb_tbl - int(rb_soff)
+		if !_fits(meta, rb_vt, 4) { return }
 		_ = n_vf
 
-		// RecordBatch fields: length(i64 at field[0]), nodes(ref at field[1]), buffers(ref at field[2])
+		// RecordBatch fields: length@0, nodes@1, buffers@2, compression@3
 		n_cols := len(schema.fields)
+
+		// Check optional BodyCompression table at field[3]
+		is_compressed := false
+		dctx: rawptr = nil
+		defer if dctx != nil {
+			_ = LZ4F_freeDecompressionContext(dctx)
+		}
+		if fo_comp := get_fo(meta, rb_vt, 3); fo_comp > 0 {
+			cpos := rb_tbl + fo_comp
+			if !_fits(meta, cpos, 4) { return }
+			ctbl := cpos + int(_rd_i32(meta, cpos))
+			if !_fits(meta, ctbl, 4) { return }
+			c_vt := ctbl - int(_rd_i32(meta, ctbl))
+			if !_fits(meta, c_vt, 4) { return }
+
+			codec := _IPC_CODEC_LZ4_FRAME
+			if f0 := get_fo(meta, c_vt, 0); f0 > 0 {
+				if !_fits(meta, ctbl + f0, 1) { return }
+				codec = meta[ctbl + f0]
+			}
+			method := _IPC_COMP_METHOD_BUFFER
+			if f1 := get_fo(meta, c_vt, 1); f1 > 0 {
+				if !_fits(meta, ctbl + f1, 1) { return }
+				method = meta[ctbl + f1]
+			}
+			if codec != _IPC_CODEC_LZ4_FRAME || method != _IPC_COMP_METHOD_BUFFER {
+				return
+			}
+			is_compressed = true
+			if LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION)) != 0 || dctx == nil {
+				return
+			}
+		}
 
 		length := i64(0)
 		if fo2 := get_fo(meta, rb_vt, 0); fo2 > 0 {
@@ -1501,8 +1632,10 @@ _ipc_decode_record_batch :: proc(
 		defer delete(node_nullcounts)
 		if fo2 := get_fo(meta, rb_vt, 1); fo2 > 0 {
 			nv_pos := rb_tbl + fo2
+			if !_fits(meta, nv_pos, 4) { return }
 			nv_ref := _rd_i32(meta, nv_pos)
 			nv := nv_pos + int(nv_ref)
+			if !_fits(meta, nv, 4) { return }
 			n_nodes = int(_rd_u32(meta, nv))
 			// A2/A3: reject counts that cannot fit (overflow-safe: each node 16 bytes).
 			if n_nodes < 0 || nv < 0 || nv+4 > len(meta) || n_nodes > (len(meta)-nv-4)/16 { return }
@@ -1521,8 +1654,10 @@ _ipc_decode_record_batch :: proc(
 		defer delete(buf_lengths)
 		if fo2 := get_fo(meta, rb_vt, 2); fo2 > 0 {
 			bv_pos := rb_tbl + fo2
+			if !_fits(meta, bv_pos, 4) { return }
 			bv_ref := _rd_i32(meta, bv_pos)
 			bv := bv_pos + int(bv_ref)
+			if !_fits(meta, bv, 4) { return }
 			n_bufs = int(_rd_u32(meta, bv))
 			// A2/A3: reject counts that cannot fit (overflow-safe: each buffer 16 bytes).
 			if n_bufs < 0 || bv < 0 || bv+4 > len(meta) || n_bufs > (len(meta)-bv-4)/16 { return }
@@ -1537,8 +1672,36 @@ _ipc_decode_record_batch :: proc(
 			return
 		}
 
-		// Build columns — buffers are zero-copy views into `body` (which lives
-		// in the file block the batch takes ownership of).
+		decode_buf :: proc(
+			is_comp: bool,
+			dctx:    rawptr,
+			body:    []u8,
+			off_i64: i64,
+			len_i64: i64,
+			alloc:   mem.Allocator,
+		) -> (Buffer, bool) {
+			if len_i64 == 0 {
+				return {}, true
+			}
+			if off_i64 < 0 || len_i64 < 0 || off_i64 > i64(len(body)) || len_i64 > i64(len(body)) - off_i64 {
+				return {}, !is_comp
+			}
+			if !is_comp {
+				return _ipc_view_buffer(body, int(off_i64), int(len_i64)), true
+			}
+			return _ipc_lz4_decompress_buffer(dctx, body, int(off_i64), int(len_i64), alloc)
+		}
+
+		cleanup_cols :: proc(cols: []Array, alloc: mem.Allocator) {
+			for &c in cols {
+				array_free(&c, alloc)
+			}
+			delete(cols, alloc)
+		}
+
+		// Build columns — uncompressed buffers are zero-copy views into `body`
+		// (pointing into the file block), whereas compressed buffers are
+		// decompressed into 64-byte-aligned owned Buffers.
 		columns := make([]Array, n_cols, allocator)
 		for ci in 0..<n_cols {
 			columns[ci] = Array{type = schema.fields[ci].type}
@@ -1550,11 +1713,11 @@ _ipc_decode_record_batch :: proc(
 			dt := schema.fields[ci].type
 
 			if validate && (col_len < 0 || null_count < 0 || null_count > col_len || col_len != int(length)) {
-				delete(columns, allocator); return
+				cleanup_cols(columns, allocator); return
 			}
 
 			if dt == nil {
-				delete(columns, allocator); return
+				cleanup_cols(columns, allocator); return
 			}
 
 			#partial switch _ in dt {
@@ -1566,13 +1729,20 @@ _ipc_decode_record_batch :: proc(
 			// validity bitmap buffer
 			var_buf: Buffer
 			if buf_idx < n_bufs && buf_lengths[buf_idx] > 0 && null_count > 0 {
-				var_buf = _ipc_view_buffer(body, int(buf_offsets[buf_idx]), int(buf_lengths[buf_idx]))
+				dec_ok: bool
+				var_buf, dec_ok = decode_buf(
+					is_compressed, dctx, body, buf_offsets[buf_idx], buf_lengths[buf_idx], allocator,
+				)
+				if !dec_ok {
+					cleanup_cols(columns, allocator); return
+				}
 			}
 			buf_idx += 1
 
 			// A1/A3: a validity bitmap must cover col_len bits.
 			if validate && null_count > 0 && (var_buf.data == nil || var_buf.size < _ipc_bitmap_bytes_needed(col_len)) {
-				delete(columns, allocator); return
+				buffer_free(&var_buf)
+				cleanup_cols(columns, allocator); return
 			}
 
 			switch _ in dt {
@@ -1584,24 +1754,45 @@ _ipc_decode_record_batch :: proc(
 				case Large_String_Type, Large_Binary_Type: off_w = size_of(i64)
 				}
 				if validate && col_len > (max(int) / off_w) - 1 {
-					delete(columns, allocator)
+					buffer_free(&var_buf)
+					cleanup_cols(columns, allocator)
 					return
 				}
 				off_buf: Buffer
 				if buf_idx < n_bufs {
-					off_buf = _ipc_view_buffer(body, int(buf_offsets[buf_idx]), int(buf_lengths[buf_idx]))
+					dec_ok: bool
+					off_buf, dec_ok = decode_buf(
+						is_compressed, dctx, body, buf_offsets[buf_idx], buf_lengths[buf_idx], allocator,
+					)
+					if !dec_ok {
+						buffer_free(&var_buf)
+						cleanup_cols(columns, allocator)
+						return
+					}
 				}
 				buf_idx += 1
 				data_buf: Buffer
 				if buf_idx < n_bufs {
-					data_buf = _ipc_view_buffer(body, int(buf_offsets[buf_idx]), int(buf_lengths[buf_idx]))
+					dec_ok: bool
+					data_buf, dec_ok = decode_buf(
+						is_compressed, dctx, body, buf_offsets[buf_idx], buf_lengths[buf_idx], allocator,
+					)
+					if !dec_ok {
+						buffer_free(&off_buf)
+						buffer_free(&var_buf)
+						cleanup_cols(columns, allocator)
+						return
+					}
 				}
 				buf_idx += 1
 				// A4: the offset buffer is attacker-controlled and is later used
 				// to slice the (unchecked) data buffer in array_get_string — so
 				// verify it is monotonic and in-bounds before handing it out.
 				if validate && !_ipc_offsets_valid(off_buf, data_buf, col_len, off_w) {
-					delete(columns, allocator)
+					buffer_free(&data_buf)
+					buffer_free(&off_buf)
+					buffer_free(&var_buf)
+					cleanup_cols(columns, allocator)
 					return
 				}
 				columns[ci] = Array{type=dt, length=col_len, null_count=null_count, buffers={var_buf, off_buf, data_buf}}
@@ -1612,21 +1803,32 @@ _ipc_decode_record_batch :: proc(
 				// fixed-width or bool
 				data_buf: Buffer
 				if buf_idx < n_bufs {
-					data_buf = _ipc_view_buffer(body, int(buf_offsets[buf_idx]), int(buf_lengths[buf_idx]))
+					dec_ok: bool
+					data_buf, dec_ok = decode_buf(
+						is_compressed, dctx, body, buf_offsets[buf_idx], buf_lengths[buf_idx], allocator,
+					)
+					if !dec_ok {
+						buffer_free(&var_buf)
+						cleanup_cols(columns, allocator)
+						return
+					}
 				}
 				buf_idx += 1
 				if validate && !_ipc_fixed_ok(dt, col_len, data_buf) {
-					delete(columns, allocator); return
+					buffer_free(&data_buf)
+					buffer_free(&var_buf)
+					cleanup_cols(columns, allocator); return
 				}
 				columns[ci] = Array{type=dt, length=col_len, null_count=null_count, buffers={var_buf, data_buf, {}}}
 			}
 		}
 
 		if validate && buf_idx != n_bufs {
-			delete(columns, allocator); return
+			cleanup_cols(columns, allocator); return
 		}
 
 		batch = Record_Batch{schema=schema, columns=columns, length=int(length), allocator=allocator}
+		uses_backing = !is_compressed
 		ok = true
 		_ = header_type
 	}

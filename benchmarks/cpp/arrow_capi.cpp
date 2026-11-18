@@ -390,7 +390,7 @@ int arrow_capi_binary_stats_slice(
 
 // ── Arrow IPC file/stream parity ──────────────────────────────────────────────
 
-int arrow_capi_ipc_write_sample(const char* path, int is_stream) {
+static int arrow_capi_ipc_write_sample_impl(const char* path, int is_stream, int use_lz4) {
     if (!path) return 0;
 
     auto schema = arrow::schema({
@@ -463,9 +463,16 @@ int arrow_capi_ipc_write_sample(const char* path, int is_stream) {
     if (!out_res.ok()) return 0;
     auto sink = *out_res;
 
+    auto options = arrow::ipc::IpcWriteOptions::Defaults();
+    if (use_lz4) {
+        auto codec_res = arrow::util::Codec::Create(arrow::Compression::LZ4_FRAME);
+        if (!codec_res.ok()) return 0;
+        options.codec = std::move(*codec_res);
+    }
+
     auto writer_res = is_stream
-        ? arrow::ipc::MakeStreamWriter(sink.get(), schema)
-        : arrow::ipc::MakeFileWriter(sink.get(), schema);
+        ? arrow::ipc::MakeStreamWriter(sink.get(), schema, options)
+        : arrow::ipc::MakeFileWriter(sink.get(), schema, options);
     if (!writer_res.ok()) return 0;
     auto writer = *writer_res;
 
@@ -473,6 +480,14 @@ int arrow_capi_ipc_write_sample(const char* path, int is_stream) {
     if (!writer->Close().ok()) return 0;
     if (!sink->Close().ok()) return 0;
     return 1;
+}
+
+int arrow_capi_ipc_write_sample(const char* path, int is_stream) {
+    return arrow_capi_ipc_write_sample_impl(path, is_stream, 0);
+}
+
+int arrow_capi_ipc_write_sample_lz4(const char* path, int is_stream) {
+    return arrow_capi_ipc_write_sample_impl(path, is_stream, 1);
 }
 
 static bool accumulate_batch_stats(

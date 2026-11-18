@@ -81,6 +81,7 @@ when ODIN_OS == .Linux {
             out_null_count: ^i64,
         ) -> c.int ---
         arrow_capi_ipc_write_sample :: proc(path: cstring, is_stream: c.int) -> c.int ---
+        arrow_capi_ipc_write_sample_lz4 :: proc(path: cstring, is_stream: c.int) -> c.int ---
         arrow_capi_ipc_verify_roundtrip :: proc(
             path: cstring,
             is_stream: c.int,
@@ -142,6 +143,7 @@ when ODIN_OS == .Linux {
         out_null_count: ^i64,
     ) -> c.int { return 0 }
     arrow_capi_ipc_write_sample :: proc "c" (path: cstring, is_stream: c.int) -> c.int { return 0 }
+    arrow_capi_ipc_write_sample_lz4 :: proc "c" (path: cstring, is_stream: c.int) -> c.int { return 0 }
     arrow_capi_ipc_verify_roundtrip :: proc "c" (
         path: cstring,
         is_stream: c.int,
@@ -909,6 +911,156 @@ test_arrow_cpp_ipc_file_and_stream_bidirectional_parity :: proc(t: ^testing.T) {
             sc_s, bs_s, ok_rs := oa.ipc_read_stream(cpp_stream_p)
             testing.expect(t, ok_rs)
             verify_odin_read(t, sc_s, bs_s)
+            if sc_s != nil { oa.schema_free(sc_s); free(sc_s) }
+            for bx in bs_s { bc := bx; oa.record_batch_free(&bc) }
+            delete(bs_s)
+        }
+        testing.expect_value(t, len(track.allocation_map), 0)
+        testing.expect_value(t, len(track.bad_free_array), 0)
+        mem.tracking_allocator_destroy(&track)
+    }
+}
+
+@(test)
+test_arrow_cpp_ipc_lz4_bidirectional_parity :: proc(t: ^testing.T) {
+    defer free_all(context.temp_allocator)
+
+    odin_file_p   := cpp_temp_path("odin_lz4_file", "arrow")
+    odin_stream_p := cpp_temp_path("odin_lz4_stream", "arrows")
+    cpp_file_p    := cpp_temp_path("cpp_lz4_file", "arrow")
+    cpp_stream_p  := cpp_temp_path("cpp_lz4_stream", "arrows")
+    defer {
+        _ = os.remove(odin_file_p)
+        _ = os.remove(odin_stream_p)
+        _ = os.remove(cpp_file_p)
+        _ = os.remove(cpp_stream_p)
+    }
+
+    // 1. Direction A: Odin writes compressible 256-row 6-column Record_Batch with .LZ4_Frame -> Arrow C++ validates
+    {
+        sc_fields := []oa.Field{
+            oa.field_make("id", oa.Int64_Type{}),
+            oa.field_make("uval", oa.UInt64_Type{}),
+            oa.field_make("score", oa.Float32_Type{}),
+            oa.field_make("flag", oa.Bool_Type{}),
+            oa.field_make("payload", oa.Binary_Type{}),
+            oa.field_make("label", oa.String_Type{}),
+        }
+        sc, sc_err := oa.schema_make(sc_fields)
+        testing.expect_value(t, sc_err, nil)
+        defer oa.schema_free(&sc)
+
+        N :: 256
+        bi := oa.builder_make(i64, N);   defer oa.builder_destroy(&bi)
+        bu := oa.builder_make(u64, N);   defer oa.builder_destroy(&bu)
+        bf := oa.builder_make(f32, N);   defer oa.builder_destroy(&bf)
+        bb := oa.builder_make(bool, N);  defer oa.builder_destroy(&bb)
+        bn := oa.binary_builder_make(N); defer oa.binary_builder_destroy(&bn)
+        bs := oa.string_builder_make(N); defer oa.string_builder_destroy(&bs)
+
+        want_i64_sum  := i64(0)
+        want_bin_bytes := i64(0)
+        for i in 0 ..< N {
+            if i % 19 == 0 {
+                oa.builder_append_null(&bi)
+                oa.builder_append_null(&bu)
+                oa.builder_append_null(&bf)
+                oa.builder_append_null(&bb)
+                oa.binary_builder_append_null(&bn)
+                oa.string_builder_append_null(&bs)
+            } else {
+                v := i64((i % 8) * 100)
+                want_i64_sum += v
+                want_bin_bytes += 4
+                oa.builder_append(&bi, v)
+                oa.builder_append(&bu, u64(v + 1000))
+                oa.builder_append(&bf, f32(i % 4) * 1.5)
+                oa.builder_append(&bb, (i & 1) == 0)
+                oa.binary_builder_append(&bn, []u8{0xDE, 0xAD, 0xBE, 0xEF})
+                oa.string_builder_append(&bs, "repeated-lz4-arrow-label")
+            }
+        }
+
+        c0, e0 := oa.builder_finish(&bi);        testing.expect_value(t, e0, nil); defer oa.array_free(&c0)
+        c1, e1 := oa.builder_finish(&bu);        testing.expect_value(t, e1, nil); defer oa.array_free(&c1)
+        c2, e2 := oa.builder_finish(&bf);        testing.expect_value(t, e2, nil); defer oa.array_free(&c2)
+        c3, e3 := oa.builder_finish(&bb);        testing.expect_value(t, e3, nil); defer oa.array_free(&c3)
+        c4, e4 := oa.binary_builder_finish(&bn); testing.expect_value(t, e4, nil); defer oa.array_free(&c4)
+        c5, e5 := oa.string_builder_finish(&bs); testing.expect_value(t, e5, nil); defer oa.array_free(&c5)
+
+        batch, rb_ok := oa.record_batch_make(&sc, []oa.Array{c0, c1, c2, c3, c4, c5})
+        testing.expect(t, rb_ok)
+        defer delete(batch.columns)
+
+        testing.expect(t, oa.ipc_write_file(odin_file_p, &sc, []oa.Record_Batch{batch}, .LZ4_Frame))
+        testing.expect(t, oa.ipc_write_stream(odin_stream_p, &sc, []oa.Record_Batch{batch}, .LZ4_Frame))
+
+        got_sum_f, got_bytes_f: i64
+        ok_f := arrow_capi_ipc_verify_roundtrip(
+            strings.clone_to_cstring(odin_file_p, context.temp_allocator),
+            0, N, 6, &got_sum_f, &got_bytes_f,
+        )
+        testing.expect_value(t, ok_f, c.int(1))
+        testing.expect_value(t, got_sum_f, want_i64_sum)
+        testing.expect_value(t, got_bytes_f, want_bin_bytes)
+
+        got_sum_s, got_bytes_s: i64
+        ok_s := arrow_capi_ipc_verify_roundtrip(
+            strings.clone_to_cstring(odin_stream_p, context.temp_allocator),
+            1, N, 6, &got_sum_s, &got_bytes_s,
+        )
+        testing.expect_value(t, ok_s, c.int(1))
+        testing.expect_value(t, got_sum_s, want_i64_sum)
+        testing.expect_value(t, got_bytes_s, want_bin_bytes)
+    }
+
+    // 2. Direction B: Arrow C++ writes LZ4_FRAME IPC File & Stream -> Odin reads & verifies with leak tracking
+    {
+        testing.expect_value(
+            t,
+            arrow_capi_ipc_write_sample_lz4(strings.clone_to_cstring(cpp_file_p, context.temp_allocator), 0),
+            c.int(1),
+        )
+        testing.expect_value(
+            t,
+            arrow_capi_ipc_write_sample_lz4(strings.clone_to_cstring(cpp_stream_p, context.temp_allocator), 1),
+            c.int(1),
+        )
+
+        verify_odin_lz4 :: proc(t: ^testing.T, sc: ^oa.Schema, batches: []oa.Record_Batch) {
+            testing.expect(t, sc != nil)
+            testing.expect_value(t, len(batches), 1)
+            if sc == nil || len(batches) != 1 { return }
+            b := &batches[0]
+            testing.expect_value(t, b.length, 5)
+            testing.expect_value(t, oa.array_get(&b.columns[0], 0, i64), i64(-5_000_000_001))
+            testing.expect(t, oa.array_is_null(&b.columns[0], 1))
+            testing.expect_value(t, oa.array_get(&b.columns[0], 3, i64), i64(9_000_000_007))
+            testing.expect_value(t, oa.array_get(&b.columns[1], 4, u64), u64(8_000_000_009))
+            testing.expect_value(t, oa.array_get(&b.columns[2], 3, f32), f32(3.75))
+            testing.expect_value(t, oa.array_get(&b.columns[3], 0, bool), true)
+            testing.expect(t, mem.compare(oa.array_get_binary(&b.columns[4], 3), []u8{0xDE, 0xAD, 0xBE, 0xEF}) == 0)
+            testing.expect_value(t, oa.array_get_string(&b.columns[5], 0), "alpha")
+            testing.expect_value(t, oa.array_get_string(&b.columns[5], 4), "omega")
+        }
+
+        track: mem.Tracking_Allocator
+        mem.tracking_allocator_init(&track, context.allocator)
+        saved_alloc := context.allocator
+        {
+            context.allocator = mem.tracking_allocator(&track)
+            defer context.allocator = saved_alloc
+
+            sc_f, bs_f, ok_rf := oa.ipc_read_file(cpp_file_p)
+            testing.expect(t, ok_rf)
+            verify_odin_lz4(t, sc_f, bs_f)
+            if sc_f != nil { oa.schema_free(sc_f); free(sc_f) }
+            for bx in bs_f { bc := bx; oa.record_batch_free(&bc) }
+            delete(bs_f)
+
+            sc_s, bs_s, ok_rs := oa.ipc_read_stream(cpp_stream_p)
+            testing.expect(t, ok_rs)
+            verify_odin_lz4(t, sc_s, bs_s)
             if sc_s != nil { oa.schema_free(sc_s); free(sc_s) }
             for bx in bs_s { bc := bx; oa.record_batch_free(&bc) }
             delete(bs_s)

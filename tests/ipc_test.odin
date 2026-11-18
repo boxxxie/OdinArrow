@@ -664,3 +664,244 @@ test_ipc_overwrite_shrinks_existing_file :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+@(test)
+test_ipc_lz4_file_and_stream_roundtrip :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	raw_file   := ipc_test_temp_path("lz4_raw", "arrow")
+	lz4_file   := ipc_test_temp_path("lz4_comp", "arrow")
+	lz4_stream := ipc_test_temp_path("lz4_comp", "arrows")
+	defer {
+		_ = os.remove(raw_file);   delete(raw_file)
+		_ = os.remove(lz4_file);   delete(lz4_file)
+		_ = os.remove(lz4_stream); delete(lz4_stream)
+	}
+
+	fields := []oa.Field{
+		oa.field_make("i64",  oa.Int64_Type{}),
+		oa.field_make("f64",  oa.Float64_Type{}),
+		oa.field_make("flag", oa.Bool_Type{}),
+		oa.field_make("str",  oa.String_Type{}),
+		oa.field_make("bin",  oa.Binary_Type{}),
+		oa.field_make("lstr", oa.Large_String_Type{}),
+		oa.field_make("nul",  oa.Null_Type{}),
+	}
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
+	defer oa.schema_free(&schema)
+
+	// Build two batches: batch 0 is large & compressible; batch 1 is sliced + tiny (hits -1 fallback).
+	n0 :: 512
+	bi64  := oa.builder_make(i64, n0);        defer oa.builder_destroy(&bi64)
+	bf64  := oa.builder_make(f64, n0);        defer oa.builder_destroy(&bf64)
+	bbool := oa.builder_make(bool, n0);       defer oa.builder_destroy(&bbool)
+	bstr  := oa.string_builder_make(n0);      defer oa.string_builder_destroy(&bstr)
+	bbin  := oa.binary_builder_make(n0);      defer oa.binary_builder_destroy(&bbin)
+	blstr := oa.large_string_builder_make(n0); defer oa.large_string_builder_destroy(&blstr)
+
+	for i in 0 ..< n0 {
+		if i % 17 == 0 {
+			oa.builder_append_null(&bi64)
+			oa.builder_append_null(&bf64)
+			oa.builder_append_null(&bbool)
+			oa.string_builder_append_null(&bstr)
+			oa.binary_builder_append_null(&bbin)
+			oa.large_string_builder_append_null(&blstr)
+		} else {
+			oa.builder_append(&bi64, i64((i % 8) * 1000))
+			oa.builder_append(&bf64, f64(i % 16) * 1.25)
+			oa.builder_append(&bbool, (i & 1) == 0)
+			oa.string_builder_append(&bstr, "repeated-benchmark-prefix-string")
+			oa.binary_builder_append(&bbin, []u8{0xCA, 0xFE, 0xBA, 0xBE})
+			oa.large_string_builder_append(&blstr, "large-utf8-repeated-payload")
+		}
+	}
+
+	c0, e0 := oa.builder_finish(&bi64);        testing.expect_value(t, e0, nil); defer oa.array_free(&c0)
+	c1, e1 := oa.builder_finish(&bf64);        testing.expect_value(t, e1, nil); defer oa.array_free(&c1)
+	c2, e2 := oa.builder_finish(&bbool);       testing.expect_value(t, e2, nil); defer oa.array_free(&c2)
+	c3, e3 := oa.string_builder_finish(&bstr); testing.expect_value(t, e3, nil); defer oa.array_free(&c3)
+	c4, e4 := oa.binary_builder_finish(&bbin); testing.expect_value(t, e4, nil); defer oa.array_free(&c4)
+	c5, e5 := oa.large_string_builder_finish(&blstr); testing.expect_value(t, e5, nil); defer oa.array_free(&c5)
+	c6 := oa.Array{type = oa.Null_Type{}, length = n0, null_count = n0}
+
+	rb0, rb0_ok := oa.record_batch_make(&schema, []oa.Array{c0, c1, c2, c3, c4, c5, c6})
+	testing.expect(t, rb0_ok)
+	defer delete(rb0.columns)
+
+	// Batch 1: 3-row slice starting at odd bit offset to test offset > 0 + tiny -1 buffer path.
+	slice_cols := []oa.Array{
+		oa.array_slice(c0, 3, 6),
+		oa.array_slice(c1, 3, 6),
+		oa.array_slice(c2, 3, 6),
+		oa.array_slice(c3, 3, 6),
+		oa.array_slice(c4, 3, 6),
+		oa.array_slice(c5, 3, 6),
+		oa.Array{type = oa.Null_Type{}, length = 3, null_count = 3},
+	}
+	rb1, rb1_ok := oa.record_batch_make(&schema, slice_cols)
+	testing.expect(t, rb1_ok)
+	defer delete(rb1.columns)
+
+	batches_in := []oa.Record_Batch{rb0, rb1}
+	testing.expect(t, oa.ipc_write_file(raw_file, &schema, batches_in, .None))
+	testing.expect(t, oa.ipc_write_file(lz4_file, &schema, batches_in, .LZ4_Frame))
+	testing.expect(t, oa.ipc_write_stream(lz4_stream, &schema, batches_in, .LZ4_Frame))
+
+	raw_bytes, r_err := os.read_entire_file(raw_file, context.temp_allocator)
+	testing.expect_value(t, r_err, nil)
+	lz4_bytes, l_err := os.read_entire_file(lz4_file, context.temp_allocator)
+	testing.expect_value(t, l_err, nil)
+	testing.expect(
+		t,
+		len(lz4_bytes) > 0 && len(lz4_bytes) < (len(raw_bytes) * 40) / 100,
+		"LZ4_Frame IPC file must compress repetitive arrays below 40% of raw size",
+	)
+
+	verify_batches :: proc(t: ^testing.T, sc: ^oa.Schema, bs: []oa.Record_Batch) {
+		testing.expect(t, sc != nil)
+		testing.expect_value(t, len(bs), 2)
+		if sc == nil || len(bs) != 2 {
+			return
+		}
+		testing.expect_value(t, len(sc.fields), 7)
+		testing.expect_value(t, bs[0].length, n0)
+		testing.expect_value(t, bs[1].length, 3)
+
+		for row in 0 ..< n0 {
+			if row % 17 == 0 {
+				testing.expect(t, oa.array_is_null(&bs[0].columns[0], row))
+				testing.expect(t, oa.array_is_null(&bs[0].columns[3], row))
+			} else {
+				testing.expect_value(t, oa.array_get(&bs[0].columns[0], row, i64), i64((row % 8) * 1000))
+				testing.expect_value(t, oa.array_get(&bs[0].columns[1], row, f64), f64(row % 16) * 1.25)
+				testing.expect_value(t, oa.array_get(&bs[0].columns[2], row, bool), (row & 1) == 0)
+				testing.expect_value(t, oa.array_get_string(&bs[0].columns[3], row), "repeated-benchmark-prefix-string")
+				testing.expect_value(t, oa.array_get_large_string(&bs[0].columns[5], row), "large-utf8-repeated-payload")
+			}
+			testing.expect(t, oa.array_is_null(&bs[0].columns[6], row))
+		}
+
+		// Batch 1 equals rows [3..6) of Batch 0.
+		for k in 0 ..< 3 {
+			src_row := k + 3
+			testing.expect_value(t, oa.array_get(&bs[1].columns[0], k, i64), i64((src_row % 8) * 1000))
+			testing.expect_value(t, oa.array_get(&bs[1].columns[2], k, bool), (src_row & 1) == 0)
+			testing.expect_value(t, oa.array_get_string(&bs[1].columns[3], k), "repeated-benchmark-prefix-string")
+			testing.expect_value(t, oa.array_get_large_string(&bs[1].columns[5], k), "large-utf8-repeated-payload")
+		}
+	}
+
+	for use_mmap in ([]bool{true, false}) {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer check_no_leaks(t, &track)
+		{
+			old_alloc := context.allocator
+			defer context.allocator = old_alloc
+			context.allocator = mem.tracking_allocator(&track)
+
+			sc_f, bs_f, ok_f := oa.ipc_read_file(lz4_file, use_mmap = use_mmap)
+			testing.expect(t, ok_f)
+			verify_batches(t, sc_f, bs_f)
+			if sc_f != nil { oa.schema_free(sc_f); free(sc_f) }
+			for &b in bs_f { oa.record_batch_free(&b) }
+			delete(bs_f)
+
+			sc_s, bs_s, ok_s := oa.ipc_read_stream(lz4_stream, use_mmap = use_mmap)
+			testing.expect(t, ok_s)
+			verify_batches(t, sc_s, bs_s)
+			if sc_s != nil { oa.schema_free(sc_s); free(sc_s) }
+			for &b in bs_s { oa.record_batch_free(&b) }
+			delete(bs_s)
+		}
+	}
+}
+
+@(test)
+test_ipc_lz4_fuzz_and_corrupt_no_leak :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	fp  := ipc_test_temp_path("lz4_fuzz", "arrow")
+	bad := ipc_test_temp_path("lz4_bad", "arrow")
+	defer {
+		_ = os.remove(fp);  delete(fp)
+		_ = os.remove(bad); delete(bad)
+	}
+
+	fields := []oa.Field{oa.field_make("v", oa.Int64_Type{})}
+	schema, sc_err := oa.schema_make(fields)
+	testing.expect_value(t, sc_err, nil)
+	defer oa.schema_free(&schema)
+
+	vals := make([]i64, 256, context.temp_allocator) // 2048 bytes uncompressed
+	bv := oa.builder_make(i64, len(vals)); defer oa.builder_destroy(&bv)
+	for v in vals { oa.builder_append(&bv, v) }
+	col, col_err := oa.builder_finish(&bv)
+	testing.expect_value(t, col_err, nil)
+	defer oa.array_free(&col)
+
+	batch, rb_ok := oa.record_batch_make(&schema, []oa.Array{col})
+	testing.expect(t, rb_ok)
+	defer delete(batch.columns)
+
+	testing.expect(t, oa.ipc_write_file(fp, &schema, []oa.Record_Batch{batch}, .LZ4_Frame))
+	orig, o_err := os.read_entire_file(fp, context.temp_allocator)
+	testing.expect_value(t, o_err, nil)
+	if o_err != nil || len(orig) < 20 {
+		return
+	}
+
+	free_result :: proc(sc: ^oa.Schema, bs: []oa.Record_Batch) {
+		if sc != nil { oa.schema_free(sc); free(sc) }
+		for &b in bs { oa.record_batch_free(&b) }
+		delete(bs)
+	}
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer check_no_leaks(t, &track)
+	{
+		old_alloc := context.allocator
+		defer context.allocator = old_alloc
+		context.allocator = mem.tracking_allocator(&track)
+
+		// 1. Hostile uncompressed length prefixes (anti-OOM bomb & invalid negative sentinel -2).
+		uncomp_pat := []u8{
+			0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uncomp_len = 2048
+			0x04, 0x22, 0x4D, 0x18,                         // LZ4F frame magic
+		}
+		pos := bytes.index(orig, uncomp_pat)
+		testing.expect(t, pos >= 0, "expected uncompressed-length prefix in LZ4 IPC body")
+		if pos >= 0 {
+			for bad_hdr in ([][]u8{{0xFF, 0xFF, 0xFF, 0x7F}, {0xFE, 0xFF, 0xFF, 0xFF}}) {
+				mut := make([]u8, len(orig), context.temp_allocator)
+				copy(mut, orig)
+				copy(mut[pos:pos+4], bad_hdr)
+				if bad_hdr[0] == 0xFE {
+					for k in 4 ..< 8 { mut[pos + k] = 0xFF }
+				}
+				testing.expect_value(t, os.write_entire_file(bad, mut), nil)
+				sc, bs, ok := oa.ipc_read_file(bad, use_mmap = false)
+				testing.expect(t, ok)
+				testing.expect_value(t, len(bs), 0)
+				free_result(sc, bs)
+			}
+		}
+
+		// 2. Deterministic random 1- and 2-byte mutations: zero crashes, zero leaks.
+		rng: u64 = 0xCAFE_BABE_1234_5678
+		next :: proc(s: ^u64) -> u64 { s^ = s^ * 6364136223846793005 + 1442695040888963407; return s^ >> 17 }
+		mut_buf := make([]u8, len(orig))
+		defer delete(mut_buf)
+		for _ in 0 ..< 400 {
+			copy(mut_buf, orig)
+			mut_buf[int(next(&rng) % u64(len(orig)))] = u8(next(&rng))
+			mut_buf[int(next(&rng) % u64(len(orig)))] = u8(next(&rng))
+			if os.write_entire_file(bad, mut_buf) != nil { continue }
+			sc, bs, _ := oa.ipc_read_file(bad, use_mmap = false)
+			free_result(sc, bs)
+		}
+	}
+}
