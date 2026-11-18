@@ -182,7 +182,7 @@ compute_compare :: proc(arr: ^Array, op: Compare_Op, scalar: f64, allocator := c
 	case UInt64_Type:  return _compare_int_f64(arr, op, scalar, u64, allocator)
 	case Float32_Type: return _compare_float_f64(arr, op, scalar, f32, allocator)
 	case Float64_Type: return _compare_float_f64(arr, op, scalar, f64, allocator)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_compare: type does not support ordering")
 	}
 	return
@@ -200,7 +200,7 @@ compute_compare_i64 :: proc(arr: ^Array, op: Compare_Op, scalar: i64, allocator 
 	case UInt64_Type:  return _compare_int_i64(arr, op, scalar, u64, allocator)
 	case Float32_Type: return _compare_float_i64(arr, op, scalar, f32, allocator)
 	case Float64_Type: return _compare_float_i64(arr, op, scalar, f64, allocator)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_compare_i64: type does not support ordering")
 	}
 	return
@@ -218,7 +218,7 @@ compute_compare_u64 :: proc(arr: ^Array, op: Compare_Op, scalar: u64, allocator 
 	case UInt64_Type:  return _compare_int_u64(arr, op, scalar, u64, allocator)
 	case Float32_Type: return _compare_float_u64(arr, op, scalar, f32, allocator)
 	case Float64_Type: return _compare_float_u64(arr, op, scalar, f64, allocator)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_compare_u64: type does not support ordering")
 	}
 	return
@@ -749,7 +749,7 @@ compute_select_compare_into :: proc(arr: ^Array, op: Compare_Op, scalar: f64, ou
 	case UInt64_Type:  return _select_compare_int_f64(arr, op, scalar, u64, out_indices, true, {})
 	case Float32_Type: return _select_compare_f32_f64(arr, op, scalar,      out_indices, true, {})
 	case Float64_Type: return _select_compare_native(arr, op, scalar,       out_indices, true, {})
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_select_compare_into: type does not support ordering")
 	}
 	return {}
@@ -767,7 +767,7 @@ compute_select_compare :: proc(arr: ^Array, op: Compare_Op, scalar: f64, allocat
 	case UInt64_Type:  return _select_compare_int_f64(arr, op, scalar, u64, nil, false, allocator)
 	case Float32_Type: return _select_compare_f32_f64(arr, op, scalar,      nil, false, allocator)
 	case Float64_Type: return _select_compare_native(arr, op, scalar,       nil, false, allocator)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_select_compare: type does not support ordering")
 	}
 	return Selection{ allocator = allocator }
@@ -785,7 +785,7 @@ compute_select_compare_i64 :: proc(arr: ^Array, op: Compare_Op, scalar: i64, all
 	case UInt64_Type:  return _select_compare_int_i64(arr, op, scalar, u64, allocator)
 	case Float32_Type: return _select_compare_float_i64(arr, op, scalar, f32, allocator)
 	case Float64_Type: return _select_compare_float_i64(arr, op, scalar, f64, allocator)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_select_compare_i64: type does not support ordering")
 	}
 	return Selection{ allocator = allocator }
@@ -834,7 +834,7 @@ _refine_compare_f64_into :: proc(sel: ^Selection, arr: ^Array, op: Compare_Op, s
 	case UInt64_Type:  return _refine_compare_int_f64_into(sel, arr, op, scalar, u64, out)
 	case Float32_Type: return _refine_compare_dispatch_into(sel, arr, op, scalar, f32, out)
 	case Float64_Type: return _refine_compare_dispatch_into(sel, arr, op, scalar, f64, out)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("selection_refine_compare: type does not support ordering")
 	}
 	return 0
@@ -853,7 +853,7 @@ _refine_compare_i64_into :: proc(sel: ^Selection, arr: ^Array, op: Compare_Op, s
 	case UInt64_Type:  return _refine_compare_int_i64_into(sel, arr, op, scalar, u64, out)
 	case Float32_Type: return _refine_compare_float_i64_into(sel, arr, op, scalar, f32, out)
 	case Float64_Type: return _refine_compare_float_i64_into(sel, arr, op, scalar, f64, out)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("selection_refine_compare_i64: type does not support ordering")
 	}
 	return 0

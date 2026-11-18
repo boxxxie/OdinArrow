@@ -238,7 +238,7 @@ _le_i32 :: #force_inline proc(dst: []u8, v: i32) {
 // ── Arrow type encoding ───────────────────────────────────────────────────────
 
 // Arrow IPC Type enum (format/Schema.fbs): None=0, Null=1, Int=2, FloatingPoint=3,
-// Binary=4, Utf8=5, Bool=6, ..., LargeBinary=19, LargeUtf8=20
+// Binary=4, Utf8=5, Bool=6, Decimal=7, ..., LargeBinary=19, LargeUtf8=20
 _IPC_TYPE_NONE        :: u8(0)
 _IPC_TYPE_NULL        :: u8(1)
 _IPC_TYPE_INT         :: u8(2)
@@ -246,6 +246,7 @@ _IPC_TYPE_FLOATINGPT  :: u8(3)
 _IPC_TYPE_BINARY      :: u8(4)
 _IPC_TYPE_UTF8        :: u8(5)
 _IPC_TYPE_BOOL        :: u8(6)
+_IPC_TYPE_DECIMAL     :: u8(7)
 _IPC_TYPE_LARGEBINARY :: u8(19)
 _IPC_TYPE_LARGEUTF8   :: u8(20)
 
@@ -274,7 +275,7 @@ _IPC_COMP_METHOD_BUFFER :: u8(0) // BodyCompressionMethod.BUFFER in Message.fbs
 // (Bool, Utf8, LargeUtf8) — must still carry a (possibly empty) type table, or
 // Arrow rejects the field with "null field Field.type".
 _ipc_write_type :: proc(b: ^FBB, dt: DataType) -> (disc: u8, off: int) {
-	switch _ in dt {
+	switch t in dt {
 	case Bool_Type:         return _IPC_TYPE_BOOL, _ipc_empty_type(b)
 	case String_Type:       return _IPC_TYPE_UTF8, _ipc_empty_type(b)
 	case Large_String_Type: return _IPC_TYPE_LARGEUTF8, _ipc_empty_type(b)
@@ -290,6 +291,8 @@ _ipc_write_type :: proc(b: ^FBB, dt: DataType) -> (disc: u8, off: int) {
 	case UInt64_Type: return _ipc_int_type(b, 64, false)
 	case Float32_Type: return _ipc_fp_type(b, 1)  // precision SINGLE
 	case Float64_Type: return _ipc_fp_type(b, 2)  // precision DOUBLE
+	case Decimal64_Type:  return _ipc_decimal_type(b, t.precision, t.scale, 64)
+	case Decimal128_Type: return _ipc_decimal_type(b, t.precision, t.scale, 128)
 	case Null_Type:
 		return _IPC_TYPE_NULL, _ipc_empty_type(b)
 	}
@@ -315,6 +318,15 @@ _ipc_fp_type :: proc(b: ^FBB, precision: i16) -> (u8, int) {
 	_fbb_start_table(b, 1)
 	_fbb_add_i16(b, 0, precision, 0)
 	return _IPC_TYPE_FLOATINGPT, _fbb_end_table(b)
+}
+
+// Decimal type table: { precision: i32 @0, scale: i32 @1, bitWidth: i32 = 128 @2 }
+_ipc_decimal_type :: proc(b: ^FBB, precision, scale, bit_width: i32) -> (u8, int) {
+	_fbb_start_table(b, 3)
+	_fbb_add_i32(b, 0, precision, 0)
+	_fbb_add_i32(b, 1, scale, 0)
+	_fbb_add_i32(b, 2, bit_width, 128)
+	return _IPC_TYPE_DECIMAL, _fbb_end_table(b)
 }
 
 // ── Schema FlatBuffer encoding ────────────────────────────────────────────────
@@ -581,7 +593,8 @@ _ipc_encode_record_batch :: proc(
 			}
 		case Int8_Type, Int16_Type, Int32_Type, Int64_Type,
 			 UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
-			 Float32_Type, Float64_Type:
+			 Float32_Type, Float64_Type,
+			 Decimal64_Type, Decimal128_Type:
 			w := i64(type_byte_width(col.type))
 			data_len := i64(col.length) * w
 			val_ptr := col.buffers[1].data
@@ -1537,6 +1550,32 @@ _ipc_disc_to_datatype :: proc(data: []u8, disc: u8, tbl: int) -> (dt: DataType, 
 			}
 		}
 		return nil, false
+	case _IPC_TYPE_DECIMAL:
+		if tbl > 0 && _fits(data, tbl, 4) {
+			soff := _rd_i32(data, tbl)
+			vt   := tbl - int(soff)
+			if _fits(data, vt, 4) {
+				vt_size := int(_rd_i16(data, vt))
+				if vt_size >= 4 && _fits(data, vt, vt_size) {
+					pr_off := int(_rd_i16(data, vt+4)) if vt_size >= 6 else 0
+					sc_off := int(_rd_i16(data, vt+6)) if vt_size >= 8 else 0
+					bw_off := int(_rd_i16(data, vt+8)) if vt_size >= 10 else 0
+					pr := i32(0)
+					sc := i32(0)
+					bw := i32(128)
+					if pr_off > 0 { pr = _rd_i32(data, tbl+pr_off) }
+					if sc_off > 0 { sc = _rd_i32(data, tbl+sc_off) }
+					if bw_off > 0 { bw = _rd_i32(data, tbl+bw_off) }
+					if bw == 64 && pr >= 1 && pr <= 18 {
+						return Decimal64_Type{precision = pr, scale = sc}, true
+					}
+					if bw == 128 && pr >= 1 && pr <= 38 {
+						return Decimal128_Type{precision = pr, scale = sc}, true
+					}
+				}
+			}
+		}
+		return nil, false
 	}
 	return nil, false
 }
@@ -1799,7 +1838,8 @@ _ipc_decode_record_batch :: proc(
 			case Bool_Type,
 				 Int8_Type, Int16_Type, Int32_Type, Int64_Type,
 				 UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
-				 Float32_Type, Float64_Type:
+				 Float32_Type, Float64_Type,
+				 Decimal64_Type, Decimal128_Type:
 				// fixed-width or bool
 				data_buf: Buffer
 				if buf_idx < n_bufs {

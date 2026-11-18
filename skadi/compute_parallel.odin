@@ -340,16 +340,18 @@ compute_filter_parallel :: proc(arr, mask: ^Array, num_threads := 0, allocator :
 
 		scatter_job: proc(ctx: rawptr, idx: int)
 		#partial switch _ in arr.type {
-		case Int8_Type:    scatter_job = _filter_scatter_job(i8)
-		case Int16_Type:   scatter_job = _filter_scatter_job(i16)
-		case Int32_Type:   scatter_job = _filter_scatter_job(i32)
-		case Int64_Type:   scatter_job = _filter_scatter_job(i64)
-		case UInt8_Type:   scatter_job = _filter_scatter_job(u8)
-		case UInt16_Type:  scatter_job = _filter_scatter_job(u16)
-		case UInt32_Type:  scatter_job = _filter_scatter_job(u32)
-		case UInt64_Type:  scatter_job = _filter_scatter_job(u64)
-		case Float32_Type: scatter_job = _filter_scatter_job(f32)
-		case Float64_Type: scatter_job = _filter_scatter_job(f64)
+		case Int8_Type:       scatter_job = _filter_scatter_job(i8)
+		case Int16_Type:      scatter_job = _filter_scatter_job(i16)
+		case Int32_Type:      scatter_job = _filter_scatter_job(i32)
+		case Int64_Type:      scatter_job = _filter_scatter_job(i64)
+		case UInt8_Type:      scatter_job = _filter_scatter_job(u8)
+		case UInt16_Type:     scatter_job = _filter_scatter_job(u16)
+		case UInt32_Type:     scatter_job = _filter_scatter_job(u32)
+		case UInt64_Type:     scatter_job = _filter_scatter_job(u64)
+		case Float32_Type:    scatter_job = _filter_scatter_job(f32)
+		case Float64_Type:    scatter_job = _filter_scatter_job(f64)
+		case Decimal64_Type:  scatter_job = _filter_scatter_job(i64)
+		case Decimal128_Type: scatter_job = _filter_scatter_job(i128)
 		}
 		assert(scatter_job != nil, "compute_filter_parallel: unhandled DataType")
 		_pool_run(nt, scatter_job, &fctx, n_morsels)
@@ -705,16 +707,18 @@ compute_take_parallel :: proc(arr, indices: ^Array, num_threads := 0, allocator 
 
 _resolve_take_scatter_job :: proc(dt: DataType, $Idx: typeid) -> proc(ctx: rawptr, idx: int) {
 	#partial switch _ in dt {
-	case Int8_Type:    return _take_scatter_job(i8,  Idx)
-	case Int16_Type:   return _take_scatter_job(i16, Idx)
-	case Int32_Type:   return _take_scatter_job(i32, Idx)
-	case Int64_Type:   return _take_scatter_job(i64, Idx)
-	case UInt8_Type:   return _take_scatter_job(u8,  Idx)
-	case UInt16_Type:  return _take_scatter_job(u16, Idx)
-	case UInt32_Type:  return _take_scatter_job(u32, Idx)
-	case UInt64_Type:  return _take_scatter_job(u64, Idx)
-	case Float32_Type: return _take_scatter_job(f32, Idx)
-	case Float64_Type: return _take_scatter_job(f64, Idx)
+	case Int8_Type:       return _take_scatter_job(i8,   Idx)
+	case Int16_Type:      return _take_scatter_job(i16,  Idx)
+	case Int32_Type:      return _take_scatter_job(i32,  Idx)
+	case Int64_Type:      return _take_scatter_job(i64,  Idx)
+	case UInt8_Type:      return _take_scatter_job(u8,   Idx)
+	case UInt16_Type:     return _take_scatter_job(u16,  Idx)
+	case UInt32_Type:     return _take_scatter_job(u32,  Idx)
+	case UInt64_Type:     return _take_scatter_job(u64,  Idx)
+	case Float32_Type:    return _take_scatter_job(f32,  Idx)
+	case Float64_Type:    return _take_scatter_job(f64,  Idx)
+	case Decimal64_Type:  return _take_scatter_job(i64,  Idx)
+	case Decimal128_Type: return _take_scatter_job(i128, Idx)
 	}
 	return nil
 }

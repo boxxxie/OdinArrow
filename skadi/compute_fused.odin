@@ -26,7 +26,7 @@ compute_sum_where :: proc(values, mask: ^Array) -> (sum: f64, valid_count: int) 
 	case UInt64_Type:  return _sum_where_typed(values, mask, u64)
 	case Float32_Type: return _sum_where_typed(values, mask, f32)
 	case Float64_Type: return _sum_where_typed(values, mask, f64)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_sum_where: type does not support numeric summation")
 	}
 	return
@@ -110,7 +110,7 @@ compute_min_max_where :: proc(values, mask: ^Array) -> (min_val: f64, max_val: f
 	case UInt64_Type:  return _min_max_where_typed(values, mask, u64)
 	case Float32_Type: return _min_max_where_typed(values, mask, f32)
 	case Float64_Type: return _min_max_where_typed(values, mask, f64)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_min_max_where: type does not support ordering")
 	}
 	return

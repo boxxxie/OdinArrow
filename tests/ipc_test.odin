@@ -905,3 +905,184 @@ test_ipc_lz4_fuzz_and_corrupt_no_leak :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+@(test)
+test_ipc_decimal64_and_decimal128_roundtrip_and_kernels :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	d64_dt  := oa.Decimal64_Type{precision = 18, scale = 6}
+	d128_dt := oa.Decimal128_Type{precision = 38, scale = 9}
+
+	testing.expect_value(t, oa.type_byte_width(d64_dt), 8)
+	testing.expect_value(t, oa.type_byte_width(d128_dt), 16)
+	testing.expect(t, oa.type_is_decimal(d64_dt))
+	testing.expect(t, oa.type_is_decimal(d128_dt))
+	testing.expect(t, !oa.type_is_decimal(oa.Int64_Type{}))
+	testing.expect(t, oa.type_is_signed(d64_dt))
+	testing.expect(t, !oa.type_is_integer(d64_dt))
+	testing.expect(t, !oa.type_is_floating(d64_dt))
+	testing.expect(t, !oa.type_is_variable_length(d128_dt))
+	testing.expect_value(t, oa.type_name(d64_dt), "decimal64")
+	testing.expect_value(t, oa.type_name(d128_dt), "decimal128")
+
+	raw_file   := ipc_test_temp_path("dec_raw", "arrow")
+	lz4_file   := ipc_test_temp_path("dec_lz4", "arrow")
+	lz4_stream := ipc_test_temp_path("dec_lz4", "arrows")
+	defer {
+		_ = os.remove(raw_file);   delete(raw_file)
+		_ = os.remove(lz4_file);   delete(lz4_file)
+		_ = os.remove(lz4_stream); delete(lz4_stream)
+	}
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer check_no_leaks(t, &track)
+	{
+		old_alloc := context.allocator
+		defer context.allocator = old_alloc
+		context.allocator = mem.tracking_allocator(&track)
+
+		fields := []oa.Field{
+			oa.field_make("d64", d64_dt),
+			oa.field_make("d128", d128_dt),
+		}
+		schema, sc_err := oa.schema_make(fields)
+		testing.expect_value(t, sc_err, nil)
+		defer oa.schema_free(&schema)
+
+		b64 := oa.builder_make(i64, 5)
+		defer oa.builder_destroy(&b64)
+		oa.builder_append(&b64, i64(41_732_000))
+		oa.builder_append(&b64, i64(-5_000))
+		oa.builder_append_null(&b64)
+		oa.builder_append(&b64, i64(0))
+		oa.builder_append(&b64, i64(123_456_789))
+		c64, e64 := oa.builder_finish_as(&b64, d64_dt)
+		testing.expect_value(t, e64, nil)
+		defer oa.array_free(&c64)
+
+		big_pos := i128(1_000_000_000_000_000_000) * 123 + 456_789
+		big_neg := -big_pos
+		b128 := oa.builder_make(i128, 5)
+		defer oa.builder_destroy(&b128)
+		oa.builder_append(&b128, big_pos)
+		oa.builder_append(&b128, i128(42))
+		oa.builder_append_null(&b128)
+		oa.builder_append(&b128, big_neg)
+		oa.builder_append(&b128, i128(0))
+		c128, e128 := oa.builder_finish_as(&b128, d128_dt)
+		testing.expect_value(t, e128, nil)
+		defer oa.array_free(&c128)
+
+		// Verify compute_filter, compute_take, selection_take, and array_slice+array_copy preserve Decimal types.
+		bm := oa.builder_make(bool, 5)
+		defer oa.builder_destroy(&bm)
+		oa.builder_append(&bm, true)
+		oa.builder_append(&bm, false)
+		oa.builder_append(&bm, true)
+		oa.builder_append(&bm, true)
+		oa.builder_append(&bm, false)
+		mask, m_err := oa.builder_finish(&bm)
+		testing.expect_value(t, m_err, nil)
+		defer oa.array_free(&mask)
+
+		flt64, flt64_err := oa.compute_filter(&c64, &mask)
+		testing.expect_value(t, flt64_err, nil)
+		defer oa.array_free(&flt64)
+		testing.expect_value(t, flt64.type, oa.DataType(d64_dt))
+		testing.expect_value(t, flt64.length, 3)
+		testing.expect_value(t, oa.array_get(&flt64, 0, i64), i64(41_732_000))
+		testing.expect(t, oa.array_is_null(&flt64, 1))
+		testing.expect_value(t, oa.array_get(&flt64, 2, i64), i64(0))
+
+		bi := oa.builder_make(i64, 2)
+		defer oa.builder_destroy(&bi)
+		oa.builder_append(&bi, i64(3))
+		oa.builder_append(&bi, i64(0))
+		idx_arr, idx_err := oa.builder_finish(&bi)
+		testing.expect_value(t, idx_err, nil)
+		defer oa.array_free(&idx_arr)
+
+		tk128, tk_err := oa.compute_take(&c128, &idx_arr)
+		testing.expect_value(t, tk_err, nil)
+		defer oa.array_free(&tk128)
+		testing.expect_value(t, tk128.type, oa.DataType(d128_dt))
+		testing.expect_value(t, tk128.length, 2)
+		testing.expect_value(t, oa.array_get(&tk128, 0, i128), big_neg)
+		testing.expect_value(t, oa.array_get(&tk128, 1, i128), big_pos)
+
+		sel_idx := []i32{1, 3}
+		sel := oa.Selection{indices = sel_idx, length = 2}
+		st64, st_err := oa.selection_take(&c64, &sel)
+		testing.expect_value(t, st_err, nil)
+		defer oa.array_free(&st64)
+		testing.expect_value(t, st64.type, oa.DataType(d64_dt))
+		testing.expect_value(t, oa.array_get(&st64, 0, i64), i64(-5_000))
+		testing.expect_value(t, oa.array_get(&st64, 1, i64), i64(0))
+
+		sl128 := oa.array_slice(c128, 1, 4)
+		cp128, cp_err := oa.array_copy(&sl128)
+		testing.expect_value(t, cp_err, nil)
+		defer oa.array_free(&cp128)
+		testing.expect_value(t, cp128.type, oa.DataType(d128_dt))
+		testing.expect_value(t, oa.array_get(&cp128, 0, i128), i128(42))
+		testing.expect(t, oa.array_is_null(&cp128, 1))
+		testing.expect_value(t, oa.array_get(&cp128, 2, i128), big_neg)
+
+		// IPC file + stream round-trip (None and LZ4_Frame, mmap and non-mmap).
+		rb, rb_ok := oa.record_batch_make(&schema, []oa.Array{c64, c128})
+		testing.expect(t, rb_ok)
+		defer delete(rb.columns)
+
+		sl_cols := []oa.Array{oa.array_slice(c64, 1, 4), oa.array_slice(c128, 1, 4)}
+		rb_sl, rbs_ok := oa.record_batch_make(&schema, sl_cols)
+		testing.expect(t, rbs_ok)
+		defer delete(rb_sl.columns)
+
+		batches_in := []oa.Record_Batch{rb, rb_sl}
+		testing.expect(t, oa.ipc_write_file(raw_file, &schema, batches_in, .None))
+		testing.expect(t, oa.ipc_write_file(lz4_file, &schema, batches_in, .LZ4_Frame))
+		testing.expect(t, oa.ipc_write_stream(lz4_stream, &schema, batches_in, .LZ4_Frame))
+
+		check_read :: proc(t: ^testing.T, sc: ^oa.Schema, bs: []oa.Record_Batch, big_pos, big_neg: i128) {
+			d64_dt  := oa.Decimal64_Type{precision = 18, scale = 6}
+			d128_dt := oa.Decimal128_Type{precision = 38, scale = 9}
+			testing.expect(t, sc != nil)
+			testing.expect_value(t, len(bs), 2)
+			if sc != nil && len(bs) == 2 {
+				testing.expect_value(t, sc.fields[0].type, oa.DataType(d64_dt))
+				testing.expect_value(t, sc.fields[1].type, oa.DataType(d128_dt))
+				testing.expect_value(t, bs[0].columns[0].type, oa.DataType(d64_dt))
+				testing.expect_value(t, bs[0].columns[1].type, oa.DataType(d128_dt))
+				testing.expect_value(t, oa.array_get(&bs[0].columns[0], 0, i64), i64(41_732_000))
+				testing.expect_value(t, oa.array_get(&bs[0].columns[0], 1, i64), i64(-5_000))
+				testing.expect(t, oa.array_is_null(&bs[0].columns[0], 2))
+				testing.expect_value(t, oa.array_get(&bs[0].columns[0], 4, i64), i64(123_456_789))
+				testing.expect_value(t, oa.array_get(&bs[0].columns[1], 0, i128), big_pos)
+				testing.expect(t, oa.array_is_null(&bs[0].columns[1], 2))
+				testing.expect_value(t, oa.array_get(&bs[0].columns[1], 3, i128), big_neg)
+				testing.expect_value(t, bs[1].length, 3)
+				testing.expect_value(t, oa.array_get(&bs[1].columns[0], 0, i64), i64(-5_000))
+				testing.expect(t, oa.array_is_null(&bs[1].columns[0], 1))
+				testing.expect_value(t, oa.array_get(&bs[1].columns[1], 2, i128), big_neg)
+			}
+			if sc != nil { oa.schema_free(sc); free(sc) }
+			for &b in bs { oa.record_batch_free(&b) }
+			delete(bs)
+		}
+
+		for use_mmap in ([]bool{true, false}) {
+			sc0, bs0, ok0 := oa.ipc_read_file(raw_file, use_mmap = use_mmap)
+			testing.expect(t, ok0)
+			check_read(t, sc0, bs0, big_pos, big_neg)
+
+			sc1, bs1, ok1 := oa.ipc_read_file(lz4_file, use_mmap = use_mmap)
+			testing.expect(t, ok1)
+			check_read(t, sc1, bs1, big_pos, big_neg)
+
+			sc2, bs2, ok2 := oa.ipc_read_stream(lz4_stream, use_mmap = use_mmap)
+			testing.expect(t, ok2)
+			check_read(t, sc2, bs2, big_pos, big_neg)
+		}
+	}
+}

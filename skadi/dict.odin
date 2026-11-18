@@ -235,7 +235,7 @@ _codes_group_sum_dispatch :: proc(codes: []i32, weights: ^Array, out: []f64) {
 	case UInt64_Type:  _codes_group_sum_typed(codes, weights, out, u64)
 	case Float32_Type: _codes_group_sum_typed(codes, weights, out, f32)
 	case Float64_Type: _codes_group_sum_typed(codes, weights, out, f64)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("dict_group_sum: weights must be numeric")
 	}
 }

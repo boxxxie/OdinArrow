@@ -21,6 +21,7 @@ compute_sum :: proc(arr: ^Array) -> (sum: f64, valid_count: int) {
 	case Float32_Type: return _sum_typed(arr, f32)
 	case Float64_Type: return _sum_typed(arr, f64)
 	case Null_Type, Bool_Type,
+	     Decimal64_Type, Decimal128_Type,
 	     String_Type, Large_String_Type,
 	     Binary_Type, Large_Binary_Type:
 		panic("compute_sum: type does not support numeric summation")
@@ -121,6 +122,7 @@ compute_min :: proc(arr: ^Array) -> (min_val: f64, valid_count: int) {
 	case Float32_Type: return _min_typed(arr, f32)
 	case Float64_Type: return _min_typed(arr, f64)
 	case Null_Type, Bool_Type,
+	     Decimal64_Type, Decimal128_Type,
 	     String_Type, Large_String_Type,
 	     Binary_Type, Large_Binary_Type:
 		panic("compute_min: type does not support ordering")
@@ -142,6 +144,7 @@ compute_max :: proc(arr: ^Array) -> (max_val: f64, valid_count: int) {
 	case Float32_Type: return _max_typed(arr, f32)
 	case Float64_Type: return _max_typed(arr, f64)
 	case Null_Type, Bool_Type,
+	     Decimal64_Type, Decimal128_Type,
 	     String_Type, Large_String_Type,
 	     Binary_Type, Large_Binary_Type:
 		panic("compute_max: type does not support ordering")
@@ -296,6 +299,7 @@ compute_min_max :: proc(arr: ^Array) -> (min_val: f64, max_val: f64, valid_count
 	case Float32_Type: return _min_max_typed(arr, f32)
 	case Float64_Type: return _min_max_typed(arr, f64)
 	case Null_Type, Bool_Type,
+	     Decimal64_Type, Decimal128_Type,
 	     String_Type, Large_String_Type,
 	     Binary_Type, Large_Binary_Type:
 		panic("compute_min_max: type does not support ordering")
@@ -401,16 +405,18 @@ compute_filter :: proc(arr, mask: ^Array, allocator := context.allocator) -> (re
 	assert(is_bool, "compute_filter: mask must be Bool type")
 
 	switch _ in arr.type {
-	case Int8_Type:    return _filter_typed(arr, mask, i8,  allocator)
-	case Int16_Type:   return _filter_typed(arr, mask, i16, allocator)
-	case Int32_Type:   return _filter_typed(arr, mask, i32, allocator)
-	case Int64_Type:   return _filter_typed(arr, mask, i64, allocator)
-	case UInt8_Type:   return _filter_typed(arr, mask, u8,  allocator)
-	case UInt16_Type:  return _filter_typed(arr, mask, u16, allocator)
-	case UInt32_Type:  return _filter_typed(arr, mask, u32, allocator)
-	case UInt64_Type:  return _filter_typed(arr, mask, u64, allocator)
-	case Float32_Type: return _filter_typed(arr, mask, f32, allocator)
-	case Float64_Type: return _filter_typed(arr, mask, f64, allocator)
+	case Int8_Type:         return _filter_typed(arr, mask, i8,   allocator)
+	case Int16_Type:        return _filter_typed(arr, mask, i16,  allocator)
+	case Int32_Type:        return _filter_typed(arr, mask, i32,  allocator)
+	case Int64_Type:        return _filter_typed(arr, mask, i64,  allocator)
+	case UInt8_Type:        return _filter_typed(arr, mask, u8,   allocator)
+	case UInt16_Type:       return _filter_typed(arr, mask, u16,  allocator)
+	case UInt32_Type:       return _filter_typed(arr, mask, u32,  allocator)
+	case UInt64_Type:       return _filter_typed(arr, mask, u64,  allocator)
+	case Float32_Type:      return _filter_typed(arr, mask, f32,  allocator)
+	case Float64_Type:      return _filter_typed(arr, mask, f64,  allocator)
+	case Decimal64_Type:    return _filter_typed(arr, mask, i64,  allocator)
+	case Decimal128_Type:   return _filter_typed(arr, mask, i128, allocator)
 	case Bool_Type:         return _filter_bool(arr, mask, allocator)
 	case String_Type:       return _filter_string(arr, mask, allocator)
 	case Binary_Type:       return _filter_binary(arr, mask, allocator)
@@ -493,7 +499,7 @@ _filter_typed :: proc(arr, mask: ^Array, $T: typeid, allocator: mem.Allocator) -
 			}
 		}
 		result = Array{
-			type    = _data_type_for(T),
+			type    = arr.type,
 			length  = out_count,
 			buffers = {{}, data_buf, {}},
 		}
@@ -512,7 +518,7 @@ _filter_typed :: proc(arr, mask: ^Array, $T: typeid, allocator: mem.Allocator) -
 			}
 		}
 	}
-	return builder_finish(&b, allocator)
+	return builder_finish_as(&b, arr.type, allocator)
 }
 
 // Count set bits in mask_bits in the range [off, off+n).
@@ -762,19 +768,21 @@ compute_take :: proc(arr, indices: ^Array, allocator := context.allocator) -> (r
 
 _compute_take_idx :: proc(arr, indices: ^Array, $Idx: typeid, allocator: mem.Allocator) -> (result: Array, err: mem.Allocator_Error) {
 	switch _ in arr.type {
-	case Int8_Type:    return _take_primitive(arr, indices, i8,  Idx, allocator)
-	case Int16_Type:   return _take_primitive(arr, indices, i16, Idx, allocator)
-	case Int32_Type:   return _take_primitive(arr, indices, i32, Idx, allocator)
-	case Int64_Type:   return _take_primitive(arr, indices, i64, Idx, allocator)
-	case UInt8_Type:   return _take_primitive(arr, indices, u8,  Idx, allocator)
-	case UInt16_Type:  return _take_primitive(arr, indices, u16, Idx, allocator)
-	case UInt32_Type:  return _take_primitive(arr, indices, u32, Idx, allocator)
-	case UInt64_Type:  return _take_primitive(arr, indices, u64, Idx, allocator)
-	case Float32_Type: return _take_primitive(arr, indices, f32, Idx, allocator)
-	case Float64_Type: return _take_primitive(arr, indices, f64, Idx, allocator)
-	case Bool_Type:    return _take_bool(arr, indices, Idx, allocator)
-	case String_Type:  return _take_string(arr, indices, Idx, allocator)
-	case Binary_Type:  return _take_binary(arr, indices, Idx, allocator)
+	case Int8_Type:       return _take_primitive(arr, indices, i8,   Idx, allocator)
+	case Int16_Type:      return _take_primitive(arr, indices, i16,  Idx, allocator)
+	case Int32_Type:      return _take_primitive(arr, indices, i32,  Idx, allocator)
+	case Int64_Type:      return _take_primitive(arr, indices, i64,  Idx, allocator)
+	case UInt8_Type:      return _take_primitive(arr, indices, u8,   Idx, allocator)
+	case UInt16_Type:     return _take_primitive(arr, indices, u16,  Idx, allocator)
+	case UInt32_Type:     return _take_primitive(arr, indices, u32,  Idx, allocator)
+	case UInt64_Type:     return _take_primitive(arr, indices, u64,  Idx, allocator)
+	case Float32_Type:    return _take_primitive(arr, indices, f32,  Idx, allocator)
+	case Float64_Type:    return _take_primitive(arr, indices, f64,  Idx, allocator)
+	case Decimal64_Type:  return _take_primitive(arr, indices, i64,  Idx, allocator)
+	case Decimal128_Type: return _take_primitive(arr, indices, i128, Idx, allocator)
+	case Bool_Type:       return _take_bool(arr, indices, Idx, allocator)
+	case String_Type:     return _take_string(arr, indices, Idx, allocator)
+	case Binary_Type:     return _take_binary(arr, indices, Idx, allocator)
 	case Null_Type, Large_String_Type, Large_Binary_Type:
 		panic("compute_take: unsupported type")
 	}
@@ -860,7 +868,7 @@ _take_primitive :: proc(arr, indices: ^Array, $T, $Idx: typeid, allocator: mem.A
 	}
 
 	result = Array{
-		type       = _data_type_for(T),
+		type       = arr.type,
 		length     = n,
 		null_count = null_count,
 		buffers    = {bitmap_buf, data_buf, {}},
@@ -985,6 +993,7 @@ compute_cast :: proc(arr: ^Array, to: DataType, allocator := context.allocator) 
 	case Float32_Type: return _cast_to(arr, f32, allocator)
 	case Float64_Type: return _cast_to(arr, f64, allocator)
 	case Null_Type, Bool_Type,
+	     Decimal64_Type, Decimal128_Type,
 	     String_Type, Large_String_Type,
 	     Binary_Type, Large_Binary_Type:
 		panic("compute_cast: unsupported target type")
@@ -1008,6 +1017,7 @@ _cast_to :: proc(arr: ^Array, $To: typeid, allocator: mem.Allocator) -> (result:
 	case Float32_Type: return _cast_impl(arr, f32, To, allocator)
 	case Float64_Type: return _cast_impl(arr, f64, To, allocator)
 	case Null_Type, Bool_Type,
+	     Decimal64_Type, Decimal128_Type,
 	     String_Type, Large_String_Type,
 	     Binary_Type, Large_Binary_Type:
 		panic("compute_cast: unsupported source type")
@@ -1116,6 +1126,7 @@ _arith_op :: proc(left, right: ^Array, $OP: Arithmetic_Op, allocator: mem.Alloca
 	case Float32_Type: return _arith_impl(left, right, f32, OP, allocator)
 	case Float64_Type: return _arith_impl(left, right, f64, OP, allocator)
 	case Null_Type, Bool_Type,
+	     Decimal64_Type, Decimal128_Type,
 	     String_Type, Large_String_Type,
 	     Binary_Type, Large_Binary_Type:
 		panic("compute_arithmetic: unsupported type")
@@ -1287,7 +1298,7 @@ compute_sort_indices :: proc(arr: ^Array, allocator := context.allocator) -> (re
 	case Float32_Type: return _sort_indices_typed(arr, f32, allocator)
 	case Float64_Type: return _sort_indices_typed(arr, f64, allocator)
 	case String_Type:  return _sort_indices_string(arr, allocator)
-	case Bool_Type, Null_Type, Binary_Type,
+	case Bool_Type, Null_Type, Decimal64_Type, Decimal128_Type, Binary_Type,
 	     Large_String_Type, Large_Binary_Type:
 		panic("compute_sort_indices: unsupported type")
 	}

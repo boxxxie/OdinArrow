@@ -908,7 +908,7 @@ pipeline_agg_where_f64 :: proc(
 		return {}, false
 	}
 	#partial switch _ in values.type {
-	case oa.Null_Type, oa.Bool_Type, oa.String_Type, oa.Large_String_Type, oa.Binary_Type, oa.Large_Binary_Type:
+	case oa.Null_Type, oa.Bool_Type, oa.Decimal64_Type, oa.Decimal128_Type, oa.String_Type, oa.Large_String_Type, oa.Binary_Type, oa.Large_Binary_Type:
 		return {}, false
 	}
 	n := values.length
@@ -1193,7 +1193,7 @@ pipeline_codes_group_sum_into :: proc(
 		return 0, false
 	}
 	#partial switch _ in weights.type {
-	case oa.Null_Type, oa.Bool_Type, oa.String_Type, oa.Large_String_Type, oa.Binary_Type, oa.Large_Binary_Type:
+	case oa.Null_Type, oa.Bool_Type, oa.Decimal64_Type, oa.Decimal128_Type, oa.String_Type, oa.Large_String_Type, oa.Binary_Type, oa.Large_Binary_Type:
 		return 0, false
 	}
 	for k in 0..<dict_len {
@@ -1286,7 +1286,7 @@ pipeline_codes_group_sum :: proc(
 		return nil, 0, false
 	}
 	#partial switch _ in weights.type {
-	case oa.Null_Type, oa.Bool_Type, oa.String_Type, oa.Large_String_Type, oa.Binary_Type, oa.Large_Binary_Type:
+	case oa.Null_Type, oa.Bool_Type, oa.Decimal64_Type, oa.Decimal128_Type, oa.String_Type, oa.Large_String_Type, oa.Binary_Type, oa.Large_Binary_Type:
 		return nil, 0, false
 	}
 	out, alloc_err := make([]f64, dict_len, allocator)

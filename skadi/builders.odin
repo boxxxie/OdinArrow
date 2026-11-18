@@ -183,6 +183,21 @@ builder_finish :: proc(
 	return
 }
 
+// Produce an immutable Array with an explicit DataType override (e.g. Decimal64_Type / Decimal128_Type).
+@(require_results)
+builder_finish_as :: proc(
+	b:         ^Primitive_Builder($T),
+	dt:        DataType,
+	allocator := context.allocator,
+) -> (arr: Array, err: mem.Allocator_Error) {
+	assert(type_byte_width(dt) == size_of(T), "builder_finish_as: DataType byte width must match size_of(T)")
+	arr, err = builder_finish(b, allocator)
+	if err == nil {
+		arr.type = dt
+	}
+	return
+}
+
 builder_reset :: proc(b: ^Primitive_Builder($T)) {
 	if b.bitmap != nil { mem.set(rawptr(b.bitmap), 0xFF, b.bm_cap) }
 	b.null_count = 0
@@ -233,8 +248,9 @@ _data_type_for :: proc($T: typeid) -> DataType {
 	else when T == u16 { return UInt16_Type{} }
 	else when T == u32 { return UInt32_Type{} }
 	else when T == u64 { return UInt64_Type{} }
-	else when T == f32 { return Float32_Type{} }
-	else when T == f64 { return Float64_Type{} }
+	else when T == f32  { return Float32_Type{} }
+	else when T == f64  { return Float64_Type{} }
+	else when T == i128 { return Decimal128_Type{precision = 38, scale = 0} }
 	else {
 		#assert(false, "Primitive_Builder: unsupported type T")
 		return {}

@@ -38,6 +38,8 @@ UInt32_Type       :: struct{}
 UInt64_Type       :: struct{}
 Float32_Type      :: struct{}
 Float64_Type      :: struct{}
+Decimal64_Type    :: struct { precision: i32, scale: i32 } // 8-byte little-endian i64
+Decimal128_Type   :: struct { precision: i32, scale: i32 } // 16-byte little-endian i128
 String_Type       :: struct{} // UTF-8, i32 offsets
 Large_String_Type :: struct{} // UTF-8, i64 offsets
 Binary_Type       :: struct{} // raw bytes, i32 offsets
@@ -49,6 +51,7 @@ DataType :: union {
 	Int8_Type, Int16_Type, Int32_Type, Int64_Type,
 	UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
 	Float32_Type, Float64_Type,
+	Decimal64_Type, Decimal128_Type,
 	String_Type, Large_String_Type,
 	Binary_Type, Large_Binary_Type,
 }
@@ -70,6 +73,8 @@ type_byte_width :: proc(dt: DataType) -> int {
 	case UInt64_Type:                         return 8
 	case Float32_Type:                        return 4
 	case Float64_Type:                        return 8
+	case Decimal64_Type:                      return 8
+	case Decimal128_Type:                     return 16
 	case String_Type, Large_String_Type,
 	     Binary_Type, Large_Binary_Type:      return -1
 	}
@@ -88,7 +93,8 @@ type_is_variable_length :: proc(dt: DataType) -> bool {
 	case Null_Type, Bool_Type,
 	     Int8_Type, Int16_Type, Int32_Type, Int64_Type,
 	     UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
-	     Float32_Type, Float64_Type:
+	     Float32_Type, Float64_Type,
+	     Decimal64_Type, Decimal128_Type:
 		return false
 	}
 	return false
@@ -100,6 +106,21 @@ type_is_integer :: proc(dt: DataType) -> bool {
 	     UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type:
 		return true
 	case Null_Type, Bool_Type, Float32_Type, Float64_Type,
+	     Decimal64_Type, Decimal128_Type,
+	     String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+		return false
+	}
+	return false
+}
+
+type_is_decimal :: proc(dt: DataType) -> bool {
+	switch _ in dt {
+	case Decimal64_Type, Decimal128_Type:
+		return true
+	case Null_Type, Bool_Type,
+	     Int8_Type, Int16_Type, Int32_Type, Int64_Type,
+	     UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
+	     Float32_Type, Float64_Type,
 	     String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		return false
 	}
@@ -108,7 +129,8 @@ type_is_integer :: proc(dt: DataType) -> bool {
 
 type_is_signed :: proc(dt: DataType) -> bool {
 	switch _ in dt {
-	case Int8_Type, Int16_Type, Int32_Type, Int64_Type:
+	case Int8_Type, Int16_Type, Int32_Type, Int64_Type,
+	     Decimal64_Type, Decimal128_Type:
 		return true
 	case Null_Type, Bool_Type,
 	     UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
@@ -126,6 +148,7 @@ type_is_floating :: proc(dt: DataType) -> bool {
 	case Null_Type, Bool_Type,
 	     Int8_Type, Int16_Type, Int32_Type, Int64_Type,
 	     UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
+	     Decimal64_Type, Decimal128_Type,
 	     String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		return false
 	}
@@ -146,6 +169,8 @@ type_name :: proc(dt: DataType) -> string {
 	case UInt64_Type:       return "uint64"
 	case Float32_Type:      return "float32"
 	case Float64_Type:      return "float64"
+	case Decimal64_Type:    return "decimal64"
+	case Decimal128_Type:   return "decimal128"
 	case String_Type:       return "string"
 	case Large_String_Type: return "large_string"
 	case Binary_Type:       return "binary"

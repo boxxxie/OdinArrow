@@ -40,7 +40,7 @@ compute_agg_where_compare :: proc(values, pred: ^Array, op: Compare_Op, scalar: 
 	case UInt64_Type:  return _agg_where_int_f64(values, pred, op, scalar, u64)
 	case Float32_Type: return _agg_where_float_f64(values, pred, op, scalar, f32)
 	case Float64_Type: return _agg_where_float_f64(values, pred, op, scalar, f64)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_agg_where_compare: type does not support aggregation")
 	}
 	return {}
@@ -60,7 +60,7 @@ compute_agg_where_compare_i64 :: proc(values, pred: ^Array, op: Compare_Op, scal
 	case UInt64_Type:  return _agg_where_int_i64(values, pred, op, scalar, u64)
 	case Float32_Type: return _agg_where_float_i64(values, pred, op, scalar, f32)
 	case Float64_Type: return _agg_where_float_i64(values, pred, op, scalar, f64)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_agg_where_compare_i64: type does not support ordering")
 	}
 	return {}

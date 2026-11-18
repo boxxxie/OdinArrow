@@ -239,13 +239,15 @@ _array_copy_rebased :: proc(src: ^Array, allocator: mem.Allocator) -> (dst: Arra
 		}
 	case Int8_Type, Int16_Type, Int32_Type, Int64_Type,
 	     UInt8_Type, UInt16_Type, UInt32_Type, UInt64_Type,
-	     Float32_Type, Float64_Type:
+	     Float32_Type, Float64_Type,
+	     Decimal64_Type, Decimal128_Type:
 		elem_sz := 0
 		#partial switch _ in src.type {
 		case Int8_Type, UInt8_Type: elem_sz = 1
 		case Int16_Type, UInt16_Type: elem_sz = 2
 		case Int32_Type, UInt32_Type, Float32_Type: elem_sz = 4
-		case Int64_Type, UInt64_Type, Float64_Type: elem_sz = 8
+		case Int64_Type, UInt64_Type, Float64_Type, Decimal64_Type: elem_sz = 8
+		case Decimal128_Type: elem_sz = 16
 		}
 		if src.buffers[1].data != nil && n > 0 && elem_sz > 0 {
 			data_bytes := n * elem_sz

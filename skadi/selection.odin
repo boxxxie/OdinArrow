@@ -186,7 +186,7 @@ compute_sum_selection :: proc(arr: ^Array, sel: ^Selection) -> (sum: f64, valid_
 	case UInt64_Type:  return _sum_selection_typed(arr, sel, u64)
 	case Float32_Type: return _sum_selection_typed(arr, sel, f32)
 	case Float64_Type: return _sum_selection_typed(arr, sel, f64)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_sum_selection: type does not support numeric summation")
 	}
 	return
@@ -235,7 +235,7 @@ compute_min_max_selection :: proc(arr: ^Array, sel: ^Selection) -> (min_val: f64
 	case UInt64_Type:  return _min_max_selection_typed(arr, sel, u64)
 	case Float32_Type: return _min_max_selection_typed(arr, sel, f32)
 	case Float64_Type: return _min_max_selection_typed(arr, sel, f64)
-	case Null_Type, Bool_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
+	case Null_Type, Bool_Type, Decimal64_Type, Decimal128_Type, String_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("compute_min_max_selection: type does not support ordering")
 	}
 	return
@@ -298,17 +298,19 @@ compute_take_selection :: proc(arr: ^Array, sel: ^Selection, allocator := contex
 
 selection_take :: proc(arr: ^Array, sel: ^Selection, allocator := context.allocator) -> (result: Array, err: mem.Allocator_Error) {
 	switch _ in arr.type {
-	case Int8_Type:    return _selection_take_typed(arr, sel, i8,  allocator)
-	case Int16_Type:   return _selection_take_typed(arr, sel, i16, allocator)
-	case Int32_Type:   return _selection_take_typed(arr, sel, i32, allocator)
-	case Int64_Type:   return _selection_take_typed(arr, sel, i64, allocator)
-	case UInt8_Type:   return _selection_take_typed(arr, sel, u8,  allocator)
-	case UInt16_Type:  return _selection_take_typed(arr, sel, u16, allocator)
-	case UInt32_Type:  return _selection_take_typed(arr, sel, u32, allocator)
-	case UInt64_Type:  return _selection_take_typed(arr, sel, u64, allocator)
-	case Float32_Type: return _selection_take_typed(arr, sel, f32, allocator)
-	case Float64_Type: return _selection_take_typed(arr, sel, f64, allocator)
-	case String_Type:  return _selection_take_string(arr, sel, allocator)
+	case Int8_Type:       return _selection_take_typed(arr, sel, i8,   allocator)
+	case Int16_Type:      return _selection_take_typed(arr, sel, i16,  allocator)
+	case Int32_Type:      return _selection_take_typed(arr, sel, i32,  allocator)
+	case Int64_Type:      return _selection_take_typed(arr, sel, i64,  allocator)
+	case UInt8_Type:      return _selection_take_typed(arr, sel, u8,   allocator)
+	case UInt16_Type:     return _selection_take_typed(arr, sel, u16,  allocator)
+	case UInt32_Type:     return _selection_take_typed(arr, sel, u32,  allocator)
+	case UInt64_Type:     return _selection_take_typed(arr, sel, u64,  allocator)
+	case Float32_Type:    return _selection_take_typed(arr, sel, f32,  allocator)
+	case Float64_Type:    return _selection_take_typed(arr, sel, f64,  allocator)
+	case Decimal64_Type:  return _selection_take_typed(arr, sel, i64,  allocator)
+	case Decimal128_Type: return _selection_take_typed(arr, sel, i128, allocator)
+	case String_Type:     return _selection_take_string(arr, sel, allocator)
 	case Bool_Type, Null_Type, Large_String_Type, Binary_Type, Large_Binary_Type:
 		panic("selection_take: unsupported type")
 	}
@@ -349,7 +351,7 @@ _selection_take_typed :: proc(arr: ^Array, sel: ^Selection, $T: typeid, allocato
 		for ; j < n; j += 1 {
 			dst[j] = src[int(idxs[j])]
 		}
-		result = Array{ type = _data_type_for(T), length = n, buffers = {{}, buf, {}} }
+		result = Array{ type = arr.type, length = n, buffers = {{}, buf, {}} }
 		return
 	}
 	b := builder_make(T, n, allocator)
@@ -358,7 +360,7 @@ _selection_take_typed :: proc(arr: ^Array, sel: ^Selection, $T: typeid, allocato
 		i := int(sel.indices[j])
 		if array_is_null(arr, i) { builder_append_null(&b) } else { builder_append(&b, data[off + i]) }
 	}
-	return builder_finish(&b, allocator)
+	return builder_finish_as(&b, arr.type, allocator)
 }
 
 _selection_take_string :: proc(arr: ^Array, sel: ^Selection, allocator: mem.Allocator) -> (result: Array, err: mem.Allocator_Error) {
