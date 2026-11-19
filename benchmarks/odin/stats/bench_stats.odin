@@ -11,19 +11,23 @@ import "core:strings"
 import "core:time"
 
 Bench_Config :: struct {
-	runs:         int,
-	warmup:       int,
-	n_scale:      int,
-	commit:       string,
-	run_id:       string,
-	lang:         string,
-	output_path:  string,
-	history_path: string,
-	append_mode:  bool,
-	no_history:   bool,
-	legacy:       bool,
-	groups:       [dynamic]string,
-	filter:       string,
+	runs:             int,
+	warmup:           int,
+	n_scale:          int,
+	commit:           string,
+	run_id:           string,
+	lang:             string,
+	output_path:      string,
+	history_path:     string,
+	packet_out_path:  string,
+	output_explicit:  bool,
+	history_explicit: bool,
+	append_mode:      bool,
+	no_history:       bool,
+	legacy:           bool,
+	quiet:            bool,
+	groups:           [dynamic]string,
+	filter:           string,
 }
 
 Bench_Stats :: struct {
@@ -61,6 +65,7 @@ Bench_Result :: struct {
 	pool_misses:         u64,
 	stats:               Bench_Stats,
 	samples_ns:          [dynamic]f64,
+	samples_batch_ns:    [dynamic]u64,
 }
 
 Bench_Alloc_State :: struct {
@@ -233,6 +238,7 @@ config_destroy :: proc(cfg: ^Bench_Config, allocator := context.allocator) {
 	delete(cfg.lang, allocator)
 	delete(cfg.output_path, allocator)
 	delete(cfg.history_path, allocator)
+	delete(cfg.packet_out_path, allocator)
 	delete(cfg.filter, allocator)
 	for g in cfg.groups {
 		delete(g, allocator)
@@ -248,6 +254,7 @@ result_destroy :: proc(r: ^Bench_Result, allocator := context.allocator) {
 	delete(r.run_id, allocator)
 	delete(r.name, allocator)
 	delete(r.samples_ns)
+	delete(r.samples_batch_ns)
 	r^ = {}
 }
 
@@ -274,16 +281,17 @@ parse_cli_args :: proc(
 	allocator        := context.allocator,
 ) -> (cfg: Bench_Config, ok: bool, show_help: bool) {
 	cfg = Bench_Config{
-		runs         = 5,
-		warmup       = 1,
-		n_scale      = 0,
-		commit       = resolve_git_commit(".", allocator),
-		run_id       = fmt.aprintf("%d", time.to_unix_nanoseconds(time.now()) / 1_000_000, allocator = allocator),
-		lang         = strings.clone(default_lang, allocator),
-		output_path  = strings.clone(default_output, allocator),
-		history_path = strings.clone(default_history, allocator),
-		groups       = make([dynamic]string, allocator),
-		filter       = strings.clone("", allocator),
+		runs            = 5,
+		warmup          = 1,
+		n_scale         = 0,
+		commit          = resolve_git_commit(".", allocator),
+		run_id          = fmt.aprintf("%d", time.to_unix_nanoseconds(time.now()) / 1_000_000, allocator = allocator),
+		lang            = strings.clone(default_lang, allocator),
+		output_path     = strings.clone(default_output, allocator),
+		history_path    = strings.clone(default_history, allocator),
+		packet_out_path = strings.clone("", allocator),
+		groups          = make([dynamic]string, allocator),
+		filter          = strings.clone("", allocator),
 	}
 
 	i := 0
@@ -313,6 +321,8 @@ parse_cli_args :: proc(
 			cfg.no_history = true
 		case "--legacy":
 			cfg.legacy = true
+		case "--quiet":
+			cfg.quiet = true
 		case "--runs":
 			v, v_ok := next_val(args, &i, val, has_inline_val)
 			if !v_ok {
@@ -377,6 +387,7 @@ parse_cli_args :: proc(
 				return {}, false, false
 			}
 			_replace_str(&cfg.output_path, v, allocator)
+			cfg.output_explicit = true
 		case "--history":
 			v, v_ok := next_val(args, &i, val, has_inline_val)
 			if !v_ok {
@@ -384,6 +395,14 @@ parse_cli_args :: proc(
 				return {}, false, false
 			}
 			_replace_str(&cfg.history_path, v, allocator)
+			cfg.history_explicit = true
+		case "--packet-out":
+			v, v_ok := next_val(args, &i, val, has_inline_val)
+			if !v_ok {
+				config_destroy(&cfg, allocator)
+				return {}, false, false
+			}
+			_replace_str(&cfg.packet_out_path, v, allocator)
 		case "--groups":
 			v, v_ok := next_val(args, &i, val, has_inline_val)
 			if !v_ok {

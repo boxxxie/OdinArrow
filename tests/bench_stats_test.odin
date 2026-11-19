@@ -61,9 +61,11 @@ test_bench_stats_cli_parsing :: proc(t: ^testing.T) {
 		"--lang", "odin_custom",
 		"--output", "/tmp/out.jsonl",
 		"--history", "/tmp/hist.jsonl",
+		"--packet-out", "/tmp/run.hpk",
 		"--append",
 		"--no-history",
 		"--legacy",
+		"--quiet",
 	}
 	cfg, ok, help := bs.parse_cli_args(args, "odin", "benchmarks/odin.jsonl", "benchmarks/history.jsonl")
 	defer bs.config_destroy(&cfg)
@@ -78,9 +80,13 @@ test_bench_stats_cli_parsing :: proc(t: ^testing.T) {
 	testing.expect_value(t, cfg.lang, "odin_custom")
 	testing.expect_value(t, cfg.output_path, "/tmp/out.jsonl")
 	testing.expect_value(t, cfg.history_path, "/tmp/hist.jsonl")
+	testing.expect_value(t, cfg.packet_out_path, "/tmp/run.hpk")
+	testing.expect(t, cfg.output_explicit)
+	testing.expect(t, cfg.history_explicit)
 	testing.expect(t, cfg.append_mode)
 	testing.expect(t, cfg.no_history)
 	testing.expect(t, cfg.legacy)
+	testing.expect(t, cfg.quiet)
 	testing.expect_value(t, len(cfg.groups), 2)
 	testing.expect(t, bs.matches_group(&cfg, "Compute"))
 	testing.expect(t, !bs.matches_group(&cfg, "ipc"))

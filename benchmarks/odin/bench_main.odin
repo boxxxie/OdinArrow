@@ -981,4 +981,9 @@ main :: proc() {
 	run_group(&ctx, "fusion",   group_fusion)
 	run_group(&ctx, "encoding", group_encoding)
 	run_group(&ctx, "ipc",      group_ipc)
+	if cfg.packet_out_path != "" {
+		if !write_hugi_packet(&ctx, base_alloc) {
+			os.exit(1)
+		}
+	}
 }

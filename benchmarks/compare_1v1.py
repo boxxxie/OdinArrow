@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -157,6 +158,95 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _resolve_hugi_bin() -> str:
+    found = shutil.which("hugi")
+    if found:
+        return found
+    local_bin = Path.home() / ".local" / "bin" / "hugi"
+    if local_bin.exists():
+        return str(local_bin)
+    return "hugi"
+
+
+def map_hugi_record(rec: dict[str, Any]) -> dict[str, Any]:
+    """Map a hugi JSONL export record to the internal compare_1v1 record shape."""
+    ops = max(int(rec.get("ops_per_sample", rec.get("ops", 1))), 1)
+    p50 = float(rec.get("p50_ns", rec.get("median_ns", 0.0)))
+    stddev = float(rec.get("std_dev_ns", rec.get("stddev_ns", 0.0)))
+    mb_per_sec = float(rec.get("mb_per_sec", 0.0))
+    bytes_per_op = int(rec.get("bytes_per_op", 0))
+    footprint = int(rec.get("footprint_bytes", 0))
+    bytes_used = footprint if footprint > 0 else bytes_per_op * ops
+    samples_ns = [float(x) for x in rec.get("samples_ns", [])]
+    runs = int(rec.get("run_count", rec.get("runs", 0))) or len(samples_ns)
+    name = str(rec.get("full_name") or rec.get("name", ""))
+    group = str(rec.get("group_name") or rec.get("group", ""))
+    return {
+        "rank": int(rec.get("rank", 9999)),
+        "group": group,
+        "lang": str(rec.get("lang", "")),
+        "commit": str(rec.get("commit", "")),
+        "run_id": str(rec.get("run_id", "")),
+        "name": name,
+        "ops": ops,
+        "runs": runs,
+        "warmup": int(rec.get("warmup", 1)),
+        "total_ms": (p50 * ops) / 1_000_000.0,
+        "ns_per_op": p50,
+        "mean_ns": float(rec.get("mean_ns", p50)),
+        "median_ns": p50,
+        "stddev_ns": stddev,
+        "variance_ns2": stddev * stddev,
+        "cv_pct": float(rec.get("cv_pct", 0.0)),
+        "min_ns": float(rec.get("min_ns", 0.0)),
+        "max_ns": float(rec.get("max_ns", 0.0)),
+        "iqr_ns": float(rec.get("iqr_ns", 0.0)),
+        "p95_ns": float(rec.get("p95_ns", 0.0)),
+        "p99_ns": float(rec.get("p99_ns", 0.0)),
+        "ops_per_sec": float(rec.get("ops_per_sec", 0.0)),
+        "gb_per_sec": mb_per_sec / 1024.0,
+        "bytes_used": bytes_used,
+        "allocs_per_run": round(float(rec.get("allocs_per_op", 0.0)) * ops),
+        "resizes_per_run": int(rec.get("resizes_per_run", 0)),
+        "alloc_bytes_per_run": round(float(rec.get("alloc_bytes_per_op", 0.0)) * ops),
+        "peak_live_bytes": int(rec.get("peak_heap_bytes", 0)),
+        "pool_hits": int(rec.get("pool_hits", 0)),
+        "pool_misses": int(rec.get("pool_misses", 0)),
+        "samples_ns": samples_ns,
+    }
+
+
+def load_hugidb(db_path: Path) -> list[dict[str, Any]]:
+    """Invoke `hugi export` on a .hugidb store and map JSONL rows into internal dicts."""
+    if not db_path.exists():
+        return []
+    cmd = [
+        _resolve_hugi_bin(),
+        "export",
+        "--db",
+        str(db_path),
+        "--lang",
+        "all",
+        "--all-commits",
+        "--format",
+        "jsonl",
+        "--out",
+        "-",
+    ]
+    proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr.strip()}"
+        )
+    records: list[dict[str, Any]] = []
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        records.append(map_hugi_record(json.loads(line)))
+    return records
+
+
 def pool_records(records: list[dict[str, Any]], key_by_commit: bool = False) -> list[dict[str, Any]]:
     """Pool samples_ns across matching (lang, name) or (commit, lang, name) records."""
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
@@ -193,6 +283,10 @@ def pool_records(records: list[dict[str, Any]], key_by_commit: bool = False) -> 
                 all_samples.append(float(r["median_ns"]))
 
         st = compute_stats(all_samples, ops, bytes_used)
+        if st["gb_per_sec"] == 0.0 and bytes_used == 0:
+            gb_vals = [float(r.get("gb_per_sec", 0.0)) for r in recs if float(r.get("gb_per_sec", 0.0)) > 0.0]
+            if gb_vals:
+                st["gb_per_sec"] = gb_vals[-1]
         telem_recs = [
             r for r in recs
             if any(k in r for k in ("allocs_per_run", "alloc_bytes_per_run", "peak_live_bytes", "pool_hits"))
@@ -791,10 +885,14 @@ def build_and_run_runners(args: argparse.Namespace) -> None:
     (ROOT / "bin").mkdir(parents=True, exist_ok=True)
 
     if args.lang in ("odin", "both"):
-        _run_cmd([
+        build_cmd = [
             "odin", "build", "benchmarks/odin",
             "-out:bin/bench_runner", "-o:speed", "-microarch:native",
-        ])
+        ]
+        hugi_col = ROOT.parent / "hugi" / "hugi"
+        if hugi_col.is_dir():
+            build_cmd.append(f"-collection:hugi={hugi_col}")
+        _run_cmd(build_cmd)
         _run_cmd([str(ROOT / "bin" / "bench_runner"), "--output", str(args.odin_jsonl), *common_flags])
 
     if args.lang in ("cpp", "both"):
@@ -817,7 +915,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--odin-jsonl", type=Path, default=ROOT / "benchmarks" / "odin.jsonl")
     p.add_argument("--cpp-jsonl", type=Path, default=ROOT / "benchmarks" / "cpp.jsonl")
     p.add_argument("--history", type=Path, default=ROOT / "benchmarks" / "history.jsonl")
+    p.add_argument("--hugidb", type=Path, default=ROOT / "benchmarks" / "history.hugidb")
     p.add_argument("--from-jsonl", action="store_true", help="Analyze existing JSONL without running binaries")
+    p.add_argument("--from-hugidb", action="store_true", help="Analyze existing .hugidb store without running binaries")
     p.add_argument("--pool", action="store_true", help="Pool all matching commit samples from history.jsonl")
     p.add_argument("--list-commits", action="store_true", help="List commits and sessions in history.jsonl")
     p.add_argument("--list-runs", action="store_true", help="List sessions (run_id) chronologically from history.jsonl")
@@ -834,44 +934,63 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    def _load_history_source() -> list[dict[str, Any]]:
+        return load_hugidb(args.hugidb) if args.from_hugidb else load_jsonl(args.history)
+
     if args.list_commits:
-        print(list_commits_report(load_jsonl(args.history)))
+        print(list_commits_report(_load_history_source()))
         return 0
 
     if args.list_runs:
-        print(list_runs_report(load_jsonl(args.history)))
+        print(list_runs_report(_load_history_source()))
         return 0
 
     if args.inspect is not None:
-        print(inspect_report(load_jsonl(args.history), args.inspect, args.lang))
+        print(inspect_report(_load_history_source(), args.inspect, args.lang))
         return 0
 
     if args.compare_commits is not None:
         sha_a, sha_b = args.compare_commits
-        print(compare_commits_report(load_jsonl(args.history), sha_a, sha_b, args.lang))
+        print(compare_commits_report(_load_history_source(), sha_a, sha_b, args.lang))
         return 0
 
     if args.compare_runs is not None:
         run_a, run_b = args.compare_runs
-        print(compare_runs_report(load_jsonl(args.history), run_a, run_b, args.lang))
+        print(compare_runs_report(_load_history_source(), run_a, run_b, args.lang))
         return 0
 
     if args.compare_last:
-        print(compare_last_report(load_jsonl(args.history), args.lang))
+        print(compare_last_report(_load_history_source(), args.lang))
         return 0
 
-    if not args.from_jsonl:
+    if not args.from_jsonl and not args.from_hugidb:
         build_and_run_runners(args)
 
-    history_recs = load_jsonl(args.history)
-    if args.pool:
-        target_commit = args.commit or resolve_git_commit(ROOT)
-        hist = [r for r in history_recs if _match_commit(str(r.get("commit", "")), target_commit)]
+    if args.from_hugidb:
+        history_recs = load_hugidb(args.hugidb)
+        if args.commit:
+            hist = [r for r in history_recs if _match_commit(str(r.get("commit", "")), args.commit)]
+        elif args.pool:
+            target_commit = resolve_git_commit(ROOT)
+            matched = [r for r in history_recs if _match_commit(str(r.get("commit", "")), target_commit)]
+            hist = matched if matched else history_recs
+        else:
+            latest_map: dict[tuple[str, str], dict[str, Any]] = {}
+            for r in history_recs:
+                latest_map[(str(r.get("lang", "")), str(r.get("name", "")))] = r
+            hist = list(latest_map.values())
         odin_raw = [r for r in hist if r.get("lang") == "odin"] if args.lang in ("odin", "both") else []
         cpp_raw = [r for r in hist if r.get("lang") == "cpp"] if args.lang in ("cpp", "both") else []
     else:
-        odin_raw = load_jsonl(args.odin_jsonl) if args.lang in ("odin", "both") else []
-        cpp_raw = load_jsonl(args.cpp_jsonl) if args.lang in ("cpp", "both") else []
+        history_recs = load_jsonl(args.history)
+        if args.pool:
+            target_commit = args.commit or resolve_git_commit(ROOT)
+            hist = [r for r in history_recs if _match_commit(str(r.get("commit", "")), target_commit)]
+            odin_raw = [r for r in hist if r.get("lang") == "odin"] if args.lang in ("odin", "both") else []
+            cpp_raw = [r for r in hist if r.get("lang") == "cpp"] if args.lang in ("cpp", "both") else []
+        else:
+            odin_raw = load_jsonl(args.odin_jsonl) if args.lang in ("odin", "both") else []
+            cpp_raw = load_jsonl(args.cpp_jsonl) if args.lang in ("cpp", "both") else []
 
     if args.groups:
         allowed_g = {g.strip().lower() for g in args.groups.split(",") if g.strip()}

@@ -8,4 +8,6 @@ __pycache__/
 .tmp/
 *.bin
 *.so
+*.hpk
+*.bpk
 benchmarks/__pycache__/

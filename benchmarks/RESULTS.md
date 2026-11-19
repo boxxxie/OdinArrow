@@ -14,21 +14,43 @@ its C/C++ API) and **PyArrow** (Python).
 | Timing & Stats | `time.tick_now` / `steady_clock`, `--runs 5 --warmup 1` (**median of 5 trials** + Welch's two-sample z-test via `make bench-1v1`) |
 | Workload | 10M elements (numeric), 1M elements (strings / take / `i32` sort / dict), 100K elements (string & Umbra sort) |
 
-Reproduce: `make bench-1v1` (or `python3 benchmarks/compare_1v1.py --from-jsonl`
-to inspect saved JSONL snapshots), `bash benchmarks/bench_odin_c.sh`, or
-`bash benchmarks/compare.sh` (3-way with PyArrow).
+Reproduce: `make bench-1v1` (or `python3 benchmarks/compare_1v1.py --from-hugidb` /
+`python3 benchmarks/compare_1v1.py --from-jsonl` to inspect saved history),
+`hugi run benchmarks/odin --runs 5 --warmup 1`, `bash benchmarks/bench_odin_c.sh`,
+or `bash benchmarks/compare.sh` (3-way with PyArrow).
 
 ## Methodology note
 
 The canonical 1v1 suite ([`compare_1v1.py`](compare_1v1.py), persisted in
-`benchmarks/odin.jsonl`, `benchmarks/cpp.jsonl`, and `benchmarks/history.jsonl`)
-reports **apples-to-apples single-threaded timings (`Odin ST` vs `Arrow C++ ST`)**
-alongside **multi-threaded and Sleipnir actor scaling (`Odin MT`, `MT vs C++`,
-`MT Scale`)**, memory throughput (`GB/s`), and per-run allocation telemetry
-(`Allocs`, `Alloc MB`). Significance is computed with Welch's two-sample z-test
-(`*` indicates `z >= 1.96`, `~` indicates within measurement noise). Both sides
-use recycling memory pools (`Buffer_Pool` in Skadi, `arrow::default_memory_pool()`
-in Arrow C++).
+`benchmarks/history.hugidb`, `benchmarks/odin.jsonl`, `benchmarks/cpp.jsonl`, and
+`benchmarks/history.jsonl`) reports **apples-to-apples single-threaded timings
+(`Odin ST` vs `Arrow C++ ST`)** alongside **multi-threaded and Sleipnir actor
+scaling (`Odin MT`, `MT vs C++`, `MT Scale`)**, memory throughput (`GB/s`), and
+per-run allocation telemetry (`Allocs`, `Alloc MB`). Significance is computed
+with Welch's two-sample z-test (`*` indicates `z >= 1.96`, `~` indicates within
+measurement noise). Both sides use recycling memory pools (`Buffer_Pool` in
+Skadi, `arrow::default_memory_pool()` in Arrow C++).
+
+### Historical Tracking & Analysis with `hugi`
+
+Benchmark runs and historical JSONL snapshots are stored in the compressed
+`xitdb` database [`benchmarks/history.hugidb`](history.hugidb):
+
+```bash
+# Build and run the Odin benchmark suite via hugi, ingesting an HPKT packet into history.hugidb
+hugi run benchmarks/odin --runs 5 --warmup 1
+
+# Backfill or ingest JSONL snapshots / HPKT packets and compact cold rollups
+hugi ingest --db benchmarks/history.hugidb benchmarks/odin.jsonl benchmarks/cpp.jsonl benchmarks/history.jsonl
+hugi compact --db benchmarks/history.hugidb --keep-hot 0
+
+# Render the 1v1 Odin vs Arrow C++ statistical table directly from history.hugidb
+python3 benchmarks/compare_1v1.py --from-hugidb
+
+# Cross-language 1v1 comparison, commit diffs, and exports via hugi CLI
+hugi compare-1v1 --db benchmarks/history.hugidb --langs odin,cpp
+hugi history --db benchmarks/history.hugidb
+```
 
 ## Headline summary (commit `fa6a1e4`)
 

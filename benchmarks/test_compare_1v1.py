@@ -8,6 +8,7 @@ import math
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -213,6 +214,73 @@ class TestCompare1v1(unittest.TestCase):
             self.assertIn("| c | d |", txt2)
             self.assertNotIn("| a | b |", txt2)
             _ = json  # silence unused lint if checked
+
+    def test_map_hugi_record_and_from_hugidb(self) -> None:
+        hugi_row = {
+            "commit": "fa6a1e4",
+            "lang": "odin",
+            "suite_name": "skadi",
+            "group_name": "compute",
+            "name": "sum_10m_f64_st",
+            "full_name": "sum_10m_f64_st",
+            "run_id": "1794725905274",
+            "timestamp_unix": 1795091757,
+            "rank": 2,
+            "run_count": 3,
+            "ops_per_sample": 10_000_000,
+            "samples": 15,
+            "min_ns": 0.37,
+            "p25_ns": 0.39,
+            "p50_ns": 0.40,
+            "p75_ns": 0.42,
+            "p95_ns": 0.44,
+            "p99_ns": 0.45,
+            "max_ns": 0.46,
+            "mean_ns": 0.41,
+            "std_dev_ns": 0.02,
+            "cv_pct": 4.88,
+            "iqr_ns": 0.03,
+            "ops_per_sec": 2_500_000_000.0,
+            "mb_per_sec": 20480.0,
+            "bytes_per_op": 8,
+            "footprint_bytes": 80_000_000,
+            "allocs_per_op": 0.0001,
+            "alloc_bytes_per_op": 0.1024,
+            "peak_heap_bytes": 4096,
+            "samples_ns": [0.38, 0.40, 0.42],
+        }
+        mapped = cmp.map_hugi_record(hugi_row)
+        self.assertEqual(mapped["group"], "compute")
+        self.assertEqual(mapped["name"], "sum_10m_f64_st")
+        self.assertEqual(mapped["ops"], 10_000_000)
+        self.assertEqual(mapped["runs"], 3)
+        self.assertAlmostEqual(mapped["median_ns"], 0.40, places=9)
+        self.assertAlmostEqual(mapped["stddev_ns"], 0.02, places=9)
+        self.assertAlmostEqual(mapped["variance_ns2"], 0.0004, places=12)
+        self.assertAlmostEqual(mapped["gb_per_sec"], 20.0, places=9)
+        self.assertEqual(mapped["bytes_used"], 80_000_000)
+        self.assertEqual(mapped["allocs_per_run"], 1000)
+        self.assertEqual(mapped["alloc_bytes_per_run"], 1_024_000)
+        self.assertEqual(mapped["peak_live_bytes"], 4096)
+
+        with unittest.mock.patch.object(
+            cmp,
+            "load_hugidb",
+            return_value=[
+                cmp.map_hugi_record(hugi_row),
+                cmp.map_hugi_record({
+                    **hugi_row,
+                    "lang": "cpp",
+                    "name": "sum_10m_f64",
+                    "full_name": "sum_10m_f64",
+                    "p50_ns": 0.80,
+                    "mean_ns": 0.80,
+                    "samples_ns": [0.78, 0.80, 0.82],
+                }),
+            ],
+        ):
+            rc = cmp.main(["--from-hugidb", "--hugidb", "/tmp/fake.hugidb"])
+            self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

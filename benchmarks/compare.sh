@@ -6,7 +6,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "Building Odin benchmark binary..."
-odin build "$ROOT/benchmarks/odin" -out:"$ROOT/bin/bench_runner" -o:speed
+HUGI_FLAGS=()
+if [[ -d "$ROOT/../hugi/hugi" ]]; then
+    HUGI_FLAGS=(-collection:hugi="$ROOT/../hugi/hugi")
+fi
+odin build "$ROOT/benchmarks/odin" -out:"$ROOT/bin/bench_runner" -o:speed "${HUGI_FLAGS[@]}"
 
 echo "Running Odin benchmarks (threaded)..."
 ODIN_OUT=$("$ROOT/bin/bench_runner" --legacy --no-history)
