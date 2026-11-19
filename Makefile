@@ -106,7 +106,7 @@ bench-arrow-cpp: bin/bench_arrow_cpp
 # ── Python benchmarks ─────────────────────────────────────────────────────────
 
 bench-odin: $(BIN)
-	odin run benchmarks/odin -out:$(BIN)/bench_runner -o:speed $(HUGI_COL)
+	odin run benchmarks/odin -out:$(BIN)/bench_runner -o:speed -microarch:native $(HUGI_COL)
 
 bench-python:
 	python3 benchmarks/python/bench_array.py

@@ -902,7 +902,7 @@ def build_and_run_runners(args: argparse.Namespace) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Skadi vs Apache Arrow C++ statistical 1v1 comparator")
-    p.add_argument("--runs", type=int, default=5, help="Measured trials per benchmark (default: 5)")
+    p.add_argument("--runs", type=int, default=7, help="Measured trials per benchmark (default: 7)")
     p.add_argument("--warmup", type=int, default=1, help="Warmup trials per benchmark (default: 1)")
     p.add_argument("--n", type=int, default=None, help="Override large array element count")
     p.add_argument("--commit", type=str, default=None, help="Override git commit SHA")
