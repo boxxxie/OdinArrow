@@ -14,6 +14,11 @@ Bench_Config :: struct {
 	runs:             int,
 	warmup:           int,
 	n_scale:          int,
+	pin_cpu:          int,
+	has_pin:          bool,
+	counters:         bool,
+	test_mode:        bool,
+	host_warned:      bool,
 	commit:           string,
 	run_id:           string,
 	lang:             string,
@@ -284,6 +289,7 @@ parse_cli_args :: proc(
 		runs            = 5,
 		warmup          = 1,
 		n_scale         = 0,
+		pin_cpu         = -1,
 		commit          = resolve_git_commit(".", allocator),
 		run_id          = fmt.aprintf("%d", time.to_unix_nanoseconds(time.now()) / 1_000_000, allocator = allocator),
 		lang            = strings.clone(default_lang, allocator),
@@ -323,6 +329,25 @@ parse_cli_args :: proc(
 			cfg.legacy = true
 		case "--quiet":
 			cfg.quiet = true
+		case "--test":
+			cfg.test_mode = true
+		case "--counters":
+			cfg.counters = true
+		case "--host-warned":
+			cfg.host_warned = true
+		case "--pin":
+			v, v_ok := next_val(args, &i, val, has_inline_val)
+			if !v_ok {
+				config_destroy(&cfg, allocator)
+				return {}, false, false
+			}
+			n, p_ok := strconv.parse_int(v)
+			if !p_ok || n < 0 {
+				config_destroy(&cfg, allocator)
+				return {}, false, false
+			}
+			cfg.pin_cpu = n
+			cfg.has_pin = true
 		case "--runs":
 			v, v_ok := next_val(args, &i, val, has_inline_val)
 			if !v_ok {
@@ -422,6 +447,11 @@ parse_cli_args :: proc(
 			return {}, false, false
 		}
 		i += 1
+	}
+
+	if cfg.test_mode {
+		cfg.runs = 1
+		cfg.warmup = 0
 	}
 
 	return cfg, true, false

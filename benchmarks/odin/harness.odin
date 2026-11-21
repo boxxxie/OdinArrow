@@ -352,5 +352,7 @@ print_usage :: proc() {
 	fmt.println("  --append          Merge/update matching ranks into existing output")
 	fmt.println("  --no-history      Do not append to history JSONL")
 	fmt.println("  --legacy          Emit legacy key=ns lines only")
+	fmt.println("  --test            Smoke-run each benchmark once (runs=1, warmup=0)")
+	fmt.println("  --pin N           Logical CPU index hint forwarded by hugi")
 	fmt.println("  --quiet           Suppress terminal table output")
 }
